@@ -35,13 +35,13 @@ Three things make it hold up on real work:
 ### Recommended: the `skills` CLI (handles 14 agents)
 
 ```bash
-npx skills add purushrestha45/docket --all
+npx skills add puru9860/docket --all
 ```
 
 `--all` installs every skill in the repo to every detected agent. Scope it if you prefer:
 
 ```bash
-npx skills add purushrestha45/docket -g -a claude-code,codex,opencode
+npx skills add puru9860/docket -g -a claude-code,codex,opencode
 ```
 
 ### Manual
@@ -49,7 +49,7 @@ npx skills add purushrestha45/docket -g -a claude-code,codex,opencode
 Clone once into the shared cross-harness location:
 
 ```bash
-git clone https://github.com/purushrestha45/docket.git /tmp/docket-src
+git clone https://github.com/puru9860/docket.git /tmp/docket-src
 mkdir -p ~/.agents/skills
 cp -r /tmp/docket-src/skills/docket ~/.agents/skills/docket
 ```
@@ -122,10 +122,10 @@ Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 o
 
 ```
 docket init <run>                                    scaffold the run and plan.mdx
-docket assign <run> purushrestha45 [--tier small|self]
+docket assign <run> puru9860 [--tier small|self]
     [--harness H] [--model M] [--files ...] [--verify CMD]
-docket submit <run> purushrestha45                          validate and hand off  <- the gate
-docket decide <run> purushrestha45 --approve | --changes    verdict; --changes opens next round
+docket submit <run> puru9860                          validate and hand off  <- the gate
+docket decide <run> puru9860 --approve | --changes    verdict; --changes opens next round
 docket status <run>                                  every owner's round and state
 docket watch <run> --role orchestrator|planner       block until something needs you
 docket help <role>                                   the playbooks
