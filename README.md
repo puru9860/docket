@@ -122,10 +122,10 @@ Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 o
 
 ```
 docket init <run>                                    scaffold the run and plan.mdx
-docket assign <run> puru9860 [--tier small|self]
+docket assign <run> <owner> [--tier small|self]
     [--harness H] [--model M] [--files ...] [--verify CMD]
-docket submit <run> puru9860                          validate and hand off  <- the gate
-docket decide <run> puru9860 --approve | --changes    verdict; --changes opens next round
+docket submit <run> <owner>                          validate and hand off  <- the gate
+docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
 docket status <run>                                  every owner's round and state
 docket watch <run> --role orchestrator|planner       block until something needs you
 docket help <role>                                   the playbooks
