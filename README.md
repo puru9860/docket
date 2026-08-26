@@ -30,6 +30,33 @@ Three things make it hold up on real work:
   actionable, using the harness's own wake mechanism rather than a polling loop that
   burns a turn each time.
 
+## Requirements
+
+Run `docket doctor` at any time to see what you have and what each missing piece costs.
+
+**Required**
+
+- Python 3.11+ (via [uv](https://docs.astral.sh/uv/), or swap the shebang for `python3`)
+- git, if you want reviewers to read diffs. The validation gate works without it.
+
+**Optional, and what you lose without each**
+
+| | Without it |
+| --- | --- |
+| A multiplexer for dispatch — [herdr](https://github.com/kunchenguid) recommended, tmux or zellij fine | Run each role in its own terminal window, or dispatch headless with `claude -p`. The file protocol is unchanged. |
+| Claude Code, for the `asyncRewake` wake hook | Supervisors block on a foreground call instead of idling for free, which caps out around 8 minutes per wait. Headless dispatch needs no watcher at all, since process exit is the signal. |
+| Several agent CLIs (`claude`, `codex`, `opencode`, …) | Model tiering collapses. One agent can still play all three roles sequentially; you keep the paper trail and the gate but lose the cost saving. |
+
+None of the optional pieces are enforced and nothing is blocked if they are absent.
+`docket` is a file protocol plus a validation gate; dispatch and wake are conveniences
+layered on top. If you install one thing, install herdr — it gives each agent a real
+interactive pane, and driving an interactive session avoids the separate metering that
+applies to headless Agent SDK use.
+
+Note that herdr can only be *driven* from inside a herdr pane (`HERDR_ENV=1`). Having it
+on PATH is not enough; `docket doctor` distinguishes the two, because that is the most
+common way this trips people up.
+
 ## Install
 
 ### Recommended: the `skills` CLI (handles 14 agents)
@@ -127,6 +154,7 @@ docket assign <run> <owner> [--tier small|self]
 docket submit <run> <owner>                          validate and hand off  <- the gate
 docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
 docket status <run>                                  every owner's round and state
+docket doctor                                        what dispatch and wake options you have
 docket watch <run> --role orchestrator|planner       block until something needs you
 docket help <role>                                   the playbooks
 ```

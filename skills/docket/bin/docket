@@ -510,6 +510,67 @@ def cmd_watch(a: argparse.Namespace) -> None:
         time.sleep(min(a.interval, max(1, deadline - time.monotonic())))
 
 
+# --------------------------------------------------------------------- doctor
+
+
+def _has(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
+
+
+def cmd_doctor(a: argparse.Namespace) -> None:
+    """Report what is available and what each missing piece costs. Never blocks."""
+    ok, warn = "  ok  ", " note "
+    print("docket doctor\n")
+
+    print("Required")
+    print(f"  [{ok}] python {sys.version.split()[0]}")
+    print(f"  [{ok if _has('git') else warn}] git" + ("" if _has("git") else "  - needed to review implementor diffs"))
+    inrepo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                            capture_output=True, cwd=root()).returncode == 0 if _has("git") else False
+    print(f"  [{ok if inrepo else warn}] inside a git repo"
+          + ("" if inrepo else "  - reviewers cannot diff; the gate still works"))
+
+    print("\nDispatch (how a supervisor launches and prompts a subordinate)")
+    herdr = _has("herdr")
+    inside = os.environ.get("HERDR_ENV") == "1"
+    if herdr and inside:
+        print(f"  [{ok}] herdr, and this session is inside a herdr pane")
+        print("         -> use `herdr tab create` + `herdr agent start/prompt`. Best option.")
+    elif herdr:
+        print(f"  [{warn}] herdr installed, but this session is NOT inside a herdr pane")
+        print("         HERDR_ENV is unset, so herdr cannot be driven from here.")
+        print("         -> start your planner from inside herdr, or use a fallback below.")
+    else:
+        print(f"  [{warn}] herdr not installed  (https://github.com/kunchenguid)")
+    for m in ("tmux", "zellij"):
+        if _has(m):
+            print(f"  [{ok}] {m}  -> usable fallback: one window per role, prompt by hand")
+    if not any(_has(m) for m in ("herdr", "tmux", "zellij")):
+        print(f"  [{warn}] no multiplexer found")
+        print("         -> run each role in its own terminal window, or dispatch headless.")
+
+    print("\nAgent CLIs found (for --harness on assign)")
+    found = [c for c in ("claude", "codex", "opencode", "gemini", "cursor-agent", "amp") if _has(c)]
+    print(f"  [{ok if found else warn}] " + (", ".join(found) if found else "none found"))
+    if _has("claude"):
+        print("         headless fallback available: claude -p \"$(cat <task>.mdx)\"")
+        print("         note: -p is Agent SDK usage and may be metered separately from")
+        print("         interactive use. Driving an interactive session is not.")
+
+    print("\nWake signalling (optional; without it a supervisor blocks instead of idling)")
+    settings = root() / ".claude" / "settings.json"
+    wired = settings.is_file() and "asyncRewake" in settings.read_text()
+    print(f"  [{ok if wired else warn}] Stop hook in {settings.relative_to(root()) if settings.is_file() else '.claude/settings.json'}"
+          + ("" if wired else "  - see `docket help signalling`"))
+    conf = root() / STATE_DIR / "watch.conf"
+    print(f"  [{ok if conf.is_file() else ok}] watcher "
+          + (f"armed: {conf.read_text().strip()}" if conf.is_file() else "not armed (correct when idle)"))
+
+    print("\ndocket itself works with none of the optional pieces above.")
+    print("The protocol is files; dispatch and wake are conveniences.")
+
+
 # ---------------------------------------------------------------------- help
 
 PLAYBOOKS = {
@@ -567,14 +628,34 @@ review everything the small models produce before the planner ever sees it.
    do. A small model succeeds or fails on the quality of its acceptance criteria.
 
 3. Dispatch, at most 2-3 at a time
-   Give each implementor its OWN TAB, not a split of yours. Three agents sharing
-   one tab is unreadable, and you cannot review a diff in a 20-column pane.
+   FIRST run `docket doctor` to see which of these you actually have. docket needs
+   none of them - the protocol is files - but the dispatch command differs.
+
+   (a) herdr, and you are inside a herdr pane - best option, gives each implementor
+       its own tab. Three agents sharing one tab is unreadable and you cannot review
+       a diff in a 20-column pane.
 
      herdr tab create --cwd "$PWD" --label impl-t03 --no-focus
      # read .result.root_pane.pane_id from the JSON
      herdr agent start impl-t03 --kind opencode --pane <root-pane-id> -- --model haiku
      herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-task.mdx and run \\
        the implementor role. Read: docket help implementor" --wait --timeout 600000
+
+   (b) tmux or zellij - create a window per implementor, start the agent in it, and
+       paste the same prompt. No agent-state API, so rely on the report file and the
+       wake hook rather than on any --wait equivalent.
+
+   (c) no multiplexer, or herdr present but HERDR_ENV unset - dispatch headless:
+
+     claude -p "Read .docket/runs/<run>/T03-task.mdx and run the implementor role. \\
+       Read: docket help implementor" --model haiku --permission-mode acceptEdits
+
+       Process exit is the completion signal, so no watcher is needed for this mode.
+       You cannot watch it work, and on Claude Code `-p` is Agent SDK usage that may
+       be metered separately from interactive use. Prefer (a) when you have it.
+
+   (d) nothing available, or the run is small - do the task yourself and say so in
+       your report. Delegation is an optimisation, not an obligation.
 
    ALWAYS address an agent by its name, never by pane id. A pane moved between
    workspaces gets a NEW pane id, but the live agent name keeps resolving, so
@@ -754,6 +835,9 @@ def main() -> None:
     q.add_argument("--interval", type=int, default=5)
     q.add_argument("--timeout", type=int, default=28800)
     q.set_defaults(fn=cmd_watch)
+
+    q = sub.add_parser("doctor", help="report available dispatch and wake options")
+    q.set_defaults(fn=cmd_doctor)
 
     q = sub.add_parser("help", help="print a role playbook")
     q.add_argument("role", choices=list(PLAYBOOKS))
