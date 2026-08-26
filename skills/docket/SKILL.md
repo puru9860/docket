@@ -1,7 +1,11 @@
-# Handoff
+---
+name: docket
+description: Run a planner/orchestrator/implementor pipeline across coding agents, coordinated through numbered .mdx docket files with a mechanical report-validation gate and zero-token wake signalling. Use when splitting an implementation task across a reviewing agent, an orchestrating agent, and smaller implementor agents, or when the user invokes /docket.
+metadata:
+  argument-hint: <run-id> or the task to plan
+---
 
-Agent instructions for the handoff pipeline. Same content as the Claude Code
-SKILL.md, for harnesses that read AGENTS.md (codex, opencode, cursor).
+# Docket
 
 Three roles, three model tiers, one file protocol.
 
@@ -19,10 +23,10 @@ The playbooks are the source of truth and they live in the CLI, so an installed 
 of this file cannot go stale:
 
 ```bash
-handoff help planner        # or: orchestrator, implementor, signalling
+docket help planner        # or: orchestrator, implementor, signalling
 ```
 
-Read `handoff help signalling` before delegating anything - it explains how a
+Read `docket help signalling` before delegating anything - it explains how a
 supervisor learns a subordinate finished without polling or burning tokens.
 
 ## The two rules that matter
@@ -32,7 +36,7 @@ not a lifecycle state. Terminal scrollback is lossy (agents run on the alternate
 screen and rows that scroll off are gone), and a settled `idle` state does not mean
 the work is correct. Read the `.mdx` file, and read the diff.
 
-**`handoff submit` is a gate, not a formality.** It rejects a report with unfilled
+**`docket submit` is a gate, not a formality.** It rejects a report with unfilled
 placeholders, empty required sections, unchecked acceptance criteria, or a failing
 `verify:` command. A rejected report is never handed to the reviewer, so a small
 model cannot report success it did not achieve. Rejections cost nothing but the
@@ -41,7 +45,7 @@ implementor's own time.
 ## Layout
 
 ```
-.handoff/runs/<run>/
+.docket/runs/<run>/
   plan.mdx                 planner's output; tasks table with tier per task
   T03-task.mdx             assignment: goal, acceptance criteria, files, verify command
   T03-report-01.mdx        implementor fills this; round 1
@@ -57,28 +61,36 @@ Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 o
 ## Commands
 
 ```bash
-handoff init <run>                                    scaffold the run and plan.mdx
-handoff assign <run> <owner> [--tier small|self] \
+docket init <run>                                    scaffold the run and plan.mdx
+docket assign <run> <owner> [--tier small|self] \
     [--harness H] [--model M] [--files ...] [--verify CMD]
-handoff submit <run> <owner>                          validate and hand off  <- the gate
-handoff decide <run> <owner> --approve | --changes    verdict; --changes opens next round
-handoff status <run>                                  every owner's round and state
-handoff watch <run> --role orchestrator|planner       block until something needs you
-handoff help <role>                                   the playbooks
+docket submit <run> <owner>                          validate and hand off  <- the gate
+docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
+docket status <run>                                  every owner's round and state
+docket watch <run> --role orchestrator|planner       block until something needs you
+docket help <role>                                   the playbooks
 ```
 
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
 
 Templates are built in. To customize a report schema for a project, drop an override
-in `.handoff/templates/<report|task|plan|decision>.mdx`.
+in `.docket/templates/<report|task|plan|decision>.mdx`.
 
 ## Install
 
-`bin/handoff` is a stdlib-only `uv run` script with no dependencies. Put it on PATH:
+`bin/docket` is a stdlib-only `uv run` script with no dependencies. Put it on PATH:
 
 ```bash
-ln -s "$HOME"/.agents/skills/handoff/bin/handoff ~/.local/bin/handoff
+ln -s "$HOME"/.agents/skills/docket/bin/docket ~/.local/bin/docket
 ```
 
 For wake signalling on Claude Code, merge `hooks/settings.json.example` into the
-project's `.claude/settings.json`. See `handoff help signalling`.
+project's `.claude/settings.json`. See `docket help signalling`.
+
+## Request
+
+$ARGUMENTS
+
+If the request above is non-empty the user invoked `/docket` explicitly. Read the
+playbook for the role you are about to play, then act. If it is empty, infer the run
+and role from the conversation and from `docket status`.

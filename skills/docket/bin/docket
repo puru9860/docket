@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Handoff: file-protocol coordination for a planner/orchestrator/implementor agent pipeline."""
+"""Docket: file-protocol coordination for a planner/orchestrator/implementor agent pipeline."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-STATE_DIR = ".handoff"
+STATE_DIR = ".docket"
 REQUIRED_REPORT_SECTIONS = [
     "Summary",
     "Files changed",
@@ -112,7 +112,7 @@ def run_dir(run: str) -> Path:
 def need_run(run: str) -> Path:
     d = run_dir(run)
     if not d.is_dir():
-        die(f"no such run: {run}  (try: handoff init {run})")
+        die(f"no such run: {run}  (try: docket init {run})")
     return d
 
 
@@ -136,7 +136,7 @@ def latest(paths: list[Path]) -> Path | None:
 
 
 def die(msg: str) -> None:
-    print(f"handoff: {msg}", file=sys.stderr)
+    print(f"docket: {msg}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -291,7 +291,7 @@ def cmd_init(a: argparse.Namespace) -> None:
     plan = base / "plan.mdx"
     plan.write_text(template("plan").format(run=a.run, harness=a.harness))
     print(f"created {plan.relative_to(root())}")
-    print(f"\nNext: fill in the plan, then `handoff status {a.run}`.")
+    print(f"\nNext: fill in the plan, then `docket status {a.run}`.")
 
 
 def cmd_assign(a: argparse.Namespace) -> None:
@@ -306,7 +306,7 @@ def cmd_assign(a: argparse.Namespace) -> None:
         )
         print(f"created {task.relative_to(root())}")
     if reports(d, a.owner):
-        die(f"{a.owner} already has a report; use `handoff decide` to open a new round")
+        die(f"{a.owner} already has a report; use `docket decide` to open a new round")
     rep = d / f"{a.owner}-report-01.mdx"
     rep.write_text(
         template("report").format(
@@ -499,9 +499,9 @@ def cmd_watch(a: argparse.Namespace) -> None:
                 for k, _ in fresh:
                     f.write(k + "\n")
             print(
-                f"handoff [{a.run}]: {len(fresh)} item(s) need you:\n"
+                f"docket [{a.run}]: {len(fresh)} item(s) need you:\n"
                 + "\n".join(f"  - {m}" for _, m in fresh)
-                + f"\n\nRun `handoff status {a.run}`, then review the submitted report(s).",
+                + f"\n\nRun `docket status {a.run}`, then review the submitted report(s).",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -518,7 +518,7 @@ PLAYBOOKS = {
 You own the plan and the final review. You do not write implementation code.
 
 1. Scaffold and plan
-     handoff init <run-id>
+     docket init <run-id>
    Fill plan.mdx. In the Tasks table, set tier per task using this checklist -
    tier=small ONLY if ALL of these hold:
      - touches at most 2 files
@@ -535,15 +535,15 @@ You own the plan and the final review. You do not write implementation code.
 2. Hand off to the orchestrator, in its own tab so it never crowds your session:
      herdr tab create --cwd "$PWD" --label orch --no-focus
      herdr agent start orch --kind codex --pane <root-pane-id-from-json>
-     herdr agent prompt orch "Read .handoff/runs/<run>/plan.mdx and run the \\
-       orchestrator role. Read: handoff help orchestrator" --wait --timeout 600000
+     herdr agent prompt orch "Read .docket/runs/<run>/plan.mdx and run the \\
+       orchestrator role. Read: docket help orchestrator" --wait --timeout 600000
 
 3. Review the orchestrator's report when woken
-     handoff status <run>
+     docket status <run>
    Read orch-report-NN.mdx. Judge it against plan.mdx, not against its own summary.
    Then:
-     handoff decide <run> orch --approve
-     handoff decide <run> orch --changes --reviewer planner
+     docket decide <run> orch --approve
+     docket decide <run> orch --changes --reviewer planner
    On --changes, write specific numbered edits into orch-decision-NN.mdx citing
    file:line, then send the orchestrator back to read it.
 
@@ -555,12 +555,12 @@ You split the plan, delegate the simple half, implement the complex half, and
 review everything the small models produce before the planner ever sees it.
 
 1. Read the plan
-     handoff status <run>
+     docket status <run>
    Read plan.mdx. Trust its tier column, but override it downward (small -> self)
    if a task looks ambiguous to you. Never override upward.
 
 2. Open every task
-     handoff assign <run> T03 --tier small --harness opencode --model haiku \\
+     docket assign <run> T03 --tier small --harness opencode --model haiku \\
        --files "src/a.py" --verify "pytest tests/test_a.py"
    This writes T03-task.mdx and an empty T03-report-01.mdx. Fill in the task's
    Goal and Acceptance criteria yourself - this is the highest-leverage thing you
@@ -573,8 +573,8 @@ review everything the small models produce before the planner ever sees it.
      herdr tab create --cwd "$PWD" --label impl-t03 --no-focus
      # read .result.root_pane.pane_id from the JSON
      herdr agent start impl-t03 --kind opencode --pane <root-pane-id> -- --model haiku
-     herdr agent prompt impl-t03 "Read .handoff/runs/<run>/T03-task.mdx and run \\
-       the implementor role. Read: handoff help implementor" --wait --timeout 600000
+     herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-task.mdx and run \\
+       the implementor role. Read: docket help implementor" --wait --timeout 600000
 
    ALWAYS address an agent by its name, never by pane id. A pane moved between
    workspaces gets a NEW pane id, but the live agent name keeps resolving, so
@@ -587,7 +587,7 @@ review everything the small models produce before the planner ever sees it.
      herdr agent attach impl-t03 --takeover  drive it by hand
      herdr pane move <pane> --new-tab --label impl-t03 --no-focus   rescue a crammed pane
 
-   Do not watch panes to track progress - use `handoff status <run>`. Panes are for
+   Do not watch panes to track progress - use `docket status <run>`. Panes are for
    when you need to look at ONE agent closely.
 
    Parallel implementors must have disjoint `files:` lists. If two tasks touch the
@@ -596,11 +596,11 @@ review everything the small models produce before the planner ever sees it.
 4. Review each submission
    You are woken when a report is submitted or blocked. Read the report AND the
    diff - never the report alone. Then:
-     handoff decide <run> T03 --approve
-     handoff decide <run> T03 --changes
+     docket decide <run> T03 --approve
+     docket decide <run> T03 --changes
    --changes opens T03-report-02.mdx automatically. Write the required changes into
    T03-decision-NN.mdx, then:
-     herdr agent prompt impl-t03 "Read .handoff/runs/<run>/T03-decision-01.mdx \\
+     herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-decision-01.mdx \\
        and apply it." --wait --timeout 600000
 
    Cap this at 3 rounds per task. If round 3 still fails, take the task over
@@ -609,9 +609,9 @@ review everything the small models produce before the planner ever sees it.
 
 5. Finish your own work, then report
    Once every delegated task is approved, implement the tier=self tasks, then:
-     handoff assign <run> orch
+     docket assign <run> orch
      # fill orch-report-01.mdx
-     handoff submit <run> orch
+     docket submit <run> orch
    Your report must cover both what you delegated and what you wrote.""",
     "signalling": """SIGNALLING  (how a supervisor learns a subordinate is done)
 
@@ -633,23 +633,23 @@ B. WAKE - the right default for real implementation work
 
    One-time setup, per project:
      mkdir -p .claude
-     cp "$HOME"/.agents/skills/handoff/hooks/settings.json.example .claude/settings.json
+     cp "$HOME"/.agents/skills/docket/hooks/settings.json.example .claude/settings.json
    (Merge it into an existing settings.json rather than overwriting.)
 
    Arm it when you start delegating:
-     echo "<run> orchestrator" > .handoff/watch.conf     # orchestrator waiting on impls
-     echo "<run> planner"      > .handoff/watch.conf     # planner waiting on the orchestrator
+     echo "<run> orchestrator" > .docket/watch.conf     # orchestrator waiting on impls
+     echo "<run> planner"      > .docket/watch.conf     # planner waiting on the orchestrator
    Disarm when the run ends:
-     rm .handoff/watch.conf
+     rm .docket/watch.conf
 
    You will be woken with a system reminder naming what needs you. Then:
-     handoff status <run>
+     docket status <run>
 
-   Each event is delivered exactly once - the ledger at .handoff/runs/<run>/.woke
+   Each event is delivered exactly once - the ledger at .docket/runs/<run>/.woke
    dedupes - so you will not be woken repeatedly for the same submission.
 
    The watcher must run in the hook's foreground process tree. Never launch
-   `handoff watch` with shell '&', nohup, or a detached process: Claude Code owns
+   `docket watch` with shell '&', nohup, or a detached process: Claude Code owns
    the hook's process group and relies on that to tear the watcher down with the
    session. A backgrounded watcher outlives the session and wakes the wrong one.
 
@@ -682,7 +682,7 @@ You implement exactly one task and write an honest report. That is all.
    hold up is the only bad one.
 
 5. Submit
-     handoff submit <run> <owner>
+     docket submit <run> <owner>
    This validates your report and runs your verify command. If it rejects, it
    tells you exactly what is wrong. Fix and resubmit. Nothing reaches the
    reviewer until it passes, so a rejection costs nothing but your own time.
@@ -705,7 +705,7 @@ def cmd_help(a: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="handoff", description=__doc__)
+    p = argparse.ArgumentParser(prog="docket", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     q = sub.add_parser("init", help="scaffold a run and its plan")

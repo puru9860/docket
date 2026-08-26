@@ -1,7 +1,7 @@
-# handoff
+# docket
 
 Run a **planner / orchestrator / implementor** pipeline across coding agents, coordinated
-through numbered `.mdx` handoff files, with a mechanical report-validation gate and
+through numbered `.mdx` docket files, with a mechanical report-validation gate and
 zero-token wake signalling.
 
 Three roles, three model tiers, one file protocol:
@@ -19,7 +19,7 @@ They coordinate only through files, so no role needs to know what harness the ot
 
 Three things make it hold up on real work:
 
-- **`handoff submit` is a gate, not a formality.** It rejects a report with unfilled
+- **`docket submit` is a gate, not a formality.** It rejects a report with unfilled
   placeholders, empty required sections, unchecked acceptance criteria, or a failing
   `verify:` command. A rejected report is never handed to the reviewer, so a small model
   cannot report success it did not achieve.
@@ -35,13 +35,13 @@ Three things make it hold up on real work:
 ### Recommended: the `skills` CLI (handles 14 agents)
 
 ```bash
-npx skills add <owner>/handoff --all
+npx skills add purushrestha45/docket --all
 ```
 
 `--all` installs every skill in the repo to every detected agent. Scope it if you prefer:
 
 ```bash
-npx skills add <owner>/handoff -g -a claude-code,codex,opencode
+npx skills add purushrestha45/docket -g -a claude-code,codex,opencode
 ```
 
 ### Manual
@@ -49,9 +49,9 @@ npx skills add <owner>/handoff -g -a claude-code,codex,opencode
 Clone once into the shared cross-harness location:
 
 ```bash
-git clone https://github.com/<owner>/handoff.git /tmp/handoff-src
+git clone https://github.com/purushrestha45/docket.git /tmp/docket-src
 mkdir -p ~/.agents/skills
-cp -r /tmp/handoff-src/skills/handoff ~/.agents/skills/handoff
+cp -r /tmp/docket-src/skills/docket ~/.agents/skills/docket
 ```
 
 Then per harness:
@@ -67,7 +67,7 @@ a `[[skills.config]]` entry in `~/.codex/config.toml` is only needed to *disable
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -sfn ~/.agents/skills/handoff ~/.claude/skills/handoff
+ln -sfn ~/.agents/skills/docket ~/.claude/skills/docket
 ```
 
 Any other harness: symlink into its skills directory the same way
@@ -76,36 +76,36 @@ Any other harness: symlink into its skills directory the same way
 ### Put the CLI on PATH
 
 ```bash
-ln -sfn ~/.agents/skills/handoff/bin/handoff ~/.local/bin/handoff
-handoff help planner
+ln -sfn ~/.agents/skills/docket/bin/docket ~/.local/bin/docket
+docket help planner
 ```
 
-`bin/handoff` is a single stdlib-only [uv](https://docs.astral.sh/uv/) script with no
+`bin/docket` is a single stdlib-only [uv](https://docs.astral.sh/uv/) script with no
 dependencies. Replace the shebang with `#!/usr/bin/env python3` if you would rather not
 use uv; nothing else changes.
 
 ## Quick start
 
 ```bash
-cd <your project> && mkdir -p .handoff
-handoff init R01          # scaffolds .handoff/runs/R01/plan.mdx
-handoff help planner      # then follow the playbook
+cd <your project> && mkdir -p .docket
+docket init R01          # scaffolds .docket/runs/R01/plan.mdx
+docket help planner      # then follow the playbook
 ```
 
 The playbooks are the source of truth and they live in the CLI, so an installed copy
 cannot go stale:
 
 ```bash
-handoff help planner
-handoff help orchestrator
-handoff help implementor
-handoff help signalling
+docket help planner
+docket help orchestrator
+docket help implementor
+docket help signalling
 ```
 
 ## Layout of a run
 
 ```
-.handoff/runs/<run>/
+.docket/runs/<run>/
   plan.mdx                 planner's output; tasks table with a tier per task
   T03-task.mdx             assignment: goal, acceptance criteria, files, verify command
   T03-report-01.mdx        implementor fills this; round 1
@@ -121,20 +121,20 @@ Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 o
 ## Commands
 
 ```
-handoff init <run>                                    scaffold the run and plan.mdx
-handoff assign <run> <owner> [--tier small|self]
+docket init <run>                                    scaffold the run and plan.mdx
+docket assign <run> purushrestha45 [--tier small|self]
     [--harness H] [--model M] [--files ...] [--verify CMD]
-handoff submit <run> <owner>                          validate and hand off  <- the gate
-handoff decide <run> <owner> --approve | --changes    verdict; --changes opens next round
-handoff status <run>                                  every owner's round and state
-handoff watch <run> --role orchestrator|planner       block until something needs you
-handoff help <role>                                   the playbooks
+docket submit <run> purushrestha45                          validate and hand off  <- the gate
+docket decide <run> purushrestha45 --approve | --changes    verdict; --changes opens next round
+docket status <run>                                  every owner's round and state
+docket watch <run> --role orchestrator|planner       block until something needs you
+docket help <role>                                   the playbooks
 ```
 
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
 
 Report and task schemas are built in. Override them per project by dropping a
-`.handoff/templates/<report|task|plan|decision>.mdx`.
+`.docket/templates/<report|task|plan|decision>.mdx`.
 
 ## Wake signalling (optional but recommended)
 
@@ -150,7 +150,7 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command",
-          "command": "\"$HOME\"/.agents/skills/handoff/hooks/wake.sh",
+          "command": "\"$HOME\"/.agents/skills/docket/hooks/wake.sh",
           "asyncRewake": true, "timeout": 28800 } ] }
     ]
   }
@@ -160,14 +160,14 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
 Arm and disarm it around a run:
 
 ```bash
-echo "R01 orchestrator" > .handoff/watch.conf   # orchestrator waiting on implementors
-echo "R01 planner"      > .handoff/watch.conf   # planner waiting on the orchestrator
-rm .handoff/watch.conf                          # done
+echo "R01 orchestrator" > .docket/watch.conf   # orchestrator waiting on implementors
+echo "R01 planner"      > .docket/watch.conf   # planner waiting on the orchestrator
+rm .docket/watch.conf                          # done
 ```
 
 The watcher is inert unless `watch.conf` exists, so an idle project costs nothing. It must
 run in the hook's own foreground process tree — never with shell `&` — so the harness can
-tear it down with the session. See `handoff help signalling`.
+tear it down with the session. See `docket help signalling`.
 
 Harnesses without an equivalent wake hook fall back to the blocking mode described in the
 same playbook. The file protocol is identical either way.

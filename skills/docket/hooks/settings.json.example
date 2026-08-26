@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME\"/.agents/skills/handoff/hooks/wake.sh",
+            "command": "\"$HOME\"/.agents/skills/docket/hooks/wake.sh",
             "asyncRewake": true,
             "timeout": 28800
           }
