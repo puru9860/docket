@@ -11,6 +11,11 @@
 # teardown kill the watcher along with it. Backgrounding it here would orphan the
 # watcher and break that guarantee.
 #
+# This arm-a-foreground-watcher-from-Stop pattern, including the never-background rule
+# above and the exactly-once event ledger in `docket watch`, is taken from firstmate's
+# event-driven supervision: https://github.com/kunchenguid/firstmate (Kun Chen, MIT).
+# No code copied; see that project for the full-featured version.
+#
 # Inert unless .docket/watch.conf exists, so an idle project costs nothing.
 # Arm:   echo "R01 orchestrator" > .docket/watch.conf
 # Disarm: rm .docket/watch.conf

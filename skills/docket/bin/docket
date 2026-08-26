@@ -653,6 +653,11 @@ B. WAKE - the right default for real implementation work
    the hook's process group and relies on that to tear the watcher down with the
    session. A backgrounded watcher outlives the session and wakes the wrong one.
 
+The Stop-hook watcher design is borrowed from firstmate's event-driven supervision
+(https://github.com/kunchenguid/firstmate, Kun Chen, MIT) - including the
+never-background rule and the exactly-once event ledger. Use firstmate directly if you
+need parallel crews, worktree isolation, or restart-proof reconciliation.
+
 WHY NOT interval polling from inside the agent: every poll costs a turn and
 tokens, and it cannot wake an idle session. Why not a long-poll the agent must
 re-enter: it depends on the model voluntarily calling a blocking command forever,

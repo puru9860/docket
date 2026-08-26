@@ -178,6 +178,35 @@ Any multiplexer works, since the protocol is just files. If you use
 [herdr](https://github.com/kunchenguid), the orchestrator playbook has ready-made
 `tab create` / `agent start` / `agent prompt` commands and the pane-versus-tab guidance.
 
+## Acknowledgements
+
+The signalling design here is not original. It is a deliberately small take on ideas
+worked out in more depth elsewhere.
+
+- **[firstmate](https://github.com/kunchenguid/firstmate)** by Kun Chen (MIT) - the
+  wake mechanism comes from firstmate's event-driven, zero-token supervision: arm a
+  watcher from a Claude Code `Stop` hook with `asyncRewake`, keep it in the hook's own
+  **foreground** process tree instead of backgrounding it so the harness tears it down
+  with the session, and keep a ledger so each event is delivered exactly once. Its
+  `docs/turnend-guard.md` and `.agents/skills/harness-adapters/SKILL.md` also map which
+  harnesses can block on turn-end and which only allow a bounded follow-up, which is
+  research this project simply relies on.
+
+  No code is copied here. If you want the full-featured version of this idea - parallel
+  crews, git worktree isolation, restart-proof reconciliation, many multiplexer backends,
+  and a real test suite for all of it - use firstmate instead of this. `docket` covers a
+  much narrower case: one repo, three roles, a numbered paper trail.
+
+- **[lavish](https://github.com/kunchenguid/lavish-axi)** by Kun Chen (MIT) - the pattern
+  of keeping the real instructions in the CLI (`docket help <role>`) and leaving `SKILL.md`
+  as a thin pointer, so an installed copy cannot go stale.
+
+- **[skills](https://github.com/vercel-labs/skills)** by Vercel Labs - the cross-harness
+  installer that makes one skill directory work across a dozen agents.
+
+The `plan.mdx` / `report-NN.mdx` / `decision-NN.mdx` convention predates all of this; it
+started as a manual review workflow and this project just mechanised it.
+
 ## License
 
 MIT
