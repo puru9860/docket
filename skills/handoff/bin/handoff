@@ -1,0 +1,762 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Handoff: file-protocol coordination for a planner/orchestrator/implementor agent pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = ".handoff"
+REQUIRED_REPORT_SECTIONS = [
+    "Summary",
+    "Files changed",
+    "Acceptance",
+    "Verification",
+    "Decisions needed",
+]
+PLACEHOLDER = re.compile(r"<!--\s*TODO|\bTODO:|\bFIXME\b|\bXXX\b")
+
+
+# ---------------------------------------------------------------- frontmatter
+
+
+def parse(text: str) -> tuple[dict[str, str], str]:
+    """Split flat YAML-ish frontmatter from the body."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    head = text[3:end]
+    body = text[end + 4 :].lstrip("\n")
+    meta: dict[str, str] = {}
+    for line in head.splitlines():
+        if line.strip().startswith("#"):
+            line = ""
+        else:
+            # strip inline comments only when # is outside quotes
+            in_single = False
+            in_double = False
+            cut = None
+            for i, ch in enumerate(line):
+                if ch == "'" and not in_double:
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    in_double = not in_double
+                elif ch == "#" and not in_single and not in_double:
+                    cut = i
+                    break
+            if cut is not None:
+                line = line[:cut].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        meta[k.strip()] = v.strip()
+    return meta, body
+
+
+def render(meta: dict[str, str], body: str) -> str:
+    lines = "\n".join(f"{k}: {v}" for k, v in meta.items())
+    return f"---\n{lines}\n---\n\n{body.lstrip()}"
+
+
+def sections(body: str) -> dict[str, str]:
+    """Map '## Heading' -> its content."""
+    out: dict[str, str] = {}
+    cur = None
+    buf: list[str] = []
+    for line in body.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            if cur:
+                out[cur] = "\n".join(buf).strip()
+            cur = m.group(1)
+            buf = []
+        elif cur:
+            buf.append(line)
+    if cur:
+        out[cur] = "\n".join(buf).strip()
+    return out
+
+
+def is_empty(text: str) -> bool:
+    """Content that is only comments or whitespace counts as empty."""
+    stripped = re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()
+    return not stripped
+
+
+# ---------------------------------------------------------------------- paths
+
+
+def root() -> Path:
+    here = Path.cwd().resolve()
+    for d in [here, *here.parents]:
+        if (d / STATE_DIR).is_dir():
+            return d
+    return here
+
+
+def run_dir(run: str) -> Path:
+    return root() / STATE_DIR / "runs" / run
+
+
+def need_run(run: str) -> Path:
+    d = run_dir(run)
+    if not d.is_dir():
+        die(f"no such run: {run}  (try: handoff init {run})")
+    return d
+
+
+def reports(d: Path, owner: str) -> list[Path]:
+    return sorted(d.glob(f"{owner}-report-*.mdx"))
+
+
+def decisions(d: Path, owner: str) -> list[Path]:
+    return sorted(d.glob(f"{owner}-decision-*.mdx"))
+
+
+def owners(d: Path) -> list[str]:
+    """Every owner that has at least one report, task owners first."""
+    found = {p.name.split("-report-")[0] for p in d.glob("*-report-*.mdx")}
+    tasks = sorted(o for o in found if o != "orch")
+    return tasks + (["orch"] if "orch" in found else [])
+
+
+def latest(paths: list[Path]) -> Path | None:
+    return paths[-1] if paths else None
+
+
+def die(msg: str) -> None:
+    print(f"handoff: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ------------------------------------------------------------------ templates
+
+
+def template(name: str) -> str:
+    override = root() / STATE_DIR / "templates" / f"{name}.mdx"
+    if override.is_file():
+        return override.read_text()
+    return TEMPLATES[name]
+
+
+TEMPLATES = {
+    "plan": """---
+run: {run}
+status: draft
+planner: {harness}
+---
+
+# Plan: <title>
+
+## Objective
+
+<!-- TODO: what "done" means for this whole run, in 2-4 sentences -->
+
+## Approach
+
+<!-- TODO: the shape of the solution, and why this shape -->
+
+## Tasks
+
+<!-- tier=small: <=2 files, no cross-module contract change, no new dependency,
+     concrete acceptance criteria, and a runnable verify command. Everything else
+     is tier=self and the orchestrator implements it. -->
+
+| id  | title | tier  | files | verify |
+| --- | ----- | ----- | ----- | ------ |
+| T01 |       | small |       |        |
+
+## Risks
+
+## Out of scope
+""",
+    "task": """---
+run: {run}
+task: {owner}
+owner: {owner}
+tier: {tier}
+harness: {harness}
+model: {model}
+files: {files}
+verify: {verify}
+---
+
+# Task {owner}: <title>
+
+## Goal
+
+<!-- TODO: one paragraph. What must be true when this is done. -->
+
+## Acceptance criteria
+
+<!-- Each line becomes a checkbox in the report. Make them mechanically checkable. -->
+
+- [ ] <!-- TODO -->
+
+## Scope
+
+Touch only the files listed in `files:` above. If the work needs a file outside
+that list, stop and set `status: blocked` in your report instead of widening scope.
+
+## Out of scope
+
+## Context
+""",
+    "report": """---
+run: {run}
+task: {owner}
+owner: {owner}
+round: {round}
+status: draft
+harness: {harness}
+model: {model}
+---
+
+# Report: {owner} round {round}
+
+## Summary
+
+<!-- TODO: what you actually did, 2-4 sentences. No plans, only past tense. -->
+
+## Files changed
+
+<!-- TODO: one bullet per change as `path/to/file.py:120` plus a short note. Write "none" if nothing changed. -->
+
+## Acceptance
+
+<!-- Copy every criterion from the task. Check a box only when it genuinely passes. -->
+
+- [ ] <!-- TODO -->
+
+## Verification
+
+<!-- TODO: the exact command you ran and its real output. Never claim a result you did not see. -->
+
+## Decisions needed
+
+<!-- Something only the reviewer can decide? List it here and set `status: blocked`
+     in the frontmatter. Otherwise write "none". -->
+
+none
+
+## Notes
+""",
+    "decision": """---
+run: {run}
+task: {owner}
+owner: {owner}
+round: {round}
+verdict: {verdict}
+reviewer: {reviewer}
+---
+
+# Decision: {owner} round {round}
+
+## Verdict
+
+{verdict}
+
+## Required changes
+
+<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->
+
+## Answers to decisions needed
+
+<!-- Answer everything the report raised under "Decisions needed". -->
+
+## Notes
+""",
+}
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_init(a: argparse.Namespace) -> None:
+    base = root() / STATE_DIR / "runs" / a.run
+    if base.exists():
+        die(f"run {a.run} already exists at {base}")
+    (base / "docs").mkdir(parents=True)
+    plan = base / "plan.mdx"
+    plan.write_text(template("plan").format(run=a.run, harness=a.harness))
+    print(f"created {plan.relative_to(root())}")
+    print(f"\nNext: fill in the plan, then `handoff status {a.run}`.")
+
+
+def cmd_assign(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    task = d / f"{a.owner}-task.mdx"
+    if not task.exists() and a.owner != "orch":
+        task.write_text(
+            template("task").format(
+                run=a.run, owner=a.owner, tier=a.tier, harness=a.harness,
+                model=a.model, files=a.files, verify=a.verify,
+            )
+        )
+        print(f"created {task.relative_to(root())}")
+    if reports(d, a.owner):
+        die(f"{a.owner} already has a report; use `handoff decide` to open a new round")
+    rep = d / f"{a.owner}-report-01.mdx"
+    rep.write_text(
+        template("report").format(
+            run=a.run, owner=a.owner, round=1, harness=a.harness, model=a.model
+        )
+    )
+    print(f"created {rep.relative_to(root())}")
+
+
+def cmd_submit(a: argparse.Namespace) -> None:
+    """The gate. A report becomes visible to the reviewer only if it passes here."""
+    d = need_run(a.run)
+    rep = latest(reports(d, a.owner))
+    if not rep:
+        die(f"no report for {a.owner} in {a.run}")
+    meta, body = parse(rep.read_text())
+    problems: list[str] = []
+
+    status = meta.get("status", "")
+    if status not in ("draft", "blocked"):
+        die(f"{rep.name} has status: {status} - nothing to submit")
+
+    secs = sections(body)
+    for name in REQUIRED_REPORT_SECTIONS:
+        if name not in secs:
+            problems.append(f"missing section '## {name}'")
+        elif is_empty(secs[name]):
+            problems.append(f"section '## {name}' is empty")
+
+    if PLACEHOLDER.search(body):
+        for n, line in enumerate(body.splitlines(), 1):
+            if PLACEHOLDER.search(line):
+                problems.append(f"unresolved placeholder at line {n}: {line.strip()[:60]}")
+
+    acc = secs.get("Acceptance", "")
+    unchecked = [l.strip() for l in acc.splitlines() if re.match(r"^\s*-\s*\[\s*\]", l)]
+    if status == "blocked":
+        needed = secs.get("Decisions needed", "")
+        if is_empty(needed) or needed.strip().lower() in ("none", "none."):
+            problems.append(
+                "status is blocked but 'Decisions needed' says none - state what the reviewer must decide"
+            )
+    else:
+        if unchecked:
+            problems.append(
+                f"{len(unchecked)} unchecked acceptance criteria - finish them, or set status: blocked"
+            )
+        if not re.search(r"^\s*-\s*\[[xX]\]", acc, re.M):
+            problems.append("no acceptance criteria are checked off")
+
+    # Run the task's declared verify command, but only once the report itself holds up -
+    # no point spending a test run on a report that is already incomplete.
+    task = d / f"{a.owner}-task.mdx"
+    verify = ""
+    if task.is_file():
+        verify = parse(task.read_text())[0].get("verify", "").strip()
+    if verify and status != "blocked" and not a.skip_verify and not problems:
+        print(f"running verify: {verify}")
+        try:
+            r = subprocess.run(
+                verify, shell=True, cwd=root(), capture_output=True, text=True, timeout=a.verify_timeout
+            )
+            if r.returncode != 0:
+                tail = (r.stdout + r.stderr).strip().splitlines()[-15:] or ["(no output)"]
+                problems.append(
+                    f"verify command failed (exit {r.returncode}):\n      "
+                    + "\n      ".join(tail)
+                )
+            else:
+                print("verify passed")
+        except subprocess.TimeoutExpired:
+            problems.append(f"verify command timed out after {a.verify_timeout}s")
+
+    if problems:
+        print(f"\nREJECTED: {rep.name} is not ready to submit\n", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("\nFix these and run submit again. Nothing was handed off.", file=sys.stderr)
+        raise SystemExit(1)
+
+    meta["status"] = "submitted" if status == "draft" else "blocked"
+    rep.write_text(render(meta, body))
+    verdict = "blocked, needs a decision" if status == "blocked" else "submitted for review"
+    print(f"\n{rep.name}: {verdict}")
+
+
+def cmd_decide(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    rep = latest(reports(d, a.owner))
+    if not rep:
+        die(f"no report for {a.owner} in {a.run}")
+    meta, body = parse(rep.read_text())
+    if meta.get("status") not in ("submitted", "blocked"):
+        die(f"{rep.name} has status: {meta.get('status')} - only submitted or blocked reports are reviewable")
+
+    rnd = int(meta.get("round", "1"))
+    verdict = "approved" if a.approve else "changes-requested"
+    dec = d / f"{a.owner}-decision-{rnd:02d}.mdx"
+    if not dec.exists():
+        dec.write_text(
+            template("decision").format(
+                run=a.run, owner=a.owner, round=rnd, verdict=verdict, reviewer=a.reviewer
+            )
+        )
+    else:  # keep any review notes already written, just set the verdict
+        dm, db = parse(dec.read_text())
+        dm["verdict"] = verdict
+        dec.write_text(render(dm, db))
+
+    meta["status"] = verdict
+    rep.write_text(render(meta, body))
+
+    if a.approve:
+        print(f"{a.owner} round {rnd} approved -> {dec.name}")
+    else:
+        nxt = d / f"{a.owner}-report-{rnd + 1:02d}.mdx"
+        nxt.write_text(
+            template("report").format(
+                run=a.run, owner=a.owner, round=rnd + 1,
+                harness=meta.get("harness", ""), model=meta.get("model", ""),
+            )
+        )
+        print(f"{a.owner} round {rnd} needs changes -> {dec.name}")
+        print(f"opened next round -> {nxt.name}")
+        print(f"\nWrite the required changes into {dec.name}, then send the implementor to read it.")
+
+
+def state_of(d: Path, owner: str) -> tuple[int, str]:
+    rep = latest(reports(d, owner))
+    if not rep:
+        return 0, "unassigned"
+    meta, _ = parse(rep.read_text())
+    return int(meta.get("round", "1")), meta.get("status", "?")
+
+
+def cmd_status(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    plan = d / "plan.mdx"
+    pmeta = parse(plan.read_text())[0] if plan.is_file() else {}
+    print(f"run {a.run}   plan: {pmeta.get('status', 'missing')}")
+    rows = owners(d)
+    if not rows:
+        print("\nno tasks assigned yet")
+        return
+    print(f"\n  {'owner':<8} {'round':>5}  {'status':<18} tier   verify")
+    print(f"  {'-' * 8} {'-' * 5}  {'-' * 18} {'-' * 6} {'-' * 20}")
+    for o in rows:
+        rnd, st = state_of(d, o)
+        task = d / f"{o}-task.mdx"
+        tm = parse(task.read_text())[0] if task.is_file() else {}
+        print(f"  {o:<8} {rnd:>5}  {st:<18} {tm.get('tier', '-'):<6} {tm.get('verify', '-')[:20]}")
+    pending = [o for o in rows if state_of(d, o)[1] not in ("approved",)]
+    print(f"\n{len(rows) - len(pending)}/{len(rows)} approved")
+
+
+# --------------------------------------------------------------------- watch
+
+
+def events(d: Path, role: str) -> list[tuple[str, str]]:
+    """Actionable (key, message) pairs for a supervising role."""
+    out: list[tuple[str, str]] = []
+    scope = [o for o in owners(d) if o != "orch"] if role == "orchestrator" else ["orch"]
+    for o in scope:
+        rnd, st = state_of(d, o)
+        if st == "submitted":
+            out.append((f"{o}:{rnd}:submitted", f"{o} submitted round {rnd} for review"))
+        elif st == "blocked":
+            out.append((f"{o}:{rnd}:blocked", f"{o} is BLOCKED at round {rnd} and needs a decision"))
+    if role == "orchestrator" and scope:
+        if all(state_of(d, o)[1] == "approved" for o in scope):
+            out.append(("all:approved", f"all {len(scope)} delegated tasks approved - do your own tasks and report"))
+    return out
+
+
+def cmd_watch(a: argparse.Namespace) -> None:
+    """Block with no token cost until something needs the caller, then exit 2 to wake it.
+
+    Designed to be armed from a Claude Code Stop hook with asyncRewake: true.
+    Must run in the foreground of the hook's process tree - never with shell '&'.
+    """
+    d = need_run(a.run)
+    ledger = d / ".woke"
+    seen = set(ledger.read_text().split()) if ledger.is_file() else set()
+    deadline = time.monotonic() + a.timeout
+
+    while True:
+        fresh = [(k, m) for k, m in events(d, a.role) if k not in seen]
+        if fresh:
+            with ledger.open("a") as f:
+                for k, _ in fresh:
+                    f.write(k + "\n")
+            print(
+                f"handoff [{a.run}]: {len(fresh)} item(s) need you:\n"
+                + "\n".join(f"  - {m}" for _, m in fresh)
+                + f"\n\nRun `handoff status {a.run}`, then review the submitted report(s).",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if time.monotonic() >= deadline:
+            raise SystemExit(0)
+        time.sleep(min(a.interval, max(1, deadline - time.monotonic())))
+
+
+# ---------------------------------------------------------------------- help
+
+PLAYBOOKS = {
+    "planner": """PLANNER / REVIEWER  (biggest model; the session the human talks to)
+
+You own the plan and the final review. You do not write implementation code.
+
+1. Scaffold and plan
+     handoff init <run-id>
+   Fill plan.mdx. In the Tasks table, set tier per task using this checklist -
+   tier=small ONLY if ALL of these hold:
+     - touches at most 2 files
+     - no cross-module contract or API change
+     - no new dependency
+     - acceptance criteria are mechanically checkable
+     - there is a runnable verify command
+   Anything else is tier=self. When in doubt, self. A small model given an
+   ambiguous task produces a confident wrong answer, which costs more to
+   review than to have written yourself.
+
+   Set plan.mdx `status: approved` only after the human approves it.
+
+2. Hand off to the orchestrator, in its own tab so it never crowds your session:
+     herdr tab create --cwd "$PWD" --label orch --no-focus
+     herdr agent start orch --kind codex --pane <root-pane-id-from-json>
+     herdr agent prompt orch "Read .handoff/runs/<run>/plan.mdx and run the \\
+       orchestrator role. Read: handoff help orchestrator" --wait --timeout 600000
+
+3. Review the orchestrator's report when woken
+     handoff status <run>
+   Read orch-report-NN.mdx. Judge it against plan.mdx, not against its own summary.
+   Then:
+     handoff decide <run> orch --approve
+     handoff decide <run> orch --changes --reviewer planner
+   On --changes, write specific numbered edits into orch-decision-NN.mdx citing
+   file:line, then send the orchestrator back to read it.
+
+Never accept a report you have not read. `submitted` means it passed a schema
+check, not that the work is right.""",
+    "orchestrator": """ORCHESTRATOR / IMPLEMENTOR  (mid model)
+
+You split the plan, delegate the simple half, implement the complex half, and
+review everything the small models produce before the planner ever sees it.
+
+1. Read the plan
+     handoff status <run>
+   Read plan.mdx. Trust its tier column, but override it downward (small -> self)
+   if a task looks ambiguous to you. Never override upward.
+
+2. Open every task
+     handoff assign <run> T03 --tier small --harness opencode --model haiku \\
+       --files "src/a.py" --verify "pytest tests/test_a.py"
+   This writes T03-task.mdx and an empty T03-report-01.mdx. Fill in the task's
+   Goal and Acceptance criteria yourself - this is the highest-leverage thing you
+   do. A small model succeeds or fails on the quality of its acceptance criteria.
+
+3. Dispatch, at most 2-3 at a time
+   Give each implementor its OWN TAB, not a split of yours. Three agents sharing
+   one tab is unreadable, and you cannot review a diff in a 20-column pane.
+
+     herdr tab create --cwd "$PWD" --label impl-t03 --no-focus
+     # read .result.root_pane.pane_id from the JSON
+     herdr agent start impl-t03 --kind opencode --pane <root-pane-id> -- --model haiku
+     herdr agent prompt impl-t03 "Read .handoff/runs/<run>/T03-task.mdx and run \\
+       the implementor role. Read: handoff help implementor" --wait --timeout 600000
+
+   ALWAYS address an agent by its name, never by pane id. A pane moved between
+   workspaces gets a NEW pane id, but the live agent name keeps resolving, so
+   name-addressing survives any layout change you or the captain make later.
+
+   Layout, for the human watching:
+     ctrl+b then z        zoom the focused pane fullscreen (toggle)
+     ctrl+b then 1..9     switch tabs
+     herdr agent focus impl-t03            jump to an agent
+     herdr agent attach impl-t03 --takeover  drive it by hand
+     herdr pane move <pane> --new-tab --label impl-t03 --no-focus   rescue a crammed pane
+
+   Do not watch panes to track progress - use `handoff status <run>`. Panes are for
+   when you need to look at ONE agent closely.
+
+   Parallel implementors must have disjoint `files:` lists. If two tasks touch the
+   same file, run them in sequence instead.
+
+4. Review each submission
+   You are woken when a report is submitted or blocked. Read the report AND the
+   diff - never the report alone. Then:
+     handoff decide <run> T03 --approve
+     handoff decide <run> T03 --changes
+   --changes opens T03-report-02.mdx automatically. Write the required changes into
+   T03-decision-NN.mdx, then:
+     herdr agent prompt impl-t03 "Read .handoff/runs/<run>/T03-decision-01.mdx \\
+       and apply it." --wait --timeout 600000
+
+   Cap this at 3 rounds per task. If round 3 still fails, take the task over
+   yourself and say so in your own report. Looping a small model past 3 rounds
+   costs more than doing it.
+
+5. Finish your own work, then report
+   Once every delegated task is approved, implement the tier=self tasks, then:
+     handoff assign <run> orch
+     # fill orch-report-01.mdx
+     handoff submit <run> orch
+   Your report must cover both what you delegated and what you wrote.""",
+    "signalling": """SIGNALLING  (how a supervisor learns a subordinate is done)
+
+Two mechanisms. Use the blocking one for short tasks, the wake one for real work.
+
+A. BLOCKING - fine for tasks under ~8 minutes
+     herdr agent prompt impl-t03 "..." --wait --timeout 480000
+   Returns when the agent settles to idle, done, or blocked. Simple, but a Claude
+   Code foreground Bash call is capped at 600s, so anything longer will cut out.
+
+   Note --wait tracks lifecycle state, not one specific turn: prompting an agent
+   that is already working can return on the PREVIOUS turn finishing. So never
+   treat a --wait return as proof of completion. The report file is the truth.
+
+B. WAKE - the right default for real implementation work
+   The supervisor finishes its turn and goes idle at zero token cost. A watcher
+   sleeps in the background and re-enters the session only when something is
+   actionable.
+
+   One-time setup, per project:
+     mkdir -p .claude
+     cp "$HOME"/.agents/skills/handoff/hooks/settings.json.example .claude/settings.json
+   (Merge it into an existing settings.json rather than overwriting.)
+
+   Arm it when you start delegating:
+     echo "<run> orchestrator" > .handoff/watch.conf     # orchestrator waiting on impls
+     echo "<run> planner"      > .handoff/watch.conf     # planner waiting on the orchestrator
+   Disarm when the run ends:
+     rm .handoff/watch.conf
+
+   You will be woken with a system reminder naming what needs you. Then:
+     handoff status <run>
+
+   Each event is delivered exactly once - the ledger at .handoff/runs/<run>/.woke
+   dedupes - so you will not be woken repeatedly for the same submission.
+
+   The watcher must run in the hook's foreground process tree. Never launch
+   `handoff watch` with shell '&', nohup, or a detached process: Claude Code owns
+   the hook's process group and relies on that to tear the watcher down with the
+   session. A backgrounded watcher outlives the session and wakes the wrong one.
+
+WHY NOT interval polling from inside the agent: every poll costs a turn and
+tokens, and it cannot wake an idle session. Why not a long-poll the agent must
+re-enter: it depends on the model voluntarily calling a blocking command forever,
+which is the one thing a prompt cannot guarantee. The Stop hook inverts it - the
+harness re-enters the model.""",
+    "implementor": """IMPLEMENTOR  (small model)
+
+You implement exactly one task and write an honest report. That is all.
+
+1. Read your task file end to end. It names the only files you may touch.
+
+2. Implement it. Stay inside `files:`. If the work genuinely needs a file outside
+   that list, do not widen the scope - go to step 4 and set status: blocked.
+
+3. Run the `verify:` command from your task file yourself, and read its output.
+
+4. Fill in your report (<owner>-report-NN.mdx). Every section is required:
+     Summary          past tense, what you did
+     Files changed    `path:line` bullets, or "none"
+     Acceptance       copy each criterion; check [x] ONLY if it truly passes
+     Verification     the exact command and its real output
+     Decisions needed the reviewer's call, or "none"
+
+   If you are stuck or the task is ambiguous, set `status: blocked` in the
+   frontmatter and write what you need decided under "Decisions needed". A
+   blocked report is a good outcome. A report claiming success that does not
+   hold up is the only bad one.
+
+5. Submit
+     handoff submit <run> <owner>
+   This validates your report and runs your verify command. If it rejects, it
+   tells you exactly what is wrong. Fix and resubmit. Nothing reaches the
+   reviewer until it passes, so a rejection costs nothing but your own time.
+
+6. If you receive a decision file, read it, apply every numbered change, then
+   fill the NEW report round and submit again.
+
+Never mark an acceptance criterion [x] to make submit pass. The reviewer reads
+the diff.""",
+}
+
+
+def cmd_help(a: argparse.Namespace) -> None:
+    if a.role not in PLAYBOOKS:
+        die(f"unknown role: {a.role}  (choose from: {', '.join(PLAYBOOKS)})")
+    print(PLAYBOOKS[a.role])
+
+
+# --------------------------------------------------------------------- parser
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="handoff", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("init", help="scaffold a run and its plan")
+    q.add_argument("run")
+    q.add_argument("--harness", default="claude")
+    q.set_defaults(fn=cmd_init)
+
+    q = sub.add_parser("assign", help="open a task and its first report")
+    q.add_argument("run")
+    q.add_argument("owner", help="task id such as T03, or 'orch'")
+    q.add_argument("--tier", default="small", choices=["small", "self"])
+    q.add_argument("--harness", default="")
+    q.add_argument("--model", default="")
+    q.add_argument("--files", default="")
+    q.add_argument("--verify", default="")
+    q.set_defaults(fn=cmd_assign)
+
+    q = sub.add_parser("submit", help="validate a report and hand it to the reviewer")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--skip-verify", action="store_true", help="skip the task's verify command")
+    q.add_argument("--verify-timeout", type=int, default=900)
+    q.set_defaults(fn=cmd_submit)
+
+    q = sub.add_parser("decide", help="approve a report or request changes")
+    q.add_argument("run")
+    q.add_argument("owner")
+    g = q.add_mutually_exclusive_group(required=True)
+    g.add_argument("--approve", action="store_true")
+    g.add_argument("--changes", action="store_true")
+    q.add_argument("--reviewer", default="orch")
+    q.set_defaults(fn=cmd_decide)
+
+    q = sub.add_parser("status", help="show every owner's round and state")
+    q.add_argument("run")
+    q.set_defaults(fn=cmd_status)
+
+    q = sub.add_parser("watch", help="block until something needs you, then exit 2")
+    q.add_argument("run")
+    q.add_argument("--role", default="orchestrator", choices=["orchestrator", "planner"])
+    q.add_argument("--interval", type=int, default=5)
+    q.add_argument("--timeout", type=int, default=28800)
+    q.set_defaults(fn=cmd_watch)
+
+    q = sub.add_parser("help", help="print a role playbook")
+    q.add_argument("role", choices=list(PLAYBOOKS))
+    q.set_defaults(fn=cmd_help)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
