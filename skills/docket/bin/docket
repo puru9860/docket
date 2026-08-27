@@ -536,7 +536,7 @@ def cmd_doctor(a: argparse.Namespace) -> None:
     inside = os.environ.get("HERDR_ENV") == "1"
     if herdr and inside:
         print(f"  [{ok}] herdr, and this session is inside a herdr pane")
-        print("         -> use `herdr tab create` + `herdr agent start/prompt`. Best option.")
+        print("         -> use `herdr pane split` + `herdr agent start/prompt`. Best option.")
     elif herdr:
         print(f"  [{warn}] herdr installed, but this session is NOT inside a herdr pane")
         print("         HERDR_ENV is unset, so herdr cannot be driven from here.")
@@ -593,9 +593,9 @@ You own the plan and the final review. You do not write implementation code.
 
    Set plan.mdx `status: approved` only after the human approves it.
 
-2. Hand off to the orchestrator, in its own tab so it never crowds your session:
-     herdr tab create --cwd "$PWD" --label orch --no-focus
-     herdr agent start orch --kind codex --pane <root-pane-id-from-json>
+2. Hand off to the orchestrator, in a sibling pane so you can watch it:
+     herdr pane split --current --direction right --cwd "$PWD" --no-focus
+     herdr agent start orch --kind codex --pane <pane-id-from-json>
      herdr agent prompt orch "Read .docket/runs/<run>/plan.mdx and run the \\
        orchestrator role. Read: docket help orchestrator" --wait --timeout 600000
 
@@ -631,13 +631,15 @@ review everything the small models produce before the planner ever sees it.
    FIRST run `docket doctor` to see which of these you actually have. docket needs
    none of them - the protocol is files - but the dispatch command differs.
 
-   (a) herdr, and you are inside a herdr pane - best option, gives each implementor
-       its own tab. Three agents sharing one tab is unreadable and you cannot review
-       a diff in a 20-column pane.
+   (a) herdr, and you are inside a herdr pane - best option. Give each implementor a
+       sibling pane, then zoom to read one closely.
 
-     herdr tab create --cwd "$PWD" --label impl-t03 --no-focus
-     # read .result.root_pane.pane_id from the JSON
-     herdr agent start impl-t03 --kind opencode --pane <root-pane-id> -- --model haiku
+     # check the caller's shape first, then split the long axis:
+     #   wide pane -> --direction right,  narrow or tall pane -> --direction down
+     herdr pane layout --pane "$HERDR_PANE_ID"
+     herdr pane split --current --direction right --cwd "$PWD" --no-focus
+     # read .result.pane.pane_id from the JSON
+     herdr agent start impl-t03 --kind opencode --pane <pane-id> -- --model haiku
      herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-task.mdx and run \\
        the implementor role. Read: docket help implementor" --wait --timeout 600000
 
@@ -661,15 +663,19 @@ review everything the small models produce before the planner ever sees it.
    workspaces gets a NEW pane id, but the live agent name keeps resolving, so
    name-addressing survives any layout change you or the captain make later.
 
+   Never make repeated splits in the SAME direction - that produces unusably narrow
+   columns. Alternate right then down, and cap yourself at 2-3 implementor panes.
+
    Layout, for the human watching:
-     ctrl+b then z        zoom the focused pane fullscreen (toggle)
-     ctrl+b then 1..9     switch tabs
-     herdr agent focus impl-t03            jump to an agent
-     herdr agent attach impl-t03 --takeover  drive it by hand
-     herdr pane move <pane> --new-tab --label impl-t03 --no-focus   rescue a crammed pane
+     ctrl+b then z          zoom the focused pane fullscreen (toggle)
+     ctrl+b then Tab        cycle to the next pane
+     ctrl+b then h/j/k/l    focus a pane by direction
+     herdr agent focus impl-t03              jump straight to an agent
+     herdr agent attach impl-t03 --takeover  drive one by hand
+     herdr pane zoom --pane <id> --on        zoom a specific pane programmatically
 
    Do not watch panes to track progress - use `docket status <run>`. Panes are for
-   when you need to look at ONE agent closely.
+   when you need to look at ONE agent closely, zoomed.
 
    Parallel implementors must have disjoint `files:` lists. If two tasks touch the
    same file, run them in sequence instead.

@@ -204,7 +204,8 @@ same playbook. The file protocol is identical either way.
 
 Any multiplexer works, since the protocol is just files. If you use
 [herdr](https://github.com/kunchenguid), the orchestrator playbook has ready-made
-`tab create` / `agent start` / `agent prompt` commands and the pane-versus-tab guidance.
+`pane split` / `agent start` / `agent prompt` commands, plus the split-direction and
+zoom guidance for keeping 2-3 agent panes readable.
 
 ## Acknowledgements
 
