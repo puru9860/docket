@@ -215,6 +215,16 @@ Any multiplexer works, since the protocol is just files. If you use
 `pane split` / `agent start` / `agent prompt` commands, plus the split-direction and
 zoom guidance for keeping 2-3 agent panes readable.
 
+## Contributing / modifying docket
+
+Read **[ARCHITECTURE.md](ARCHITECTURE.md)** for the data model, the lifecycle, why the
+signalling works the way it does, the invariants, and the known gaps.
+**[AGENTS.md](AGENTS.md)** is the entry point for an agent working on this repo.
+
+```bash
+tests/test.sh    # 44 assertions; must be 0 failures
+```
+
 ## Acknowledgements
 
 The signalling design here is not original. It is a deliberately small take on ideas
