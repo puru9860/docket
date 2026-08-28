@@ -154,6 +154,8 @@ docket assign <run> <owner> [--tier small|self]
 docket submit <run> <owner>                          validate and hand off  <- the gate
 docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
 docket status <run>                                  every owner's round and state
+docket arm <run> --role R                            arm the watcher for a waiting role
+docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
 docket watch <run> --role orchestrator|planner       block until something needs you
 docket help <role>                                   the playbooks
@@ -185,13 +187,19 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
 }
 ```
 
-Arm and disarm it around a run:
+Arm **every role that will wait**, then disarm when the run ends:
 
 ```bash
-echo "R01 orchestrator" > .docket/watch.conf   # orchestrator waiting on implementors
-echo "R01 planner"      > .docket/watch.conf   # planner waiting on the orchestrator
-rm .docket/watch.conf                          # done
+docket arm R01 --role orchestrator   # waiting on implementors
+docket arm R01 --role planner        # waiting on the orchestrator
+docket disarm R01                    # done
 ```
+
+A role that is not armed is never woken, silently. `docket doctor` lists every armed
+pair so you can check. Each role keeps its own ledger, so an orchestrator and a planner
+watching the same run cannot consume each other's events, and each wake line is tagged
+with the role it belongs to. Set `DOCKET_ROLE=<role>` in a session to be woken only for
+that role.
 
 The watcher is inert unless `watch.conf` exists, so an idle project costs nothing. It must
 run in the hook's own foreground process tree — never with shell `&` — so the harness can

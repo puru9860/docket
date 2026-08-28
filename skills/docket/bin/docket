@@ -481,27 +481,110 @@ def events(d: Path, role: str) -> list[tuple[str, str]]:
     return out
 
 
+ROLES = ("orchestrator", "planner")
+
+
+def armed() -> list[tuple[str, str]]:
+    """Every (run, role) pair armed in .docket/watch.conf. One pair per line."""
+    conf = root() / STATE_DIR / "watch.conf"
+    if not conf.is_file():
+        return []
+    out: list[tuple[str, str]] = []
+    for line in conf.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        role = parts[1] if len(parts) > 1 else "orchestrator"
+        if role in ROLES and (parts[0], role) not in out:
+            out.append((parts[0], role))
+    return out
+
+
+def ledger_for(d: Path, role: str) -> Path:
+    """Per-role ledger, so two supervisors never consume each other's events."""
+    led = d / f".woke-{role}"
+    legacy = d / ".woke"
+    if not led.exists() and legacy.is_file():
+        led.write_text(legacy.read_text())  # migrate the old shared ledger once
+    return led
+
+
+def cmd_arm(a: argparse.Namespace) -> None:
+    need_run(a.run)
+    conf = root() / STATE_DIR / "watch.conf"
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    pairs = armed()
+    if (a.run, a.role) in pairs:
+        print(f"already armed: {a.run} {a.role}")
+    else:
+        pairs.append((a.run, a.role))
+        conf.write_text("".join(f"{r} {ro}\n" for r, ro in pairs))
+        print(f"armed: {a.run} {a.role}")
+    print("\narmed now:")
+    for r, ro in armed():
+        print(f"  {r} {ro}")
+
+
+def cmd_disarm(a: argparse.Namespace) -> None:
+    conf = root() / STATE_DIR / "watch.conf"
+    keep = [
+        (r, ro) for r, ro in armed()
+        if not ((a.run in (None, r)) and (a.role in (None, ro)))
+    ]
+    if not keep:
+        conf.unlink(missing_ok=True)
+        print("disarmed everything")
+        return
+    conf.write_text("".join(f"{r} {ro}\n" for r, ro in keep))
+    print("armed now:")
+    for r, ro in keep:
+        print(f"  {r} {ro}")
+
+
 def cmd_watch(a: argparse.Namespace) -> None:
-    """Block with no token cost until something needs the caller, then exit 2 to wake it.
+    """Block with no token cost until something needs a watched role, then exit 2.
 
-    Designed to be armed from a Claude Code Stop hook with asyncRewake: true.
-    Must run in the foreground of the hook's process tree - never with shell '&'.
+    Armed from a Claude Code Stop hook with asyncRewake: true. Must run in the
+    foreground of the hook's process tree - never with shell '&'.
+
+    Each role gets its own ledger, so an orchestrator and a planner watching the
+    same run never consume each other's events.
     """
-    d = need_run(a.run)
-    ledger = d / ".woke"
-    seen = set(ledger.read_text().split()) if ledger.is_file() else set()
-    deadline = time.monotonic() + a.timeout
+    if a.armed:
+        pairs = armed()
+        if a.role:
+            pairs = [pr for pr in pairs if pr[1] in a.role]
+    else:
+        if not a.run:
+            die("give a run id, or --armed to watch everything in watch.conf")
+        pairs = [(a.run, r) for r in (a.role or ["orchestrator"])]
 
+    pairs = [(r, ro) for r, ro in pairs if run_dir(r).is_dir()]
+    if not pairs:
+        raise SystemExit(0)
+
+    deadline = time.monotonic() + a.timeout
     while True:
-        fresh = [(k, m) for k, m in events(d, a.role) if k not in seen]
+        fresh: list[tuple[str, str, Path, str, str]] = []
+        for run, role in pairs:
+            d = run_dir(run)
+            led = ledger_for(d, role)
+            seen = set(led.read_text().split()) if led.is_file() else set()
+            for k, m in events(d, role):
+                if k not in seen:
+                    fresh.append((run, role, led, k, m))
         if fresh:
-            with ledger.open("a") as f:
-                for k, _ in fresh:
-                    f.write(k + "\n")
+            for led in {f[2] for f in fresh}:
+                with led.open("a") as fh:
+                    for _, _, l2, k, _ in fresh:
+                        if l2 == led:
+                            fh.write(k + "\n")
+            lines = [f"  - [{role}] {run}: {m}" for run, role, _, _, m in fresh]
             print(
-                f"docket [{a.run}]: {len(fresh)} item(s) need you:\n"
-                + "\n".join(f"  - {m}" for _, m in fresh)
-                + f"\n\nRun `docket status {a.run}`, then review the submitted report(s).",
+                f"docket: {len(fresh)} item(s) need you:\n" + "\n".join(lines)
+                + "\n\nRun `docket status <run>` for the run named above, then review it."
+                + "\nIf a line's role is not the role this session is playing, ignore it.",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -561,11 +644,21 @@ def cmd_doctor(a: argparse.Namespace) -> None:
     print("\nWake signalling (optional; without it a supervisor blocks instead of idling)")
     settings = root() / ".claude" / "settings.json"
     wired = settings.is_file() and "asyncRewake" in settings.read_text()
-    print(f"  [{ok if wired else warn}] Stop hook in {settings.relative_to(root()) if settings.is_file() else '.claude/settings.json'}"
+    print(f"  [{ok if wired else warn}] Stop hook in .claude/settings.json"
           + ("" if wired else "  - see `docket help signalling`"))
-    conf = root() / STATE_DIR / "watch.conf"
-    print(f"  [{ok if conf.is_file() else ok}] watcher "
-          + (f"armed: {conf.read_text().strip()}" if conf.is_file() else "not armed (correct when idle)"))
+    pairs = armed()
+    if pairs:
+        print(f"  [{ok}] watcher armed:")
+        for r, ro in pairs:
+            print(f"           {r}  role={ro}")
+        roles = {ro for _, ro in pairs}
+        if len(roles) == 1:
+            print(f"  [{warn}] only '{list(roles)[0]}' is armed. A supervisor whose role is not")
+            print("         armed will NEVER be woken. Arm each waiting role:")
+            print("           docket arm <run> --role orchestrator")
+            print("           docket arm <run> --role planner")
+    else:
+        print(f"  [{ok}] watcher not armed (correct when idle)")
 
     print("\ndocket itself works with none of the optional pieces above.")
     print("The protocol is files; dispatch and wake are conveniences.")
@@ -723,11 +816,21 @@ B. WAKE - the right default for real implementation work
      cp "$HOME"/.agents/skills/docket/hooks/settings.json.example .claude/settings.json
    (Merge it into an existing settings.json rather than overwriting.)
 
-   Arm it when you start delegating:
-     echo "<run> orchestrator" > .docket/watch.conf     # orchestrator waiting on impls
-     echo "<run> planner"      > .docket/watch.conf     # planner waiting on the orchestrator
-   Disarm when the run ends:
-     rm .docket/watch.conf
+   ARM EVERY ROLE THAT WILL WAIT. This is the one thing people get wrong: a role
+   that is not armed is NEVER woken, silently. The planner waiting on the
+   orchestrator needs its own arm line even if the orchestrator is already armed.
+
+     docket arm <run> --role orchestrator    # waiting on implementors
+     docket arm <run> --role planner         # waiting on the orchestrator
+     docket disarm <run>                     # when the run ends
+
+   Check with `docket doctor`, which lists every armed pair.
+
+   Each role keeps its own ledger (.woke-<role>), so an orchestrator and a planner
+   watching the same run never consume each other's events. Every armed role is
+   watched by every session's hook, and each wake line is tagged with the role it
+   belongs to - ignore a line whose role is not the one you are playing. Set
+   DOCKET_ROLE=<role> in a session's environment to be woken only for your own role.
 
    You will be woken with a system reminder naming what needs you. Then:
      docket status <run>
@@ -836,11 +939,23 @@ def main() -> None:
     q.set_defaults(fn=cmd_status)
 
     q = sub.add_parser("watch", help="block until something needs you, then exit 2")
-    q.add_argument("run")
-    q.add_argument("--role", default="orchestrator", choices=["orchestrator", "planner"])
+    q.add_argument("run", nargs="?")
+    q.add_argument("--role", action="append", choices=["orchestrator", "planner"],
+                   help="repeatable; defaults to orchestrator, or every armed role with --armed")
+    q.add_argument("--armed", action="store_true", help="watch every pair in .docket/watch.conf")
     q.add_argument("--interval", type=int, default=5)
     q.add_argument("--timeout", type=int, default=28800)
     q.set_defaults(fn=cmd_watch)
+
+    q = sub.add_parser("arm", help="arm the watcher for a run and role")
+    q.add_argument("run")
+    q.add_argument("--role", required=True, choices=["orchestrator", "planner"])
+    q.set_defaults(fn=cmd_arm)
+
+    q = sub.add_parser("disarm", help="disarm a run/role, or everything")
+    q.add_argument("run", nargs="?")
+    q.add_argument("--role", choices=["orchestrator", "planner"])
+    q.set_defaults(fn=cmd_disarm)
 
     q = sub.add_parser("doctor", help="report available dispatch and wake options")
     q.set_defaults(fn=cmd_doctor)

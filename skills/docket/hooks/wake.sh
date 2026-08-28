@@ -17,17 +17,23 @@
 # No code copied; see that project for the full-featured version.
 #
 # Inert unless .docket/watch.conf exists, so an idle project costs nothing.
-# Arm:   echo "R01 orchestrator" > .docket/watch.conf
-# Disarm: rm .docket/watch.conf
+# Arm:    docket arm R01 --role orchestrator     (repeat per waiting role)
+# Disarm: docket disarm R01
 set -u
 
 ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
 CONF="$ROOT/.docket/watch.conf"
 
 [ -f "$CONF" ] || exit 0
-read -r RUN ROLE _ < "$CONF" || exit 0
-[ -n "${RUN:-}" ] || exit 0
-
 cd "$ROOT" || exit 0
-exec "$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket" \
-  watch "$RUN" --role "${ROLE:-orchestrator}" --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
+
+DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
+
+# Watch EVERY armed (run, role) pair, not just the first line. Each role has its own
+# ledger, so an orchestrator and a planner watching the same run never consume each
+# other's events. Set DOCKET_ROLE to filter this session to one role and avoid being
+# woken for another role's work.
+if [ -n "${DOCKET_ROLE:-}" ]; then
+  exec "$DOCKET" watch --armed --role "$DOCKET_ROLE" --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
+fi
+exec "$DOCKET" watch --armed --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
