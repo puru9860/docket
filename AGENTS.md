@@ -13,8 +13,8 @@ project, that is a different thing: read `skills/docket/SKILL.md` and run
 
 ## Where things live
 
-Everything is one stdlib-only Python script: `skills/docket/bin/docket`.
-`ARCHITECTURE.md` has a code map of its regions.
+The stdlib-only CLI is `skills/docket/bin/docket`; role playbooks live in
+`skills/docket/references/`. `ARCHITECTURE.md` has the complete code and data map.
 
 The repo layout is fixed by the `skills` CLI convention - `skills/<name>/SKILL.md` is how
 installers find it. Do not move it.
@@ -47,13 +47,14 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
 - No dependencies. `bin/docket` is stdlib-only and must stay runnable as a plain
   `python3` script if someone swaps the shebang.
 - No em dashes in prose, use a plain dash.
-- Playbooks live in the `PLAYBOOKS` dict in the CLI, never in `SKILL.md`. That is what
-  keeps installed copies from going stale.
+- Detailed playbooks live in `skills/docket/references/`, not duplicated in `SKILL.md`.
+  `docket help <role>` reads those installed files directly.
 - Do not weaken the gate. If a report is getting rejected, the report is wrong, not the
   gate. `--skip-verify` exists for a broken verify command, not for a hurried report.
 - Do not make `status: blocked` harder to use than submitting. An honest block is the
   behaviour the whole design is trying to buy.
-- Keep frontmatter flat. No YAML library, no nested structures, no parallel state file.
+- Keep frontmatter flat. No YAML library or nested structures. Snapshot and baseline JSON
+  may hold mechanical evidence, but lifecycle state stays in document frontmatter.
 
 ## Things that look like bugs but are not
 

@@ -1,96 +1,85 @@
 ---
 name: docket
-description: Run a planner/orchestrator/implementor pipeline across coding agents, coordinated through numbered .mdx docket files with a mechanical report-validation gate and zero-token wake signalling. Use when splitting an implementation task across a reviewing agent, an orchestrating agent, and smaller implementor agents, or when the user invokes /docket.
+description: Coordinate planned coding work through standardized task and aggregate reports, using Claude Code, Codex, or OpenCode in split or combined planner/orchestrator topologies. Use for multi-agent implementation pipelines or when the user invokes /docket.
 metadata:
   argument-hint: <run-id> or the task to plan
 ---
 
 # Docket
 
-Three roles, three model tiers, one file protocol.
+Docket minimizes expensive supervisor context by coordinating work through files.
+It supports only Claude Code (`claude`), Codex (`codex`, temporary compatibility),
+and OpenCode (`opencode`).
 
-- **planner/reviewer** (biggest model) writes the plan and does the final review
-- **orchestrator/implementor** (mid model) splits the plan, delegates the simple half,
-  implements the complex half, and reviews everything the small models produce
-- **implementor** (small model) implements exactly one task and writes an honest report
+The logical roles are planner/reviewer, orchestrator, and implementor. They need
+not always be three agents:
 
-Roles run as separate agents, on any harness, in any mix. They never talk directly.
-They coordinate only through files, so no role needs to know what harness the others use.
+- `split`: planner and orchestrator are separate; the planner sees only the
+  orchestrator's aggregate report.
+- `combined`: one agent performs planner/reviewer and orchestrator duties; cheap
+  implementors may remain separate.
 
-## Read your role playbook first
-
-The playbooks are the source of truth and they live in the CLI, so an installed copy
-of this file cannot go stale:
-
-```bash
-docket help planner        # or: orchestrator, implementor, signalling
-```
-
-Read `docket help signalling` before delegating anything - it explains how a
-supervisor learns a subordinate finished without polling or burning tokens.
-
-## The two rules that matter
-
-**The report file is the truth.** Not an agent's chat message, not a terminal read,
-not a lifecycle state. Terminal scrollback is lossy (agents run on the alternate
-screen and rows that scroll off are gone), and a settled `idle` state does not mean
-the work is correct. Read the `.mdx` file, and read the diff.
-
-**`docket submit` is a gate, not a formality.** It rejects a report with unfilled
-placeholders, empty required sections, unchecked acceptance criteria, or a failing
-`verify:` command. A rejected report is never handed to the reviewer, so a small
-model cannot report success it did not achieve. Rejections cost nothing but the
-implementor's own time.
-
-## Layout
-
-```
-.docket/runs/<run>/
-  plan.mdx                 planner's output; tasks table with tier per task
-  T03-task.mdx             assignment: goal, acceptance criteria, files, verify command
-  T03-report-01.mdx        implementor fills this; round 1
-  T03-decision-01.mdx      reviewer's verdict and required changes
-  T03-report-02.mdx        opened automatically when changes are requested
-  orch-report-01.mdx       orchestrator's own report, reviewed by the planner
-  docs/                    supporting docs
-  .woke                    wake ledger; delivers each event exactly once
-```
-
-Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 of T03.
-
-## Commands
+Choose and read the relevant playbook completely before acting:
 
 ```bash
-docket init <run>                                    scaffold the run and plan.mdx
-docket assign <run> <owner> [--tier small|self] \
-    [--harness H] [--model M] [--files ...] [--verify CMD]
-docket submit <run> <owner>                          validate and hand off  <- the gate
-docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
-docket status <run>                                  every owner's round and state
-docket watch <run> --role orchestrator|planner       block until something needs you
-docket help <role>                                   the playbooks
+docket help planner
+docket help orchestrator
+docket help implementor
+docket help signalling
 ```
 
-`owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
+The task file defines intent; the implementor-owned discovery capsule defines the
+change surface and verification. The latest ready partial-work checkpoint and
+task-local diff preserve continuity. The submitted report and task-local diff are
+the review truth. Agent chat, terminal scrollback, and lifecycle state are not
+completion evidence.
 
-Templates are built in. To customize a report schema for a project, drop an override
-in `.docket/templates/<report|task|plan|decision>.mdx`.
+Repository understanding belongs in the cheap implementor harness. Supervisors
+provide goals, acceptance criteria, constraints, and optional hints - not mandatory
+code maps. The implementor discovers progressively, submits its capsule through
+`docket scope`, and continues silently when Docket finds no collision. Only a real
+scope collision wakes the orchestrator for sequencing or ownership.
 
-## Install
+In split topology, preserve the cost boundary: the planner must not monitor
+implementors, read task reports, receive task-level wakes, or give the human
+per-task implementation updates. The orchestrator handles all of that and submits
+one standardized `orch-report-NN.mdx`.
 
-`bin/docket` is a stdlib-only `uv run` script with no dependencies. Put it on PATH:
+`progress_updates: quiet` is the default in both topologies. After announcing a
+dispatch, do not narrate healthy task activity such as coding, file edits, test
+execution, lifecycle state, or “still working.” Wait without polling or producing
+model turns. Speak again only for an actionable blocker/decision, a batched review
+outcome, completion, or when the user explicitly asks for status.
 
 ```bash
-ln -s "$HOME"/.agents/skills/docket/bin/docket ~/.local/bin/docket
+docket init <run> --topology split|combined --harness claude|codex|opencode
+docket assign <run> T03 --complexity low|high \
+  --executor implementor|orchestrator --harness opencode \
+  --model <requested-model> [--effort <requested-effort>]
+docket validate-task <run> T03
+docket scope <run> T03
+docket scope <run> T03 --submit
+docket set-model <run> T03 --actual <verified-active-model> [--effort <verified-effort>]
+docket handoff <run> T03
+docket handoff <run> T03 --submit
+docket submit <run> T03 [--blocked]
+docket preflight <run> T03
+docket diff <run> T03
+docket decide <run> T03 --approve | --changes | --waive --reason TEXT
+docket status <run> [--role planner|orchestrator]
+docket assign <run> orch --executor orchestrator --harness opencode
 ```
 
-For wake signalling on Claude Code, merge `hooks/settings.json.example` into the
-project's `.claude/settings.json`. See `docket help signalling`.
+Templates may be overridden in
+`.docket/templates/<plan|task|scope|report|handoff|orchestrator_report|decision>.mdx`.
+
+For Claude Code wake signalling, merge `hooks/settings.json.example` into the
+project's `.claude/settings.json`, set `DOCKET_ROLE`, and read
+`docket help signalling`.
 
 ## Request
 
 $ARGUMENTS
 
-If the request above is non-empty the user invoked `/docket` explicitly. Read the
-playbook for the role you are about to play, then act. If it is empty, infer the run
-and role from the conversation and from `docket status`.
+If the request is non-empty, the user invoked `/docket`. Otherwise infer the run,
+topology, and current role from the conversation and `docket status`.

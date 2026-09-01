@@ -8,20 +8,54 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
+import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 STATE_DIR = ".docket"
-REQUIRED_REPORT_SECTIONS = [
+SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
+TOPOLOGIES = ("split", "combined")
+REQUIRED_TASK_REPORT_SECTIONS = [
     "Summary",
     "Files changed",
     "Acceptance",
     "Verification",
     "Decisions needed",
+]
+REQUIRED_ORCH_REPORT_SECTIONS = [
+    "Executive summary",
+    "Task outcomes",
+    "Changes delivered",
+    "Integrated verification",
+    "Exceptions and waivers",
+    "Decisions needed",
+]
+REQUIRED_TASK_SECTIONS = [
+    "Goal",
+    "Acceptance criteria",
+]
+REQUIRED_SCOPE_SECTIONS = [
+    "Discovery summary",
+    "Change surface",
+    "Relevant symbols",
+    "Verification plan",
+    "Risks and assumptions",
+]
+REQUIRED_HANDOFF_SECTIONS = [
+    "Resume summary",
+    "Completed",
+    "Remaining",
+    "Files and symbols",
+    "Verification state",
+    "Decisions and risks",
+    "Exact next action",
 ]
 PLACEHOLDER = re.compile(r"<!--\s*TODO|\bTODO:|\bFIXME\b|\bXXX\b")
 
@@ -88,6 +122,16 @@ def sections(body: str) -> dict[str, str]:
     return out
 
 
+def checkbox_items(text: str) -> list[str]:
+    """Normalized checkbox labels, without their checked state."""
+    out: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*-\s*\[[ xX]\]\s*(.+?)\s*$", line)
+        if match:
+            out.append(re.sub(r"\s+", " ", match.group(1)).strip())
+    return out
+
+
 def is_empty(text: str) -> bool:
     """Content that is only comments or whitespace counts as empty."""
     stripped = re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()
@@ -124,6 +168,14 @@ def decisions(d: Path, owner: str) -> list[Path]:
     return sorted(d.glob(f"{owner}-decision-*.mdx"))
 
 
+def handoffs(d: Path, owner: str) -> list[Path]:
+    return sorted(d.glob(f"{owner}-handoff-*.mdx"))
+
+
+def scope_path(d: Path, owner: str) -> Path:
+    return d / f"{owner}-scope.mdx"
+
+
 def owners(d: Path) -> list[str]:
     """Every owner that has at least one report, task owners first."""
     found = {p.name.split("-report-")[0] for p in d.glob("*-report-*.mdx")}
@@ -135,9 +187,153 @@ def latest(paths: list[Path]) -> Path | None:
     return paths[-1] if paths else None
 
 
+def topology(d: Path) -> str:
+    plan = d / "plan.mdx"
+    if not plan.is_file():
+        return "split"
+    return parse(plan.read_text())[0].get("topology", "split")
+
+
+def planned_tasks(d: Path) -> list[str]:
+    """Task ids from the plan table, preserving plan order."""
+    plan = d / "plan.mdx"
+    if not plan.is_file():
+        return []
+    _, body = parse(plan.read_text())
+    task_section = sections(body).get("Tasks", "")
+    out: list[str] = []
+    for line in task_section.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if cells and re.fullmatch(r"T\d+", cells[0]) and cells[0] not in out:
+            out.append(cells[0])
+    return out
+
+
 def die(msg: str) -> None:
     print(f"docket: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+# ----------------------------------------------------------- assignment scope
+
+
+def git_root() -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=root(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+
+
+def dirty_paths(repo: Path) -> set[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode:
+        return set()
+    records = result.stdout.split("\0")
+    out: set[str] = set()
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if not record:
+            continue
+        status, path = record[:2], record[3:]
+        if path and not path.startswith(".docket/"):
+            out.add(path)
+        if "R" in status or "C" in status:
+            if i < len(records) and records[i]:
+                old = records[i]
+                i += 1
+                if not old.startswith(".docket/"):
+                    out.add(old)
+    return out
+
+
+def file_fingerprint(repo: Path, relative: str) -> str | None:
+    path = repo / relative
+    if path.is_symlink():
+        return "link:" + os.readlink(path)
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_path(d: Path, owner: str) -> Path:
+    return d / ".snapshots" / f"{owner}.json"
+
+
+def snapshot_assignment(d: Path, owner: str, scope: list[str]) -> None:
+    repo = git_root()
+    data: dict[str, object] = {"scope": scope, "git_root": str(repo) if repo else "", "dirty": {}}
+    if repo:
+        paths = dirty_paths(repo)
+        data["dirty"] = {path: file_fingerprint(repo, path) for path in sorted(paths)}
+    target = snapshot_path(d, owner)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def update_snapshot_scope(d: Path, owner: str, scope: list[str]) -> None:
+    """Expand/change claimed paths without rebasing away implementation changes."""
+    target = snapshot_path(d, owner)
+    if not target.is_file():
+        snapshot_assignment(d, owner, scope)
+        return
+    data = json.loads(target.read_text())
+    data["scope"] = scope
+    target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def assignment_changes(d: Path, owner: str) -> tuple[list[str], list[str]]:
+    snap = snapshot_path(d, owner)
+    if not snap.is_file():
+        return [], []
+    data = json.loads(snap.read_text())
+    repo_text = str(data.get("git_root", ""))
+    if not repo_text:
+        return [], []
+    repo = Path(repo_text)
+    baseline = dict(data.get("dirty", {}))
+    candidates = set(baseline) | dirty_paths(repo)
+    changed = sorted(path for path in candidates if file_fingerprint(repo, path) != baseline.get(path))
+    scope = [str(item).strip("`/") for item in data.get("scope", []) if str(item).strip("`/")]
+
+    def allowed(path: str) -> bool:
+        return any(path == item or path.startswith(item + "/") for item in scope)
+
+    return changed, [path for path in changed if not allowed(path)]
+
+
+def baseline_path(d: Path, owner: str) -> Path:
+    return d / ".baselines" / f"{owner}.json"
+
+
+def output_fingerprint(stdout: str, stderr: str) -> str:
+    return hashlib.sha256((stdout + "\n" + stderr).encode()).hexdigest()
+
+
+def task_verify(d: Path, owner: str) -> tuple[str, int]:
+    task = d / f"{owner}-task.mdx"
+    if not task.is_file():
+        return "", 900
+    meta, _ = parse(task.read_text())
+    try:
+        timeout = int(meta.get("verify_timeout", "900"))
+    except ValueError:
+        timeout = 900
+    return meta.get("verify", "").strip(), timeout
 
 
 # ------------------------------------------------------------------ templates
@@ -154,7 +350,9 @@ TEMPLATES = {
     "plan": """---
 run: {run}
 status: draft
-planner: {harness}
+topology: {topology}
+planner_harness: {harness}
+progress_updates: quiet
 ---
 
 # Plan: <title>
@@ -169,13 +367,12 @@ planner: {harness}
 
 ## Tasks
 
-<!-- tier=small: <=2 files, no cross-module contract change, no new dependency,
-     concrete acceptance criteria, and a runnable verify command. Everything else
-     is tier=self and the orchestrator implements it. -->
+<!-- Complexity controls capability and review depth. Executor controls ownership.
+     A high-complexity task may still use an implementor when the user requests it. -->
 
-| id  | title | tier  | files | verify |
-| --- | ----- | ----- | ----- | ------ |
-| T01 |       | small |       |        |
+| id  | title | complexity | executor | constraints |
+| --- | ----- | ---------- | -------- | ----------- |
+| T01 |       | low        | implementor |             |
 
 ## Risks
 
@@ -185,11 +382,21 @@ planner: {harness}
 run: {run}
 task: {owner}
 owner: {owner}
-tier: {tier}
+complexity: {complexity}
+executor: {executor}
 harness: {harness}
-model: {model}
+requested_model: {model}
+actual_model:
+model_history:
+requested_effort: {effort}
+actual_effort:
+effort_history:
+scope_status: {scope_status}
+file_hints: {file_hints}
+verify_hint: {verify_hint}
 files: {files}
 verify: {verify}
+verify_timeout: {verify_timeout}
 ---
 
 # Task {owner}: <title>
@@ -206,12 +413,54 @@ verify: {verify}
 
 ## Scope
 
-Touch only the files listed in `files:` above. If the work needs a file outside
-that list, stop and set `status: blocked` in your report instead of widening scope.
+The implementor owns discovery. Before editing, create and submit the discovery
+capsule with `docket scope ...`; its accepted `files:` become the change boundary.
+`file_hints:` and `verify_hint:` are optional clues, not supervisor-approved scope.
 
 ## Out of scope
 
-## Context
+## Starting hints
+
+none
+
+## Existing decisions
+
+none
+
+## Discovery constraints
+
+none
+""",
+    "scope": """---
+run: {run}
+task: {owner}
+owner: {owner}
+status: draft
+files: {files}
+verify: {verify}
+---
+
+# Discovery capsule: {owner}
+
+## Discovery summary
+
+<!-- TODO: what you inspected and why this is enough context to implement. -->
+
+## Change surface
+
+<!-- TODO: explain every proposed path in frontmatter `files:`. -->
+
+## Relevant symbols
+
+<!-- TODO: useful paths and symbols for implementation and later recovery. -->
+
+## Verification plan
+
+<!-- TODO: explain the exact frontmatter `verify:` command and what it proves. -->
+
+## Risks and assumptions
+
+<!-- TODO: unresolved discovery uncertainty, or "none". -->
 """,
     "report": """---
 run: {run}
@@ -220,7 +469,12 @@ owner: {owner}
 round: {round}
 status: draft
 harness: {harness}
-model: {model}
+requested_model: {model}
+actual_model:
+model_history:
+requested_effort: {effort}
+actual_effort:
+effort_history:
 ---
 
 # Report: {owner} round {round}
@@ -245,12 +499,96 @@ model: {model}
 
 ## Decisions needed
 
-<!-- Something only the reviewer can decide? List it here and set `status: blocked`
-     in the frontmatter. Otherwise write "none". -->
+<!-- Something only the reviewer can decide? List it here and submit with
+     `docket submit ... --blocked`. Otherwise write "none". Do not edit status. -->
 
 none
 
 ## Notes
+""",
+    "orchestrator_report": """---
+run: {run}
+owner: orch
+round: {round}
+status: draft
+harness: {harness}
+requested_model: {model}
+actual_model:
+model_history:
+requested_effort: {effort}
+actual_effort:
+effort_history:
+---
+
+# Orchestrator report: round {round}
+
+## Executive summary
+
+<!-- TODO: summarize the delivered outcome for the planner. -->
+
+## Task outcomes
+
+<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->
+
+## Changes delivered
+
+<!-- TODO: summarize the task-local changes the planner should review. -->
+
+## Integrated verification
+
+<!-- TODO: exact integrated command and real output. -->
+
+## Exceptions and waivers
+
+none
+
+## Decisions needed
+
+none
+
+## Notes
+""",
+    "handoff": """---
+run: {run}
+task: {owner}
+owner: {owner}
+handoff: {handoff}
+report_round: {round}
+status: draft
+harness: {harness}
+actual_model: {model}
+actual_effort: {effort}
+---
+
+# Handoff: {owner} checkpoint {handoff}
+
+## Resume summary
+
+<!-- TODO: current implementation state in 2-4 sentences. -->
+
+## Completed
+
+<!-- TODO: finished behavior and decisions; cite `path:symbol` where useful. -->
+
+## Remaining
+
+<!-- TODO: concrete unfinished items, in dependency order. -->
+
+## Files and symbols
+
+<!-- TODO: every touched or relevant `path:symbol`, plus what changed or remains. -->
+
+## Verification state
+
+<!-- TODO: exact commands already run, real results, and tests not yet run. -->
+
+## Decisions and risks
+
+<!-- TODO: unresolved issues and fragile assumptions, or "none". -->
+
+## Exact next action
+
+<!-- TODO: one precise first action for the replacement implementor. -->
 """,
     "decision": """---
 run: {run}
@@ -284,36 +622,297 @@ reviewer: {reviewer}
 
 
 def cmd_init(a: argparse.Namespace) -> None:
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", a.run):
+        die("run id must contain only letters, numbers, dots, underscores, and hyphens")
     base = root() / STATE_DIR / "runs" / a.run
     if base.exists():
         die(f"run {a.run} already exists at {base}")
     (base / "docs").mkdir(parents=True)
     plan = base / "plan.mdx"
-    plan.write_text(template("plan").format(run=a.run, harness=a.harness))
+    plan.write_text(template("plan").format(run=a.run, harness=a.harness, topology=a.topology))
     print(f"created {plan.relative_to(root())}")
     print(f"\nNext: fill in the plan, then `docket status {a.run}`.")
 
 
 def cmd_assign(a: argparse.Namespace) -> None:
     d = need_run(a.run)
+    if a.owner != "orch" and not re.fullmatch(r"T\d+", a.owner):
+        die("owner must be a task id such as T03, or 'orch'")
+    if a.tier:
+        a.complexity = "low" if a.tier == "small" else "high"
+        a.executor = "implementor" if a.tier == "small" else "orchestrator"
+    if a.files:
+        a.file.extend(shlex.split(a.files))
     task = d / f"{a.owner}-task.mdx"
     if not task.exists() and a.owner != "orch":
+        delegated = a.executor == "implementor"
         task.write_text(
             template("task").format(
-                run=a.run, owner=a.owner, tier=a.tier, harness=a.harness,
-                model=a.model, files=a.files, verify=a.verify,
+                run=a.run, owner=a.owner, complexity=a.complexity,
+                executor=a.executor, harness=a.harness, model=a.model,
+                effort=a.effort,
+                scope_status="discovery" if delegated else "ready",
+                file_hints=" ".join(a.file), verify_hint=a.verify,
+                files="" if delegated else " ".join(a.file),
+                verify="" if delegated else a.verify,
+                verify_timeout=a.verify_timeout,
             )
         )
         print(f"created {task.relative_to(root())}")
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
     rep = d / f"{a.owner}-report-01.mdx"
-    rep.write_text(
-        template("report").format(
-            run=a.run, owner=a.owner, round=1, harness=a.harness, model=a.model
-        )
-    )
+    report_template = "orchestrator_report" if a.owner == "orch" else "report"
+    rep.write_text(template(report_template).format(
+        run=a.run, owner=a.owner, round=1, harness=a.harness, model=a.model,
+        effort=a.effort,
+    ))
     print(f"created {rep.relative_to(root())}")
+    if a.owner != "orch" and a.executor == "implementor":
+        capsule = scope_path(d, a.owner)
+        capsule.write_text(template("scope").format(
+            run=a.run, owner=a.owner, files=" ".join(a.file), verify=a.verify,
+        ))
+        print(f"created {capsule.relative_to(root())}")
+    elif a.owner != "orch":
+        snapshot_assignment(d, a.owner, a.file)
+
+
+def required_section_problems(body: str, required: list[str]) -> list[str]:
+    secs = sections(body)
+    problems: list[str] = []
+    for name in required:
+        if name not in secs:
+            problems.append(f"missing section '## {name}'")
+        elif is_empty(secs[name]):
+            problems.append(f"section '## {name}' is empty")
+    for n, line in enumerate(body.splitlines(), 1):
+        if PLACEHOLDER.search(line):
+            problems.append(f"unresolved placeholder at line {n}: {line.strip()[:60]}")
+    return problems
+
+
+def cmd_validate_task(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    task = d / f"{a.owner}-task.mdx"
+    if not task.is_file():
+        die(f"missing assignment {task.name}")
+    meta, body = parse(task.read_text())
+    problems = required_section_problems(body, REQUIRED_TASK_SECTIONS)
+    secs = sections(body)
+    criteria = checkbox_items(secs.get("Acceptance criteria", ""))
+    if not criteria:
+        problems.append("task needs at least one acceptance criterion")
+    if problems:
+        print(f"\nINVALID TASK: {task.name}\n", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"{task.name}: task intent is ready for implementor-owned discovery")
+
+
+def normalized_scope(meta: dict[str, str]) -> list[str]:
+    try:
+        values = shlex.split(meta.get("files", ""))
+    except ValueError:
+        values = []
+    return sorted({value.strip("`/") for value in values if value.strip("`/")})
+
+
+def paths_overlap(left: str, right: str) -> bool:
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+def scope_collisions(d: Path, owner: str, proposed: list[str]) -> list[str]:
+    collisions: list[str] = []
+    terminal = {"approved", "waived", "completed"}
+    for other in owners(d):
+        if other in (owner, "orch") or state_of(d, other)[1] in terminal:
+            continue
+        other_files: list[str] = []
+        other_task = d / f"{other}-task.mdx"
+        if other_task.is_file():
+            tm, _ = parse(other_task.read_text())
+            if tm.get("scope_status") == "ready":
+                other_files = normalized_scope(tm)
+        if not other_files:
+            other_capsule = scope_path(d, other)
+            if other_capsule.is_file():
+                om, _ = parse(other_capsule.read_text())
+                if om.get("status") == "ready":
+                    other_files = normalized_scope(om)
+        for path in proposed:
+            for other_path in other_files:
+                if paths_overlap(path, other_path):
+                    collisions.append(f"{path} overlaps {other}:{other_path}")
+    return sorted(set(collisions))
+
+
+def cmd_scope(a: argparse.Namespace) -> None:
+    """Validate an implementor-authored discovery capsule and claim its change scope."""
+    d = need_run(a.run)
+    task = d / f"{a.owner}-task.mdx"
+    capsule = scope_path(d, a.owner)
+    if not task.is_file() or not capsule.is_file():
+        die(f"missing discovery assignment for {a.owner}")
+    if not a.submit:
+        print(f"discovery capsule -> {capsule.name}")
+        print(f"Fill it, then run `docket scope {a.run} {a.owner} --submit` before editing.")
+        return
+
+    meta, body = parse(capsule.read_text())
+    if meta.get("status") not in ("draft", "collision", "ready"):
+        die(f"{capsule.name} has unsupported status {meta.get('status')}")
+    problems = required_section_problems(body, REQUIRED_SCOPE_SECTIONS)
+    proposed = normalized_scope(meta)
+    if not proposed:
+        problems.append("frontmatter files must name the proposed change scope")
+    if not meta.get("verify", "").strip():
+        problems.append("frontmatter verify must contain an executable verification command")
+    if problems:
+        print(f"\nINVALID SCOPE: {capsule.name}\n", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        raise SystemExit(1)
+
+    lock_path = d / ".scope.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        collisions = scope_collisions(d, a.owner, proposed)
+        if collisions:
+            meta["status"] = "collision"
+            meta["collisions"] = "; ".join(collisions)
+            capsule.write_text(render(meta, body))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            print(f"\nSCOPE COLLISION: {capsule.name}\n", file=sys.stderr)
+            for collision in collisions:
+                print(f"  - {collision}", file=sys.stderr)
+            print("The orchestrator must sequence the tasks or resolve ownership.", file=sys.stderr)
+            raise SystemExit(1)
+
+        meta["status"] = "ready"
+        meta.pop("collisions", None)
+        capsule.write_text(render(meta, body))
+        task_meta, task_body = parse(task.read_text())
+        task_meta["scope_status"] = "ready"
+        task_meta["files"] = " ".join(proposed)
+        task_meta["verify"] = meta["verify"].strip()
+        task.write_text(render(task_meta, task_body))
+        update_snapshot_scope(d, a.owner, proposed)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    print(f"{capsule.name}: scope accepted; implementation may continue")
+
+
+def cmd_handoff(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    rep = latest(reports(d, a.owner))
+    if not rep:
+        die(f"no active report for {a.owner}")
+    rm, _ = parse(rep.read_text())
+    if rm.get("status") != "draft":
+        die(f"handoff requires an unfinished draft report, got {rm.get('status')}")
+
+    existing = handoffs(d, a.owner)
+    current = latest(existing)
+    if a.submit:
+        if not current:
+            die(f"no handoff draft for {a.owner}; open one without --submit first")
+        meta, body = parse(current.read_text())
+        if meta.get("status") != "draft":
+            die(f"{current.name} is already {meta.get('status')}")
+        problems = required_section_problems(body, REQUIRED_HANDOFF_SECTIONS)
+        if rm.get("requested_model") and not meta.get("actual_model"):
+            problems.append("handoff must record the verified active model")
+        if problems:
+            print(f"\nINVALID HANDOFF: {current.name}\n", file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            raise SystemExit(1)
+        meta["status"] = "ready"
+        current.write_text(render(meta, body))
+        print(f"{current.name}: ready for a replacement implementor")
+        return
+
+    if current:
+        cm, _ = parse(current.read_text())
+        if cm.get("status") == "draft":
+            die(f"finish or remove existing handoff draft {current.name}")
+    number = len(existing) + 1
+    target = d / f"{a.owner}-handoff-{number:02d}.mdx"
+    target.write_text(template("handoff").format(
+        run=a.run,
+        owner=a.owner,
+        handoff=number,
+        round=rm.get("round", "1"),
+        harness=rm.get("harness", ""),
+        model=rm.get("actual_model", ""),
+        effort=rm.get("actual_effort", ""),
+    ))
+    print(f"opened handoff draft -> {target.name}")
+    print(f"Fill it, then run `docket handoff {a.run} {a.owner} --submit` before replacement.")
+
+
+def record_actual_model(path: Path, actual: str, effort: str) -> tuple[str, str, str, str]:
+    meta, body = parse(path.read_text())
+    requested = meta.get("requested_model", meta.get("model", ""))
+    previous = meta.get("actual_model", "")
+    history = [item.strip() for item in meta.get("model_history", "").split(" -> ") if item.strip()]
+    if not history and requested:
+        history.append(requested)
+    if not history or history[-1] != actual:
+        history.append(actual)
+    meta["actual_model"] = actual
+    meta["model_history"] = " -> ".join(history)
+    requested_effort = meta.get("requested_effort", "")
+    previous_effort = meta.get("actual_effort", "")
+    if effort:
+        effort_history = [
+            item.strip() for item in meta.get("effort_history", "").split(" -> ") if item.strip()
+        ]
+        if not effort_history and requested_effort:
+            effort_history.append(requested_effort)
+        if not effort_history or effort_history[-1] != effort:
+            effort_history.append(effort)
+        meta["actual_effort"] = effort
+        meta["effort_history"] = " -> ".join(effort_history)
+    path.write_text(render(meta, body))
+    return requested, previous, requested_effort, previous_effort
+
+
+def cmd_set_model(a: argparse.Namespace) -> None:
+    """Record the model verified in the live harness; never infer it from launch args."""
+    d = need_run(a.run)
+    rep = latest(reports(d, a.owner))
+    if not rep:
+        die(f"no report for {a.owner} in {a.run}")
+    rm, _ = parse(rep.read_text())
+    if rm.get("status") not in ("draft", "blocked"):
+        die(f"{rep.name} is already {rm.get('status')}; actual model must be recorded before submission")
+
+    requested, previous, requested_effort, previous_effort = record_actual_model(
+        rep, a.actual, a.effort
+    )
+    task = d / f"{a.owner}-task.mdx"
+    if task.is_file():
+        record_actual_model(task, a.actual, a.effort)
+
+    if previous and previous != a.actual:
+        print(f"model switched in existing session: {previous} -> {a.actual}")
+    elif requested and requested != a.actual:
+        print(f"WARNING: requested model {requested!r} is not active; harness is using {a.actual!r}")
+    else:
+        print(f"active model verified: {a.actual}")
+    if a.effort:
+        if previous_effort and previous_effort != a.effort:
+            print(f"effort switched in existing session: {previous_effort} -> {a.effort}")
+        elif requested_effort and requested_effort != a.effort:
+            print(
+                f"WARNING: requested effort {requested_effort!r} is not active; "
+                f"harness is using {a.effort!r}"
+            )
+        else:
+            print(f"active effort verified: {a.effort}")
+    print(f"recorded in {rep.name}" + (f" and {task.name}" if task.is_file() else ""))
 
 
 def cmd_submit(a: argparse.Namespace) -> None:
@@ -325,12 +924,36 @@ def cmd_submit(a: argparse.Namespace) -> None:
     meta, body = parse(rep.read_text())
     problems: list[str] = []
 
+    expected_round = int(re.search(r"-report-(\d+)\.mdx$", rep.name).group(1))
+    expected_meta = {
+        "run": a.run,
+        "owner": a.owner,
+        "round": str(expected_round),
+    }
+    if a.owner != "orch":
+        expected_meta["task"] = a.owner
+    for key, expected in expected_meta.items():
+        if meta.get(key) != expected:
+            problems.append(f"frontmatter {key!r} must be {expected!r}, got {meta.get(key)!r}")
+    if meta.get("harness") not in SUPPORTED_HARNESSES:
+        problems.append(f"frontmatter 'harness' must be one of: {', '.join(SUPPORTED_HARNESSES)}")
+    if meta.get("requested_model") and not meta.get("actual_model"):
+        problems.append("record actual_model before submission (it may equal requested_model)")
+    if meta.get("requested_effort") and not meta.get("actual_effort"):
+        problems.append("record actual_effort before submission (it may equal requested_effort)")
+
     status = meta.get("status", "")
+    legacy_blocked = status == "blocked"
     if status not in ("draft", "blocked"):
-        die(f"{rep.name} has status: {status} - nothing to submit")
+        die(
+            f"{rep.name} has status: {status} - reports stay draft until submit; "
+            "restore status: draft and run `docket submit`"
+        )
+    blocked = a.blocked or legacy_blocked
 
     secs = sections(body)
-    for name in REQUIRED_REPORT_SECTIONS:
+    required = REQUIRED_ORCH_REPORT_SECTIONS if a.owner == "orch" else REQUIRED_TASK_REPORT_SECTIONS
+    for name in required:
         if name not in secs:
             problems.append(f"missing section '## {name}'")
         elif is_empty(secs[name]):
@@ -343,16 +966,55 @@ def cmd_submit(a: argparse.Namespace) -> None:
 
     acc = secs.get("Acceptance", "")
     unchecked = [l.strip() for l in acc.splitlines() if re.match(r"^\s*-\s*\[\s*\]", l)]
-    if status == "blocked":
+    if a.owner != "orch":
+        task = d / f"{a.owner}-task.mdx"
+        if not task.is_file():
+            problems.append(f"missing assignment {task.name}")
+        else:
+            task_meta, task_body = parse(task.read_text())
+            task_acceptance = checkbox_items(sections(task_body).get("Acceptance criteria", ""))
+            report_acceptance = checkbox_items(acc)
+            if task_acceptance != report_acceptance:
+                problems.append("report acceptance criteria do not match the task acceptance criteria")
+            if (
+                not blocked
+                and task_meta.get("executor", "implementor") == "implementor"
+                and task_meta.get("scope_status") != "ready"
+            ):
+                problems.append("implementor discovery scope is not ready; submit it with `docket scope`")
+        changed, outside = assignment_changes(d, a.owner)
+        if outside:
+            problems.append(
+                "paths changed since assignment outside the task scope: " + ", ".join(outside)
+            )
+        reported_files = secs.get("Files changed", "")
+        omitted = [path for path in changed if path not in reported_files]
+        if omitted:
+            problems.append("task-local changes omitted from 'Files changed': " + ", ".join(omitted))
+    else:
+        planned = planned_tasks(d)
+        terminal = {"approved", "waived", "completed"}
+        incomplete = [owner for owner in planned if state_of(d, owner)[1] not in terminal]
+        if incomplete:
+            problems.append("orchestrator report cannot submit before tasks are decided: " + ", ".join(incomplete))
+        reported = set(re.findall(r"\bT\d+\b", secs.get("Task outcomes", "")))
+        missing = [owner for owner in planned if owner not in reported]
+        if missing:
+            problems.append("orchestrator task outcomes omit planned tasks: " + ", ".join(missing))
+        waived = [owner for owner in planned if state_of(d, owner)[1] == "waived"]
+        exceptions = secs.get("Exceptions and waivers", "").strip().lower()
+        if waived and exceptions in ("none", "none."):
+            problems.append("orchestrator report must explain every waived task")
+    if blocked:
         needed = secs.get("Decisions needed", "")
         if is_empty(needed) or needed.strip().lower() in ("none", "none."):
             problems.append(
                 "status is blocked but 'Decisions needed' says none - state what the reviewer must decide"
             )
-    else:
+    elif a.owner != "orch":
         if unchecked:
             problems.append(
-                f"{len(unchecked)} unchecked acceptance criteria - finish them, or set status: blocked"
+                f"{len(unchecked)} unchecked acceptance criteria - finish them, or submit with --blocked"
             )
         if not re.search(r"^\s*-\s*\[[xX]\]", acc, re.M):
             problems.append("no acceptance criteria are checked off")
@@ -360,25 +1022,35 @@ def cmd_submit(a: argparse.Namespace) -> None:
     # Run the task's declared verify command, but only once the report itself holds up -
     # no point spending a test run on a report that is already incomplete.
     task = d / f"{a.owner}-task.mdx"
-    verify = ""
-    if task.is_file():
-        verify = parse(task.read_text())[0].get("verify", "").strip()
-    if verify and status != "blocked" and not a.skip_verify and not problems:
+    verify, task_timeout = task_verify(d, a.owner)
+    verify_timeout = a.verify_timeout or task_timeout
+    if verify and a.skip_verify and not a.skip_verify_reason.strip():
+        problems.append("--skip-verify requires --skip-verify-reason TEXT")
+    if verify and not blocked and not a.skip_verify and not problems:
         print(f"running verify: {verify}")
         try:
             r = subprocess.run(
-                verify, shell=True, cwd=root(), capture_output=True, text=True, timeout=a.verify_timeout
+                verify, shell=True, cwd=root(), capture_output=True, text=True, timeout=verify_timeout
             )
             if r.returncode != 0:
                 tail = (r.stdout + r.stderr).strip().splitlines()[-15:] or ["(no output)"]
+                baseline_note = ""
+                base = baseline_path(d, a.owner)
+                if base.is_file():
+                    recorded = json.loads(base.read_text())
+                    if (
+                        recorded.get("returncode") == r.returncode
+                        and recorded.get("fingerprint") == output_fingerprint(r.stdout, r.stderr)
+                    ):
+                        baseline_note = " (matches the recorded failing baseline; submit --blocked for waiver review)"
                 problems.append(
-                    f"verify command failed (exit {r.returncode}):\n      "
+                    f"verify command failed (exit {r.returncode}){baseline_note}:\n      "
                     + "\n      ".join(tail)
                 )
             else:
                 print("verify passed")
         except subprocess.TimeoutExpired:
-            problems.append(f"verify command timed out after {a.verify_timeout}s")
+            problems.append(f"verify command timed out after {verify_timeout}s")
 
     if problems:
         print(f"\nREJECTED: {rep.name} is not ready to submit\n", file=sys.stderr)
@@ -387,9 +1059,20 @@ def cmd_submit(a: argparse.Namespace) -> None:
         print("\nFix these and run submit again. Nothing was handed off.", file=sys.stderr)
         raise SystemExit(1)
 
-    meta["status"] = "submitted" if status == "draft" else "blocked"
+    if blocked:
+        meta["status"] = "blocked"
+    elif a.owner == "orch" and topology(d) == "combined":
+        meta["status"] = "completed"
+    elif a.owner != "orch" and task.is_file() and parse(task.read_text())[0].get("executor") == "orchestrator":
+        meta["status"] = "completed"
+    else:
+        meta["status"] = "submitted"
     rep.write_text(render(meta, body))
-    verdict = "blocked, needs a decision" if status == "blocked" else "submitted for review"
+    verdict = {
+        "blocked": "blocked, needs a decision",
+        "completed": "completed; recorded without a redundant handoff",
+        "submitted": "submitted for review",
+    }[meta["status"]]
     print(f"\n{rep.name}: {verdict}")
 
 
@@ -401,34 +1084,72 @@ def cmd_decide(a: argparse.Namespace) -> None:
     meta, body = parse(rep.read_text())
     if meta.get("status") not in ("submitted", "blocked"):
         die(f"{rep.name} has status: {meta.get('status')} - only submitted or blocked reports are reviewable")
+    blocked = meta.get("status") == "blocked"
+    if blocked and a.approve:
+        die("a blocked report cannot become approved; use --changes or --waive --reason TEXT")
+    if not blocked and a.waive:
+        die("only a blocked report can be waived")
 
     rnd = int(meta.get("round", "1"))
-    verdict = "approved" if a.approve else "changes-requested"
+    verdict = "waived" if a.waive else ("approved" if a.approve else "changes-requested")
     dec = d / f"{a.owner}-decision-{rnd:02d}.mdx"
-    if not dec.exists():
+    if a.changes and not dec.exists():
         dec.write_text(
             template("decision").format(
                 run=a.run, owner=a.owner, round=rnd, verdict=verdict, reviewer=a.reviewer
             )
         )
-    else:  # keep any review notes already written, just set the verdict
+        print(f"opened decision draft -> {dec.name}")
+        print("Fill its required changes, then run the same command again to apply the transition.")
+        return
+    if a.changes:
         dm, db = parse(dec.read_text())
+        required_changes = sections(db).get("Required changes", "")
+        if is_empty(required_changes) or PLACEHOLDER.search(required_changes):
+            die(f"{dec.name} needs specific required changes before the transition can be applied")
         dm["verdict"] = verdict
         dec.write_text(render(dm, db))
+    elif a.waive:
+        body = (
+            f"# Decision: {a.owner} round {rnd}\n\n## Verdict\n\nwaived\n\n"
+            f"## Waiver reason\n\n{a.reason}\n\n## Notes\n\nnone\n"
+        )
+        dec.write_text(render({
+            "run": a.run, "task": a.owner, "owner": a.owner, "round": str(rnd),
+            "verdict": verdict, "reviewer": a.reviewer,
+        }, body))
+    else:
+        body = f"# Decision: {a.owner} round {rnd}\n\n## Verdict\n\napproved\n\n## Notes\n\nnone\n"
+        dec.write_text(render({
+            "run": a.run, "task": a.owner, "owner": a.owner, "round": str(rnd),
+            "verdict": verdict, "reviewer": a.reviewer,
+        }, body))
 
     meta["status"] = verdict
     rep.write_text(render(meta, body))
 
     if a.approve:
         print(f"{a.owner} round {rnd} approved -> {dec.name}")
+    elif a.waive:
+        print(f"{a.owner} round {rnd} waived -> {dec.name}")
     else:
         nxt = d / f"{a.owner}-report-{rnd + 1:02d}.mdx"
+        report_template = "orchestrator_report" if a.owner == "orch" else "report"
         nxt.write_text(
-            template("report").format(
+            template(report_template).format(
                 run=a.run, owner=a.owner, round=rnd + 1,
-                harness=meta.get("harness", ""), model=meta.get("model", ""),
+                harness=meta.get("harness", ""),
+                model=meta.get("requested_model", meta.get("model", "")),
+                effort=meta.get("requested_effort", ""),
             )
         )
+        if meta.get("actual_model"):
+            nm, nb = parse(nxt.read_text())
+            nm["actual_model"] = meta["actual_model"]
+            nm["model_history"] = meta.get("model_history", meta["actual_model"])
+            nm["actual_effort"] = meta.get("actual_effort", "")
+            nm["effort_history"] = meta.get("effort_history", meta.get("actual_effort", ""))
+            nxt.write_text(render(nm, nb))
         print(f"{a.owner} round {rnd} needs changes -> {dec.name}")
         print(f"opened next round -> {nxt.name}")
         print(f"\nWrite the required changes into {dec.name}, then send the implementor to read it.")
@@ -442,24 +1163,115 @@ def state_of(d: Path, owner: str) -> tuple[int, str]:
     return int(meta.get("round", "1")), meta.get("status", "?")
 
 
+def handoff_state(d: Path, owner: str) -> tuple[int, str]:
+    checkpoint = latest(handoffs(d, owner))
+    if not checkpoint:
+        return 0, "-"
+    meta, _ = parse(checkpoint.read_text())
+    return int(meta.get("handoff", "1")), meta.get("status", "?")
+
+
+def scope_state(d: Path, owner: str) -> str:
+    capsule = scope_path(d, owner)
+    if capsule.is_file():
+        meta, _ = parse(capsule.read_text())
+        return meta.get("status", "?")
+    task = d / f"{owner}-task.mdx"
+    if task.is_file():
+        meta, _ = parse(task.read_text())
+        return meta.get("scope_status", "-")
+    return "-"
+
+
 def cmd_status(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     plan = d / "plan.mdx"
     pmeta = parse(plan.read_text())[0] if plan.is_file() else {}
-    print(f"run {a.run}   plan: {pmeta.get('status', 'missing')}")
-    rows = owners(d)
-    if not rows:
-        print("\nno tasks assigned yet")
+    print(
+        f"run {a.run}   plan: {pmeta.get('status', 'missing')}   "
+        f"topology: {pmeta.get('topology', 'split')}   "
+        f"updates: {pmeta.get('progress_updates', 'quiet')}"
+    )
+    if a.role == "planner":
+        rnd, st = state_of(d, "orch")
+        if rnd:
+            print(f"\norchestrator report: round {rnd}  {st}")
+        else:
+            print("\norchestrator report: not opened")
         return
-    print(f"\n  {'owner':<8} {'round':>5}  {'status':<18} tier   verify")
-    print(f"  {'-' * 8} {'-' * 5}  {'-' * 18} {'-' * 6} {'-' * 20}")
+    rows = planned_tasks(d)
+    rows.extend(o for o in owners(d) if o != "orch" and o not in rows)
+    if not rows:
+        print("\nno tasks planned yet")
+        return
+    print(f"\n  {'owner':<8} {'round':>5}  {'status':<18} {'scope':<10} {'handoff':<10} complexity executor     verify")
+    print(f"  {'-' * 8} {'-' * 5}  {'-' * 18} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 12} {'-' * 20}")
     for o in rows:
         rnd, st = state_of(d, o)
         task = d / f"{o}-task.mdx"
         tm = parse(task.read_text())[0] if task.is_file() else {}
-        print(f"  {o:<8} {rnd:>5}  {st:<18} {tm.get('tier', '-'):<6} {tm.get('verify', '-')[:20]}")
-    pending = [o for o in rows if state_of(d, o)[1] not in ("approved",)]
-    print(f"\n{len(rows) - len(pending)}/{len(rows)} approved")
+        hn, hs = handoff_state(d, o)
+        handoff = f"{hn}:{hs}" if hn else "-"
+        print(
+            f"  {o:<8} {rnd:>5}  {st:<18} {scope_state(d, o):<10} {handoff:<10} "
+            f"{tm.get('complexity', tm.get('tier', '-')):<10} "
+            f"{tm.get('executor', '-'):<12} {tm.get('verify', '-')[:20]}"
+        )
+    terminal = {"approved", "waived", "completed"}
+    decided = [o for o in rows if state_of(d, o)[1] in terminal]
+    approved = [o for o in rows if state_of(d, o)[1] in {"approved", "completed"}]
+    waived = [o for o in rows if state_of(d, o)[1] == "waived"]
+    print(f"\n{len(decided)}/{len(rows)} decided  ({len(approved)} approved/completed, {len(waived)} waived)")
+
+
+def cmd_diff(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    changed, outside = assignment_changes(d, a.owner)
+    if not snapshot_path(d, a.owner).is_file():
+        die(f"no assignment snapshot for {a.owner}")
+    if not changed:
+        print(f"{a.owner}: no worktree changes since assignment")
+        return
+    print(f"{a.owner}: changes since assignment")
+    outside_set = set(outside)
+    for path in changed:
+        marker = "OUTSIDE SCOPE" if path in outside_set else "in scope"
+        print(f"  [{marker}] {path}")
+
+
+def cmd_preflight(a: argparse.Namespace) -> None:
+    """Record the task gate's state before implementation without treating failure as success."""
+    d = need_run(a.run)
+    verify, task_timeout = task_verify(d, a.owner)
+    if not verify:
+        die(f"{a.owner} has no registered verify command")
+    timeout = a.verify_timeout or task_timeout
+    print(f"running baseline verify: {verify}")
+    try:
+        result = subprocess.run(
+            verify, shell=True, cwd=root(), capture_output=True, text=True, timeout=timeout
+        )
+        data = {
+            "command": verify,
+            "returncode": result.returncode,
+            "fingerprint": output_fingerprint(result.stdout, result.stderr),
+            "output_tail": (result.stdout + result.stderr).strip().splitlines()[-30:],
+        }
+        outcome = "passing" if result.returncode == 0 else f"failing (exit {result.returncode})"
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        data = {
+            "command": verify,
+            "returncode": "timeout",
+            "fingerprint": output_fingerprint(stdout, stderr),
+            "output_tail": (stdout + stderr).strip().splitlines()[-30:],
+        }
+        outcome = f"timed out after {timeout}s"
+    target = baseline_path(d, a.owner)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    print(f"baseline recorded: {outcome} -> {target.relative_to(root())}")
 
 
 # --------------------------------------------------------------------- watch
@@ -468,16 +1280,45 @@ def cmd_status(a: argparse.Namespace) -> None:
 def events(d: Path, role: str) -> list[tuple[str, str]]:
     """Actionable (key, message) pairs for a supervising role."""
     out: list[tuple[str, str]] = []
-    scope = [o for o in owners(d) if o != "orch"] if role == "orchestrator" else ["orch"]
+    if role == "planner":
+        if topology(d) == "combined":
+            return []
+        scope = ["orch"]
+    else:
+        scope = []
+        for o in owners(d):
+            if o == "orch":
+                continue
+            task = d / f"{o}-task.mdx"
+            tm = parse(task.read_text())[0] if task.is_file() else {}
+            if tm.get("executor", "implementor") == "implementor":
+                scope.append(o)
     for o in scope:
         rnd, st = state_of(d, o)
+        capsule = scope_path(d, o)
+        if capsule.is_file():
+            sm, _ = parse(capsule.read_text())
+            if sm.get("status") == "collision":
+                detail = sm.get("collisions", "scope ownership overlaps another active task")
+                digest = hashlib.sha256(detail.encode()).hexdigest()[:10]
+                out.append((
+                    f"{o}:scope:collision:{digest}",
+                    f"{o} discovery scope collides with active work and needs sequencing",
+                ))
+        handoff_number, handoff_status = handoff_state(d, o)
+        if handoff_status == "ready" and st == "draft":
+            out.append((
+                f"{o}:handoff:{handoff_number}:ready",
+                f"{o} handoff checkpoint {handoff_number} is ready; resume with a replacement implementor",
+            ))
         if st == "submitted":
-            out.append((f"{o}:{rnd}:submitted", f"{o} submitted round {rnd} for review"))
+            label = "orchestrator" if o == "orch" else o
+            out.append((f"{o}:{rnd}:submitted", f"{label} submitted round {rnd} for review"))
         elif st == "blocked":
             out.append((f"{o}:{rnd}:blocked", f"{o} is BLOCKED at round {rnd} and needs a decision"))
     if role == "orchestrator" and scope:
-        if all(state_of(d, o)[1] == "approved" for o in scope):
-            out.append(("all:approved", f"all {len(scope)} delegated tasks approved - do your own tasks and report"))
+        if all(state_of(d, o)[1] in ("approved", "waived") for o in scope):
+            out.append(("all:decided", f"all {len(scope)} delegated tasks decided - complete the aggregate report"))
     return out
 
 
@@ -551,40 +1392,47 @@ def cmd_watch(a: argparse.Namespace) -> None:
     Each role gets its own ledger, so an orchestrator and a planner watching the
     same run never consume each other's events.
     """
-    if a.armed:
-        pairs = armed()
-        if a.role:
-            pairs = [pr for pr in pairs if pr[1] in a.role]
-    else:
-        if not a.run:
-            die("give a run id, or --armed to watch everything in watch.conf")
-        pairs = [(a.run, r) for r in (a.role or ["orchestrator"])]
+    if not a.role:
+        die("--role is required so one supervisor cannot consume another role's events")
 
-    pairs = [(r, ro) for r, ro in pairs if run_dir(r).is_dir()]
-    if not pairs:
-        raise SystemExit(0)
+    def watched_pairs() -> list[tuple[str, str]]:
+        if a.armed:
+            pairs = [pair for pair in armed() if pair[1] == a.role]
+        else:
+            if not a.run:
+                die("give a run id, or --armed to watch that role's configured runs")
+            pairs = [(a.run, a.role)]
+        return [(run, role) for run, role in pairs if run_dir(run).is_dir()]
 
     deadline = time.monotonic() + a.timeout
     while True:
         fresh: list[tuple[str, str, Path, str, str]] = []
+        pairs = watched_pairs()
+        if not pairs:
+            raise SystemExit(0)
         for run, role in pairs:
             d = run_dir(run)
             led = ledger_for(d, role)
-            seen = set(led.read_text().split()) if led.is_file() else set()
-            for k, m in events(d, role):
-                if k not in seen:
-                    fresh.append((run, role, led, k, m))
+            led.parent.mkdir(parents=True, exist_ok=True)
+            with led.open("a+") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                fh.seek(0)
+                seen = set(fh.read().split())
+                claimed = [(k, m) for k, m in events(d, role) if k not in seen]
+                if claimed:
+                    fh.seek(0, os.SEEK_END)
+                    for k, _ in claimed:
+                        fh.write(k + "\n")
+                    fh.flush()
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            for k, m in claimed:
+                fresh.append((run, role, led, k, m))
         if fresh:
-            for led in {f[2] for f in fresh}:
-                with led.open("a") as fh:
-                    for _, _, l2, k, _ in fresh:
-                        if l2 == led:
-                            fh.write(k + "\n")
             lines = [f"  - [{role}] {run}: {m}" for run, role, _, _, m in fresh]
             print(
                 f"docket: {len(fresh)} item(s) need you:\n" + "\n".join(lines)
                 + "\n\nRun `docket status <run>` for the run named above, then review it."
-                + "\nIf a line's role is not the role this session is playing, ignore it.",
+                + f"\nThis watcher is scoped only to the {a.role} role.",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -634,7 +1482,7 @@ def cmd_doctor(a: argparse.Namespace) -> None:
         print("         -> run each role in its own terminal window, or dispatch headless.")
 
     print("\nAgent CLIs found (for --harness on assign)")
-    found = [c for c in ("claude", "codex", "opencode", "gemini", "cursor-agent", "amp") if _has(c)]
+    found = [c for c in SUPPORTED_HARNESSES if _has(c)]
     print(f"  [{ok if found else warn}] " + (", ".join(found) if found else "none found"))
     if _has("claude"):
         print("         headless fallback available: claude -p \"$(cat <task>.mdx)\"")
@@ -646,17 +1494,23 @@ def cmd_doctor(a: argparse.Namespace) -> None:
     wired = settings.is_file() and "asyncRewake" in settings.read_text()
     print(f"  [{ok if wired else warn}] Stop hook in .claude/settings.json"
           + ("" if wired else "  - see `docket help signalling`"))
+    role = os.environ.get("DOCKET_ROLE", "")
+    print(f"  [{ok if role in ROLES else warn}] DOCKET_ROLE"
+          + (f"={role}" if role in ROLES else " is unset - this session cannot consume wake events"))
     pairs = armed()
     if pairs:
         print(f"  [{ok}] watcher armed:")
         for r, ro in pairs:
             print(f"           {r}  role={ro}")
-        roles = {ro for _, ro in pairs}
-        if len(roles) == 1:
-            print(f"  [{warn}] only '{list(roles)[0]}' is armed. A supervisor whose role is not")
-            print("         armed will NEVER be woken. Arm each waiting role:")
-            print("           docket arm <run> --role orchestrator")
-            print("           docket arm <run> --role planner")
+        for run in sorted({r for r, _ in pairs}):
+            present = {ro for r, ro in pairs if r == run}
+            expected = {"orchestrator"}
+            d = run_dir(run)
+            if d.is_dir() and topology(d) == "split":
+                expected.add("planner")
+            missing = expected - present
+            if missing:
+                print(f"  [{warn}] {run} is missing role(s): {', '.join(sorted(missing))}")
     else:
         print(f"  [{ok}] watcher not armed (correct when idle)")
 
@@ -666,234 +1520,16 @@ def cmd_doctor(a: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------------- help
 
-PLAYBOOKS = {
-    "planner": """PLANNER / REVIEWER  (biggest model; the session the human talks to)
 
-You own the plan and the final review. You do not write implementation code.
-
-1. Scaffold and plan
-     docket init <run-id>
-   Fill plan.mdx. In the Tasks table, set tier per task using this checklist -
-   tier=small ONLY if ALL of these hold:
-     - touches at most 2 files
-     - no cross-module contract or API change
-     - no new dependency
-     - acceptance criteria are mechanically checkable
-     - there is a runnable verify command
-   Anything else is tier=self. When in doubt, self. A small model given an
-   ambiguous task produces a confident wrong answer, which costs more to
-   review than to have written yourself.
-
-   Set plan.mdx `status: approved` only after the human approves it.
-
-2. Hand off to the orchestrator, in a sibling pane so you can watch it:
-     herdr pane split --current --direction right --cwd "$PWD" --no-focus
-     herdr agent start orch --kind codex --pane <pane-id-from-json>
-     herdr agent prompt orch "Read .docket/runs/<run>/plan.mdx and run the \\
-       orchestrator role. Read: docket help orchestrator" --wait --timeout 600000
-
-3. Review the orchestrator's report when woken
-     docket status <run>
-   Read orch-report-NN.mdx. Judge it against plan.mdx, not against its own summary.
-   Then:
-     docket decide <run> orch --approve
-     docket decide <run> orch --changes --reviewer planner
-   On --changes, write specific numbered edits into orch-decision-NN.mdx citing
-   file:line, then send the orchestrator back to read it.
-
-Never accept a report you have not read. `submitted` means it passed a schema
-check, not that the work is right.""",
-    "orchestrator": """ORCHESTRATOR / IMPLEMENTOR  (mid model)
-
-You split the plan, delegate the simple half, implement the complex half, and
-review everything the small models produce before the planner ever sees it.
-
-1. Read the plan
-     docket status <run>
-   Read plan.mdx. Trust its tier column, but override it downward (small -> self)
-   if a task looks ambiguous to you. Never override upward.
-
-2. Open every task
-     docket assign <run> T03 --tier small --harness opencode --model haiku \\
-       --files "src/a.py" --verify "pytest tests/test_a.py"
-   This writes T03-task.mdx and an empty T03-report-01.mdx. Fill in the task's
-   Goal and Acceptance criteria yourself - this is the highest-leverage thing you
-   do. A small model succeeds or fails on the quality of its acceptance criteria.
-
-3. Dispatch, at most 2-3 at a time
-   FIRST run `docket doctor` to see which of these you actually have. docket needs
-   none of them - the protocol is files - but the dispatch command differs.
-
-   (a) herdr, and you are inside a herdr pane - best option. Give each implementor a
-       sibling pane, then zoom to read one closely.
-
-     # check the caller's shape first, then split the long axis:
-     #   wide pane -> --direction right,  narrow or tall pane -> --direction down
-     herdr pane layout --pane "$HERDR_PANE_ID"
-     herdr pane split --current --direction right --cwd "$PWD" --no-focus
-     # read .result.pane.pane_id from the JSON
-     herdr agent start impl-t03 --kind opencode --pane <pane-id> -- --model haiku
-     herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-task.mdx and run \\
-       the implementor role. Read: docket help implementor" --wait --timeout 600000
-
-   (b) tmux or zellij - create a window per implementor, start the agent in it, and
-       paste the same prompt. No agent-state API, so rely on the report file and the
-       wake hook rather than on any --wait equivalent.
-
-   (c) no multiplexer, or herdr present but HERDR_ENV unset - dispatch headless:
-
-     claude -p "Read .docket/runs/<run>/T03-task.mdx and run the implementor role. \\
-       Read: docket help implementor" --model haiku --permission-mode acceptEdits
-
-       Process exit is the completion signal, so no watcher is needed for this mode.
-       You cannot watch it work, and on Claude Code `-p` is Agent SDK usage that may
-       be metered separately from interactive use. Prefer (a) when you have it.
-
-   (d) nothing available, or the run is small - do the task yourself and say so in
-       your report. Delegation is an optimisation, not an obligation.
-
-   ALWAYS address an agent by its name, never by pane id. A pane moved between
-   workspaces gets a NEW pane id, but the live agent name keeps resolving, so
-   name-addressing survives any layout change you or the captain make later.
-
-   Never make repeated splits in the SAME direction - that produces unusably narrow
-   columns. Alternate right then down, and cap yourself at 2-3 implementor panes.
-
-   Layout, for the human watching:
-     ctrl+b then z          zoom the focused pane fullscreen (toggle)
-     ctrl+b then Tab        cycle to the next pane
-     ctrl+b then h/j/k/l    focus a pane by direction
-     herdr agent focus impl-t03              jump straight to an agent
-     herdr agent attach impl-t03 --takeover  drive one by hand
-     herdr pane zoom --pane <id> --on        zoom a specific pane programmatically
-
-   Do not watch panes to track progress - use `docket status <run>`. Panes are for
-   when you need to look at ONE agent closely, zoomed.
-
-   Parallel implementors must have disjoint `files:` lists. If two tasks touch the
-   same file, run them in sequence instead.
-
-4. Review each submission
-   You are woken when a report is submitted or blocked. Read the report AND the
-   diff - never the report alone. Then:
-     docket decide <run> T03 --approve
-     docket decide <run> T03 --changes
-   --changes opens T03-report-02.mdx automatically. Write the required changes into
-   T03-decision-NN.mdx, then:
-     herdr agent prompt impl-t03 "Read .docket/runs/<run>/T03-decision-01.mdx \\
-       and apply it." --wait --timeout 600000
-
-   Cap this at 3 rounds per task. If round 3 still fails, take the task over
-   yourself and say so in your own report. Looping a small model past 3 rounds
-   costs more than doing it.
-
-5. Finish your own work, then report
-   Once every delegated task is approved, implement the tier=self tasks, then:
-     docket assign <run> orch
-     # fill orch-report-01.mdx
-     docket submit <run> orch
-   Your report must cover both what you delegated and what you wrote.""",
-    "signalling": """SIGNALLING  (how a supervisor learns a subordinate is done)
-
-Two mechanisms. Use the blocking one for short tasks, the wake one for real work.
-
-A. BLOCKING - fine for tasks under ~8 minutes
-     herdr agent prompt impl-t03 "..." --wait --timeout 480000
-   Returns when the agent settles to idle, done, or blocked. Simple, but a Claude
-   Code foreground Bash call is capped at 600s, so anything longer will cut out.
-
-   Note --wait tracks lifecycle state, not one specific turn: prompting an agent
-   that is already working can return on the PREVIOUS turn finishing. So never
-   treat a --wait return as proof of completion. The report file is the truth.
-
-B. WAKE - the right default for real implementation work
-   The supervisor finishes its turn and goes idle at zero token cost. A watcher
-   sleeps in the background and re-enters the session only when something is
-   actionable.
-
-   One-time setup, per project:
-     mkdir -p .claude
-     cp "$HOME"/.agents/skills/docket/hooks/settings.json.example .claude/settings.json
-   (Merge it into an existing settings.json rather than overwriting.)
-
-   ARM EVERY ROLE THAT WILL WAIT. This is the one thing people get wrong: a role
-   that is not armed is NEVER woken, silently. The planner waiting on the
-   orchestrator needs its own arm line even if the orchestrator is already armed.
-
-     docket arm <run> --role orchestrator    # waiting on implementors
-     docket arm <run> --role planner         # waiting on the orchestrator
-     docket disarm <run>                     # when the run ends
-
-   Check with `docket doctor`, which lists every armed pair.
-
-   Each role keeps its own ledger (.woke-<role>), so an orchestrator and a planner
-   watching the same run never consume each other's events. Every armed role is
-   watched by every session's hook, and each wake line is tagged with the role it
-   belongs to - ignore a line whose role is not the one you are playing. Set
-   DOCKET_ROLE=<role> in a session's environment to be woken only for your own role.
-
-   You will be woken with a system reminder naming what needs you. Then:
-     docket status <run>
-
-   Each event is delivered exactly once - the ledger at .docket/runs/<run>/.woke
-   dedupes - so you will not be woken repeatedly for the same submission.
-
-   The watcher must run in the hook's foreground process tree. Never launch
-   `docket watch` with shell '&', nohup, or a detached process: Claude Code owns
-   the hook's process group and relies on that to tear the watcher down with the
-   session. A backgrounded watcher outlives the session and wakes the wrong one.
-
-The Stop-hook watcher design is borrowed from firstmate's event-driven supervision
-(https://github.com/kunchenguid/firstmate, Kun Chen, MIT) - including the
-never-background rule and the exactly-once event ledger. Use firstmate directly if you
-need parallel crews, worktree isolation, or restart-proof reconciliation.
-
-WHY NOT interval polling from inside the agent: every poll costs a turn and
-tokens, and it cannot wake an idle session. Why not a long-poll the agent must
-re-enter: it depends on the model voluntarily calling a blocking command forever,
-which is the one thing a prompt cannot guarantee. The Stop hook inverts it - the
-harness re-enters the model.""",
-    "implementor": """IMPLEMENTOR  (small model)
-
-You implement exactly one task and write an honest report. That is all.
-
-1. Read your task file end to end. It names the only files you may touch.
-
-2. Implement it. Stay inside `files:`. If the work genuinely needs a file outside
-   that list, do not widen the scope - go to step 4 and set status: blocked.
-
-3. Run the `verify:` command from your task file yourself, and read its output.
-
-4. Fill in your report (<owner>-report-NN.mdx). Every section is required:
-     Summary          past tense, what you did
-     Files changed    `path:line` bullets, or "none"
-     Acceptance       copy each criterion; check [x] ONLY if it truly passes
-     Verification     the exact command and its real output
-     Decisions needed the reviewer's call, or "none"
-
-   If you are stuck or the task is ambiguous, set `status: blocked` in the
-   frontmatter and write what you need decided under "Decisions needed". A
-   blocked report is a good outcome. A report claiming success that does not
-   hold up is the only bad one.
-
-5. Submit
-     docket submit <run> <owner>
-   This validates your report and runs your verify command. If it rejects, it
-   tells you exactly what is wrong. Fix and resubmit. Nothing reaches the
-   reviewer until it passes, so a rejection costs nothing but your own time.
-
-6. If you receive a decision file, read it, apply every numbered change, then
-   fill the NEW report round and submit again.
-
-Never mark an acceptance criterion [x] to make submit pass. The reviewer reads
-the diff.""",
-}
+HELP_TOPICS = ("planner", "orchestrator", "implementor", "signalling")
 
 
 def cmd_help(a: argparse.Namespace) -> None:
-    if a.role not in PLAYBOOKS:
-        die(f"unknown role: {a.role}  (choose from: {', '.join(PLAYBOOKS)})")
-    print(PLAYBOOKS[a.role])
+    """Read the canonical role reference rather than duplicating playbooks in code."""
+    reference = Path(__file__).resolve().parent.parent / "references" / f"{a.role}.md"
+    if not reference.is_file():
+        die(f"missing playbook: {reference}")
+    print(reference.read_text().strip())
 
 
 # --------------------------------------------------------------------- parser
@@ -905,24 +1541,56 @@ def main() -> None:
 
     q = sub.add_parser("init", help="scaffold a run and its plan")
     q.add_argument("run")
-    q.add_argument("--harness", default="claude")
+    q.add_argument("--harness", default="claude", choices=SUPPORTED_HARNESSES)
+    q.add_argument("--topology", default="split", choices=TOPOLOGIES)
     q.set_defaults(fn=cmd_init)
 
     q = sub.add_parser("assign", help="open a task and its first report")
     q.add_argument("run")
     q.add_argument("owner", help="task id such as T03, or 'orch'")
-    q.add_argument("--tier", default="small", choices=["small", "self"])
-    q.add_argument("--harness", default="")
+    q.add_argument("--complexity", default="low", choices=["low", "high"])
+    q.add_argument("--executor", default="implementor", choices=["implementor", "orchestrator"])
+    q.add_argument("--tier", choices=["small", "self"], help=argparse.SUPPRESS)
+    q.add_argument("--harness", default="opencode", choices=SUPPORTED_HARNESSES)
     q.add_argument("--model", default="")
-    q.add_argument("--files", default="")
+    q.add_argument("--effort", default="", help="requested reasoning effort when supported by the harness")
+    q.add_argument("--file", action="append", default=[], help="allowed path; repeat for multiple paths")
+    q.add_argument("--files", default="", help=argparse.SUPPRESS)
     q.add_argument("--verify", default="")
+    q.add_argument("--verify-timeout", type=int, default=900)
     q.set_defaults(fn=cmd_assign)
+
+    q = sub.add_parser("validate-task", help="gate functional task intent before implementor discovery")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.set_defaults(fn=cmd_validate_task)
+
+    q = sub.add_parser("scope", help="validate and claim an implementor-authored discovery scope")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--submit", action="store_true", help="validate the capsule and claim its paths")
+    q.set_defaults(fn=cmd_scope)
+
+    q = sub.add_parser("handoff", help="open or submit a resumable partial-implementation checkpoint")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--submit", action="store_true", help="validate the latest handoff and mark it ready")
+    q.set_defaults(fn=cmd_handoff)
+
+    q = sub.add_parser("set-model", help="record the active model verified in the live harness")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--actual", required=True, help="exact active model label or provider/model id")
+    q.add_argument("--effort", default="", help="verified active effort when exposed by the harness")
+    q.set_defaults(fn=cmd_set_model)
 
     q = sub.add_parser("submit", help="validate a report and hand it to the reviewer")
     q.add_argument("run")
     q.add_argument("owner")
+    q.add_argument("--blocked", action="store_true", help="submit as blocked and request a reviewer decision")
     q.add_argument("--skip-verify", action="store_true", help="skip the task's verify command")
-    q.add_argument("--verify-timeout", type=int, default=900)
+    q.add_argument("--skip-verify-reason", default="", help="required audit reason when skipping verification")
+    q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
     q.set_defaults(fn=cmd_submit)
 
     q = sub.add_parser("decide", help="approve a report or request changes")
@@ -931,18 +1599,32 @@ def main() -> None:
     g = q.add_mutually_exclusive_group(required=True)
     g.add_argument("--approve", action="store_true")
     g.add_argument("--changes", action="store_true")
+    g.add_argument("--waive", action="store_true", help="accept a blocked report without claiming it passed")
+    q.add_argument("--reason", default="", help="required rationale for --waive")
     q.add_argument("--reviewer", default="orch")
     q.set_defaults(fn=cmd_decide)
 
     q = sub.add_parser("status", help="show every owner's round and state")
     q.add_argument("run")
+    q.add_argument("--role", choices=["planner", "orchestrator"], help="planner view hides task-level traffic")
     q.set_defaults(fn=cmd_status)
+
+    q = sub.add_parser("diff", help="show worktree paths changed since task assignment")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.set_defaults(fn=cmd_diff)
+
+    q = sub.add_parser("preflight", help="record a task's verification baseline before implementation")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
+    q.set_defaults(fn=cmd_preflight)
 
     q = sub.add_parser("watch", help="block until something needs you, then exit 2")
     q.add_argument("run", nargs="?")
-    q.add_argument("--role", action="append", choices=["orchestrator", "planner"],
-                   help="repeatable; defaults to orchestrator, or every armed role with --armed")
-    q.add_argument("--armed", action="store_true", help="watch every pair in .docket/watch.conf")
+    q.add_argument("--role", required=True, choices=["orchestrator", "planner"],
+                   help="required recipient role; prevents cross-role event consumption")
+    q.add_argument("--armed", action="store_true", help="watch this role's runs in .docket/watch.conf")
     q.add_argument("--interval", type=int, default=5)
     q.add_argument("--timeout", type=int, default=28800)
     q.set_defaults(fn=cmd_watch)
@@ -961,10 +1643,12 @@ def main() -> None:
     q.set_defaults(fn=cmd_doctor)
 
     q = sub.add_parser("help", help="print a role playbook")
-    q.add_argument("role", choices=list(PLAYBOOKS))
+    q.add_argument("role", choices=HELP_TOPICS)
     q.set_defaults(fn=cmd_help)
 
     a = p.parse_args()
+    if getattr(a, "waive", False) and not a.reason.strip():
+        die("--waive requires --reason TEXT")
     a.fn(a)
 
 

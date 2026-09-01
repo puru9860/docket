@@ -16,7 +16,8 @@
 # event-driven supervision: https://github.com/kunchenguid/firstmate (Kun Chen, MIT).
 # No code copied; see that project for the full-featured version.
 #
-# Inert unless .docket/watch.conf exists, so an idle project costs nothing.
+# Inert unless .docket/watch.conf and DOCKET_ROLE exist, so an idle or unscoped
+# session costs nothing and cannot consume another supervisor's event.
 # Arm:    docket arm R01 --role orchestrator     (repeat per waiting role)
 # Disarm: docket disarm R01
 set -u
@@ -25,15 +26,14 @@ ROOT="${CLAUDE_PROJECT_DIR:-$PWD}"
 CONF="$ROOT/.docket/watch.conf"
 
 [ -f "$CONF" ] || exit 0
+[ -n "${DOCKET_ROLE:-}" ] || exit 0
+case "$DOCKET_ROLE" in
+  planner|orchestrator) ;;
+  *) exit 0 ;;
+esac
 cd "$ROOT" || exit 0
 
 DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
 
-# Watch EVERY armed (run, role) pair, not just the first line. Each role has its own
-# ledger, so an orchestrator and a planner watching the same run never consume each
-# other's events. Set DOCKET_ROLE to filter this session to one role and avoid being
-# woken for another role's work.
-if [ -n "${DOCKET_ROLE:-}" ]; then
-  exec "$DOCKET" watch --armed --role "$DOCKET_ROLE" --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
-fi
-exec "$DOCKET" watch --armed --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
+# Watch only this session's role. The CLI atomically claims matching events.
+exec "$DOCKET" watch --armed --role "$DOCKET_ROLE" --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"

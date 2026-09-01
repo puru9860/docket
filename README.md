@@ -4,16 +4,17 @@ Run a **planner / orchestrator / implementor** pipeline across coding agents, co
 through numbered `.mdx` docket files, with a mechanical report-validation gate and
 zero-token wake signalling.
 
-Three roles, three model tiers, one file protocol:
+Three logical roles, one file protocol:
 
 | Role | Model tier | Does |
 | --- | --- | --- |
 | **planner / reviewer** | biggest | writes the plan, does the final review |
-| **orchestrator / implementor** | mid | splits the plan, delegates the simple half, implements the complex half, reviews everything the small models produce |
+| **orchestrator** | flexible | dispatches work, handles real blockers or scope collisions, and reviews task reports |
 | **implementor** | small | implements exactly one task, writes an honest report |
 
-Roles run as separate agents, on any harness, in any mix. They never talk directly.
-They coordinate only through files, so no role needs to know what harness the others use.
+The planner and orchestrator may be separate (`split`) or one agent (`combined`).
+Implementors can run cheaply in another harness. Docket supports Claude Code, Codex
+(temporary compatibility), and OpenCode.
 
 ## Why this instead of prompting one agent to "use subagents"
 
@@ -43,13 +44,13 @@ Run `docket doctor` at any time to see what you have and what each missing piece
 
 | | Without it |
 | --- | --- |
-| A multiplexer for dispatch — [herdr](https://github.com/kunchenguid) recommended, tmux or zellij fine | Run each role in its own terminal window, or dispatch headless with `claude -p`. The file protocol is unchanged. |
+| A multiplexer for dispatch - [herdr](https://github.com/kunchenguid) recommended, tmux or zellij fine | Run each role in its own terminal window, or dispatch headless with `claude -p`. The file protocol is unchanged. |
 | Claude Code, for the `asyncRewake` wake hook | Supervisors block on a foreground call instead of idling for free, which caps out around 8 minutes per wait. Headless dispatch needs no watcher at all, since process exit is the signal. |
-| Several agent CLIs (`claude`, `codex`, `opencode`, …) | Model tiering collapses. One agent can still play all three roles sequentially; you keep the paper trail and the gate but lose the cost saving. |
+| Several agent CLIs (`claude`, `codex`, `opencode`) | Model tiering collapses. One agent can still play the roles sequentially; you keep the paper trail and gate but lose the cost saving. |
 
 None of the optional pieces are enforced and nothing is blocked if they are absent.
 `docket` is a file protocol plus a validation gate; dispatch and wake are conveniences
-layered on top. If you install one thing, install herdr — it gives each agent a real
+layered on top. If you install one thing, install herdr - it gives each agent a real
 interactive pane, and driving an interactive session avoids the separate metering that
 applies to headless Agent SDK use.
 
@@ -83,22 +84,19 @@ cp -r /tmp/docket-src/skills/docket ~/.agents/skills/docket
 
 Then per harness:
 
-**Codex** — nothing to configure. It scans `$HOME/.agents/skills` (user scope) and
+**Codex** - nothing to configure. It scans `$HOME/.agents/skills` (user scope) and
 `.agents/skills` walking up from the cwd (repo scope). Skills are enabled by default;
 a `[[skills.config]]` entry in `~/.codex/config.toml` is only needed to *disable* one.
 
-**OpenCode** — nothing to configure. It scans `~/.agents/skills/*/SKILL.md` globally and
+**OpenCode** - nothing to configure. It scans `~/.agents/skills/*/SKILL.md` globally and
 `.agents/skills/<name>/SKILL.md` per project. Placement alone is enough.
 
-**Claude Code** — does not read `~/.agents/skills`, so symlink it in:
+**Claude Code** - does not read `~/.agents/skills`, so symlink it in:
 
 ```bash
 mkdir -p ~/.claude/skills
 ln -sfn ~/.agents/skills/docket ~/.claude/skills/docket
 ```
-
-Any other harness: symlink into its skills directory the same way
-(`~/.cursor/skills/`, `~/.config/crush/skills/`, `~/.copilot/skills/`, and so on).
 
 ### Put the CLI on PATH
 
@@ -119,8 +117,7 @@ docket init R01          # scaffolds .docket/runs/R01/plan.mdx
 docket help planner      # then follow the playbook
 ```
 
-The playbooks are the source of truth and they live in the CLI, so an installed copy
-cannot go stale:
+The role playbooks ship beside the skill and are surfaced by the CLI:
 
 ```bash
 docket help planner
@@ -133,14 +130,16 @@ docket help signalling
 
 ```
 .docket/runs/<run>/
-  plan.mdx                 planner's output; tasks table with a tier per task
-  T03-task.mdx             assignment: goal, acceptance criteria, files, verify command
+  plan.mdx                 planner's functional plan and task ownership
+  T03-task.mdx             assignment intent, constraints, and optional hints
+  T03-scope.mdx            implementor-owned discovery and claimed change surface
+  T03-handoff-01.mdx       resumable partial-work checkpoint when replacement is needed
   T03-report-01.mdx        implementor fills this; round 1
   T03-decision-01.mdx      reviewer's verdict and required changes
   T03-report-02.mdx        opened automatically when changes are requested
   orch-report-01.mdx       orchestrator's own report, reviewed by the planner
   docs/                    supporting docs
-  .woke                    wake ledger; delivers each event exactly once
+  .woke-<role>             role-scoped wake ledger; delivers each event exactly once
 ```
 
 Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 of T03.
@@ -148,12 +147,16 @@ Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 o
 ## Commands
 
 ```
-docket init <run>                                    scaffold the run and plan.mdx
-docket assign <run> <owner> [--tier small|self]
-    [--harness H] [--model M] [--files ...] [--verify CMD]
-docket submit <run> <owner>                          validate and hand off  <- the gate
-docket decide <run> <owner> --approve | --changes    verdict; --changes opens next round
-docket status <run>                                  every owner's round and state
+docket init <run> --topology split|combined --harness H
+docket assign <run> <owner> --complexity low|high --executor implementor|orchestrator
+docket validate-task <run> <owner>                   validate functional intent
+docket scope <run> <owner> --submit                  claim implementor-discovered paths
+docket handoff <run> <owner> [--submit]              partial-work checkpoint
+docket set-model <run> <owner> --actual MODEL        record the verified live model
+docket preflight <run> <owner>                       record the verification baseline
+docket submit <run> <owner>                          validate and hand off <- the gate
+docket decide <run> <owner> --approve|--changes|--waive
+docket status <run> [--role planner|orchestrator]
 docket arm <run> --role R                            arm the watcher for a waiting role
 docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
@@ -164,7 +167,7 @@ docket help <role>                                   the playbooks
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
 
 Report and task schemas are built in. Override them per project by dropping a
-`.docket/templates/<report|task|plan|decision>.mdx`.
+`.docket/templates/<plan|task|scope|report|handoff|orchestrator_report|decision>.mdx`.
 
 ## Wake signalling (optional but recommended)
 
@@ -202,7 +205,7 @@ with the role it belongs to. Set `DOCKET_ROLE=<role>` in a session to be woken o
 that role.
 
 The watcher is inert unless `watch.conf` exists, so an idle project costs nothing. It must
-run in the hook's own foreground process tree — never with shell `&` — so the harness can
+run in the hook's own foreground process tree - never with shell `&` - so the harness can
 tear it down with the session. See `docket help signalling`.
 
 Harnesses without an equivalent wake hook fall back to the blocking mode described in the
@@ -222,7 +225,7 @@ signalling works the way it does, the invariants, and the known gaps.
 **[AGENTS.md](AGENTS.md)** is the entry point for an agent working on this repo.
 
 ```bash
-tests/test.sh    # 44 assertions; must be 0 failures
+tests/test.sh    # behavioral regression suite; must be 0 failures
 ```
 
 ## Acknowledgements
