@@ -1,0 +1,1 @@
+Independently judge correctness, design, integration, and outcome from a fresh context: the objective and the approved contract, never prior conversation. An approval binds exact task, bundle, and verification revisions. On doubt, inspect source and evidence directly. Return numbered corrections with fresh verification, or send plan gaps back as amendments.

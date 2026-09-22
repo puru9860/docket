@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docket Five-Role Workflow - Architecture and Working</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#121724; --panel2:#171e30; --line:#26314d;
+    --ink:#e8ecf4; --muted:#9aa6c2; --faint:#6b7691;
+    --planner:#b388ff; --orch:#4cc2ff; --impl:#5eeaa8; --verif:#ffc857; --rev:#ff7a9e;
+    --cli:#ffd479; --ok:#5eeaa8; --bad:#ff6b6b; --warn:#ffc857;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6}
+  a{color:#8fc3ff}
+  header.hero{padding:48px 24px 28px;border-bottom:1px solid var(--line);
+    background:radial-gradient(900px 300px at 20% 0%,#1c2a52 0%,transparent 60%),
+               radial-gradient(800px 280px at 85% 0%,#3a1740 0%,transparent 60%),var(--bg)}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+  h1{font-size:2.1rem;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--muted);max-width:80ch;margin:0}
+  .badges{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
+  .badge{font:12px var(--mono);border:1px solid var(--line);border-radius:999px;padding:4px 10px;color:var(--muted);background:#0e1322}
+  .badge b{color:var(--ink)}
+  nav.toc{position:sticky;top:0;z-index:5;background:rgba(11,14,20,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  nav.toc .wrap{display:flex;gap:6px;overflow-x:auto;padding:10px 24px}
+  nav.toc a{white-space:nowrap;font:12.5px var(--mono);color:var(--muted);text-decoration:none;border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+  nav.toc a:hover{color:var(--ink);border-color:#3b4a73}
+  section{padding:34px 0;border-bottom:1px solid #161c2e}
+  h2{font-size:1.45rem;margin:0 0 4px;letter-spacing:-.01em}
+  h3{font-size:1.05rem;margin:26px 0 8px}
+  p.lede{color:var(--muted);max-width:95ch;margin:6px 0 16px}
+  .grid{display:grid;gap:12px}
+  .g5{grid-template-columns:repeat(5,1fr)}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:1000px){.g5{grid-template-columns:repeat(2,1fr)}.g3,.g2{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .card h4{margin:0 0 6px;font-size:.95rem}
+  .card p,.card li{font-size:.88rem;color:#c6cfe3}
+  .card ul{margin:8px 0 0;padding-left:18px}
+  .role{border-top:4px solid var(--line)}
+  .role.planner{border-top-color:var(--planner)} .role.orch{border-top-color:var(--orch)}
+  .role.impl{border-top-color:var(--impl)} .role.verif{border-top-color:var(--verif)}
+  .role.rev{border-top-color:var(--rev)}
+  .tag{display:inline-block;font:11px var(--mono);border-radius:6px;padding:2px 8px;border:1px solid var(--line);color:var(--muted);margin:2px 4px 2px 0}
+  table{width:100%;border-collapse:collapse;font-size:.86rem;margin:12px 0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #1c2440;vertical-align:top}
+  th{background:var(--panel2);color:var(--ink);font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}
+  td.mono,.mono{font-family:var(--mono);font-size:.8rem}
+  tr:last-child td{border-bottom:none}
+  code{font-family:var(--mono);font-size:.82em;background:#0e1424;border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+  pre{background:#070b14;border:1px solid var(--line);border-radius:12px;padding:14px 16px;overflow:auto;font:12.5px/1.65 var(--mono);color:#d6deF2}
+  .pipe{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:14px 0}
+  .node{flex:1 1 140px;min-width:140px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;position:relative}
+  .node strong{display:block;font-size:.82rem}
+  .node span{font-size:.74rem;color:var(--muted)}
+  .node small{display:block;font:11px var(--mono);color:var(--faint);margin-top:6px}
+  .arr{align-self:center;padding:0 6px;color:var(--faint);font-size:20px}
+  .flow{border:1px solid var(--line);border-radius:14px;background:#0d1220;padding:14px;margin:12px 0}
+  .flow .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+  .pill{font:12px var(--mono);border-radius:999px;padding:6px 12px;border:1px solid var(--line);background:var(--panel2)}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  .callout{border:1px solid var(--line);border-left:4px solid var(--orch);background:#0e1528;border-radius:10px;padding:12px 14px;margin:12px 0;font-size:.9rem;color:#cdd6ec}
+  .callout.warn{border-left-color:var(--warn)} .callout.bad{border-left-color:var(--bad)}
+  .callout.good{border-left-color:var(--ok)}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:10px 0}
+  details summary{cursor:pointer;font-weight:600}
+  .kbd{font-family:var(--mono)}
+  footer{padding:28px 0 60px;color:var(--faint);font-size:.82rem}
+  .tabs{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}
+  .tabs button{background:var(--panel);color:var(--muted);border:1px solid var(--line);border-radius:10px;padding:8px 14px;font:13px var(--mono);cursor:pointer}
+  .tabs button.active{color:var(--ink);border-color:#4a5f9e;background:var(--panel2)}
+  .tabpane{display:none} .tabpane.active{display:block}
+  svg.diagram{width:100%;height:auto;background:#0d1220;border:1px solid var(--line);border-radius:14px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font:12px var(--mono);color:var(--muted);margin:8px 0}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header class="hero">
+<div class="wrap">
+<h1>Docket: five-role workflow - architecture and working</h1>
+<p class="sub">How <code>planner &rarr; orchestrator &rarr; implementor &rarr; frozen bundle &rarr; verifier &rarr; reviewer &rarr; aggregate &rarr; delivery + suite &rarr; final packet</code> holds up with cheap models doing the bulk work and capable models spending tokens only where judgment is required. Single stdlib-only CLI (<code>skills/docket/bin/docket</code>), file protocol under <code>.docket/runs/&lt;run&gt;/</code>, zero-token idle signalling.</p>
+<div class="badges">
+<span class="badge"><b>workflow</b> five-role-v1 / legacy</span>
+<span class="badge"><b>harness</b> claude / codex / opencode</span>
+<span class="badge"><b>evidence</b> git / documents-only</span>
+<span class="badge"><b>topology</b> split / combined</span>
+<span class="badge"><b>cost metric</b> premium tokens / accepted outcome</span>
+</div>
+</div>
+</header>
+<nav class="toc"><div class="wrap">
+<a href="#mental">1 Mental model</a><a href="#topology">2 Topology</a><a href="#roles">3 Roles + models</a>
+<a href="#pipeline">4 End-to-end pipeline</a><a href="#lifecycle">5 Lifecycle</a><a href="#datamodel">6 Data model</a>
+<a href="#bundle">7 Evidence bundles</a><a href="#gate">8 The gate</a><a href="#verify">9 Verify + accept</a>
+<a href="#signal">10 Signalling</a><a href="#dispatch">11 Dispatch + deps</a><a href="#packet">12 Packets + release</a>
+<a href="#invariants">13 Invariants</a><a href="#example">14 Worked example</a>
+</div></nav>
+
+<div class="wrap">
+
+<section id="mental">
+<h2>1. The model in one paragraph</h2>
+<p class="lede">Five logical roles may run as five agents, or planner+orchestrator may be combined. They share no API - only Markdown files in <code>.docket/runs/&lt;run&gt;/</code>. A supervisor learns a subordinate finished because the <b>harness re-enters it</b>, not because it polled. Mechanical gates validate intent, atomically claim implementor-discovered scopes, detect collisions, and refuse to mark a report reviewable unless schema, diff boundary, acceptance fidelity and verification all hold. Every submitted round freezes into an immutable content-addressed bundle; every verdict binds to that digest.</p>
+<div class="grid g3">
+<div class="card"><h4>Why files, not messages</h4><ul>
+<li><b>Harness independence.</b> Claude Code planner + OpenCode implementor share only a directory.</li>
+<li><b>Terminal output is lossy.</b> Alternate-screen rows scroll off; supervisors must read files.</li>
+<li><b>Sessions die.</b> Files survive kill, compaction, restart. Memory does not.</li></ul></div>
+<div class="card"><h4>What is review truth</h4><ul>
+<li>Submitted <code>*-report-NN.mdx</code> body + task-local diff + frozen bundle.</li>
+<li>Not chat, not scrollback, not lifecycle state, not scope capsule, not handoff.</li>
+<li>Edited body = new evidence: needs <code>--re-review</code> (full gate + re-verify).</li></ul></div>
+<div class="card"><h4>What Docket never does</h4><ul>
+<li>Never rewrites a submitted body; <code>decide</code> writes lifecycle keys + separate <code>*-decision-NN.mdx</code>.</li>
+<li>Never describes missing Git evidence as an empty diff; it says <code>unavailable</code>.</li>
+<li>Never auto-approves: budget exhaustion &rarr; one durable escalation.</li></ul></div>
+</div>
+<div class="callout">Cost boundary: <code>progress_updates: quiet</code> in both topologies. After one dispatch notice, supervisors wait in one blocking wait. Speak only for: blocker needing user authority, completion, or explicit status request. A normal review-batch wake is internal work, not a user update.</div>
+</section>
+
+<section id="topology">
+<h2>2. Topology and workflow versions</h2>
+<div class="tabs">
+<button class="active" data-tab="t-split">split (default for premium saving)</button>
+<button data-tab="t-combined">combined</button>
+<button data-tab="t-version">legacy vs five-role-v1</button>
+</div>
+<div class="tabpane active" id="t-split">
+<div class="grid g2">
+<div class="card"><h4>Split: planner and orchestrator are separate agents</h4>
+<p>Planner (expensive, Claude Code / Codex) writes <code>plan.mdx</code>, hands it over, then stops supervising task work. It must not monitor implementors, read <code>Txx-report</code> files, receive task wakes, or relay per-task updates. It consumes exactly one artifact: <code>orch-report-NN.mdx</code> + aggregate diff.</p>
+<p class="mono">docket init R01 --topology split --harness claude<br>docket arm R01 --role planner  # planner session, DOCKET_ROLE=planner<br>docket arm R01 --role orchestrator  # orchestrator session</p></div>
+<div class="card"><h4>When to use split</h4><ul>
+<li>Planner runs on Opus / GPT-5; implementation + supervision run cheaply in OpenCode.</li>
+<li>You want the planner context protected from per-task chatter.</li>
+<li>Human wants one aggregate review, not N task reviews.</li></ul></div>
+</div>
+</div>
+<div class="tabpane" id="t-combined">
+<div class="grid g2">
+<div class="card"><h4>Combined: one agent is planner+reviewer+orchestrator</h4><p>Cheap implementors may still be separate. Follow the orchestrator playbook after plan approval; no redundant planner handoff. Do not narrate implementor activity just because you can now see it.</p>
+<p class="mono">docket init R01 --topology combined<br># arm orchestrator only; final orch report completes without self-wake</p></div>
+<div class="card"><h4>When to use combined</h4><ul><li>Small run, one operator, or only one harness installed.</li><li>You keep the paper trail + gate but lose some cost separation.</li></ul></div>
+</div>
+</div>
+<div class="tabpane" id="t-version">
+<table><tr><th>Policy</th><th>legacy</th><th>five-role-v1 (new)</th></tr>
+<tr><td>Declared in</td><td class="mono">workflow: legacy in plan.mdx</td><td class="mono">workflow: five-role-v1 in plan.mdx</td></tr>
+<tr><td>Roles enforced</td><td>planner / orchestrator / implementor (convention)</td><td>planner, orchestrator, implementor, <b>verifier</b>, <b>reviewer</b> with <code>--as</code> identity on every mutation</td></tr>
+<tr><td>Approval</td><td>orchestrator reviews</td><td>reviewer only; needs passing verification for exact bundle + live contract</td></tr>
+<tr><td>Verification</td><td><code>verify:</code> command run at submit</td><td>same + numbered <code>*-verification-NN.mdx</code> findings (pass/fail/uncertain), correction budget, routing</td></tr>
+<tr><td>Migration</td><td colspan="2" class="mono">docket migrate &lt;run&gt; --to five-role-v1 (explicit human auth; preserves bytes; reconciles event identities)</td></tr>
+</table>
+</div>
+<h3>Plan frontmatter policy (flat keys only, never nested)</h3>
+<pre>docket init R01 --topology split --harness opencode --evidence-mode git --root app=/path/to/checkout
+# plan.mdx frontmatter:
+workflow: five-role-v1
+provisional_integration: forbidden | allowed
+evidence_mode: git | documents-only
+primary_model: &lt;id&gt;   fallback_models: [...]
+max_concurrency: N   correction_limit: 2
+verifier_correction: allowed | forbidden</pre>
+</section>
+
+<section id="roles">
+<h2>3. The five roles - authority, cost, and which model to use</h2>
+<p class="lede">Authority is <b>exclusive, not additive</b>. Verifiers never approve. Orchestrators never approve disputed work, waive, or alter acceptance. Reviewers alone approve/waive. Planners own intent + amendments. The CLI is infrastructure and impersonates nobody. The table below is the model-tiering rule from the improvement plan, made concrete per harness.</p>
+<div class="grid g5">
+<div class="card role planner"><h4>Planner</h4><span class="tag">owns intent</span><span class="tag">capable</span><p>Compact contract, acceptance obligations, risks, milestones, amendments. Final outcome review in split mode.</p><p><b>Does not:</b> implement, monitor implementors, read task reports.</p></div>
+<div class="card role orch"><h4>Orchestrator</h4><span class="tag">routes + assembles</span><span class="tag">cheap</span><p>Assigns, validates intent, dispatches, recovers, routes by rule, assembles aggregate packet.</p><p><b>Does not:</b> approve disputed work, waive, alter acceptance.</p></div>
+<div class="card role impl"><h4>Implementor</h4><span class="tag">one task</span><span class="tag">cheap</span><p>Discovers repo, proposes scope, implements, proves acceptance, checkpoints via handoff.</p><p><b>Does not:</b> edit status manually, submit twice, edit after submit.</p></div>
+<div class="card role verif"><h4>Verifier</h4><span class="tag">adversarial</span><span class="tag">cheap-first</span><p>Challenges whether evidence proves acceptance. Records pass / fail / uncertain + numbered defects.</p><p><b>Does not:</b> approve, waive, invent fixes.</p></div>
+<div class="card role rev"><h4>Reviewer</h4><span class="tag">decides</span><span class="tag">capable + fresh</span><p>Judges correctness/design/integration from packet. Approve / waive (reason) / changes.</p><p><b>Fresh context:</b> objective + contract, never planner history.</p></div>
+</div>
+
+<h3>Authority matrix (enforced by <code>--as</code> under five-role-v1)</h3>
+<table><tr><th>Operation</th><th>May perform</th><th>Guards</th></tr>
+<tr><td class="mono">submit task round</td><td>implementor (orchestrator for aggregate)</td><td>gate, scope, diff, verification; one writer; locked transition</td></tr>
+<tr><td class="mono">verify submitted round</td><td>verifier</td><td>round submitted; one numbered artifact per attempt</td></tr>
+<tr><td class="mono">decide --approve / --waive</td><td>reviewer</td><td>passing verification for exact frozen bundle + live contract; waivers need reason</td></tr>
+<tr><td class="mono">decide --changes</td><td>reviewer</td><td>numbered required changes; correction budget (default 2)</td></tr>
+<tr><td>verifier-triggered correction</td><td>verifier, only if <code>verifier_correction: allowed</code></td><td>records verifier provenance, never approval</td></tr>
+<tr><td class="mono">decide --reopen</td><td>reviewer</td><td>waived round; collision check; exactly one next round</td></tr>
+<tr><td class="mono">migrate --to five-role-v1</td><td>explicit human</td><td>preserves artifacts; retires legacy event identities</td></tr>
+</table>
+
+<h3>Model selection per role (the part most teams get wrong)</h3>
+<div class="callout good"><b>Rule:</b> spend capable-model tokens on <b>intent and judgment</b> (planner, reviewer, hard verification). Spend cheap-model tokens on <b>volume</b> (orchestration, implementation, routine verification). Principal metric: <b>premium tokens per accepted outcome</b>, with escaped defects as the quality constraint. Cheap work that needs expensive reconstruction is not economical.</div>
+<table><tr><th>Role</th><th>Tier + effort</th><th>Claude Code</th><th>Codex (temp. compat)</th><th>OpenCode</th><th>Why this tier</th></tr>
+<tr><td><b>Planner</b></td><td>biggest / capable<br><span class="mono">effort high|xhigh</span></td><td class="mono">claude-opus-4-6 --effort high</td><td class="mono">gpt-5 / gpt-5.1 high</td><td class="mono">anthropic/claude-opus-*, openai/gpt-5*</td><td>Writes contract once; decides amendments. Low volume, high leverage. Protect with split boundary.</td></tr>
+<tr><td><b>Orchestrator</b></td><td>cheap / flexible<br><span class="mono">effort low|medium</span></td><td class="mono">claude-sonnet / haiku --effort medium</td><td class="mono">gpt-5-mini / gpt-4.1-mini</td><td class="mono">muse-spark-1.3, qwen, glm, gemini-flash</td><td>Runs on every event (assign, route, assemble). Deterministic rules; must not burn premium on polling.</td></tr>
+<tr><td><b>Implementor (low)</b></td><td>small / cheap<br><span class="mono">complexity=low</span></td><td class="mono">haiku --effort low/medium</td><td class="mono">gpt-5-mini low</td><td class="mono">muse-spark, haiku-class, small open</td><td>Narrow, mechanically checkable task + runnable <code>verify:</code>. Gate catches hollow claims.</td></tr>
+<tr><td><b>Implementor (high)</b></td><td>stronger<br><span class="mono">complexity=high</span></td><td class="mono">sonnet/opus --effort high</td><td class="mono">gpt-5 medium+</td><td class="mono">sonnet-class and up</td><td>Broad scope / deep review needed. <code>complexity</code> and <code>executor</code> are independent knobs.</td></tr>
+<tr><td><b>Verifier</b></td><td>cheap by default, escalate on risk</td><td class="mono">sonnet default; opus for hard evidence</td><td class="mono">mini default; full for hard</td><td class="mono">cheap default; strong for concurrency / security / oracle / plumbing</td><td>Fresh context adversarial check. Cheap verifiers share implementor blind spots - route risky areas up.</td></tr>
+<tr><td><b>Reviewer</b></td><td>capable, separate context<br><span class="mono">milestones + final</span></td><td class="mono">claude-opus-4-6 --effort high</td><td class="mono">gpt-5 high</td><td class="mono">opus/gpt-5 class, fresh session</td><td>Only approver. Gets 1-2k token packet + bundle digests, not chatter. Never skip final review even if first-round approvals rise.</td></tr>
+</table>
+<details><summary>Model operations you must actually run (launch flags are not proof)</summary>
+<pre># assign records the REQUESTED model; set-model records the OBSERVED one
+docket assign R01 T03 --complexity low --executor implementor --harness opencode --model &lt;requested&gt;
+docket set-model R01 T03 --actual &lt;verified-active-label&gt; [--effort high]
+
+# Claude Code: prefer in-session change over restart
+/model claude-opus-4-6
+/effort high
+# OpenCode: Ctrl+X then M (or /models) in the SAME session; verify UI label; restart only if exited
+# Codex: same rule - verify, do not infer actual_model from the launch command.
+
+# plan policy bounds spend without nesting:
+primary_model: ...   fallback_models: [...]   max_concurrency: N
+correction_limit: 2   # past fallback/end: ONE compact exception, never silent upscale
+docket switch-model R01 T03 --model &lt;next-fallback&gt;   # walks approved list
+docket dispatch R01 T03 --session S --agent NAME [--model M]  # one round = one writer</pre>
+</details>
+<div class="callout warn"><b>Anti-patterns:</b> planner reading task reports (breaks split boundary); orchestrator approving disputed work; verifier approving; approving a <code>git</code> run with <code>diff coverage unavailable</code>; re-recording a <code>depend</code> pin instead of reverifying; backgrounding <code>docket watch</code> with <code>&amp;</code> (must stay in hook foreground tree).</div>
+</section>
+
+<section id="pipeline">
+<h2>4. End-to-end pipeline</h2>
+<p class="lede">The documented flow from the request: planner batches intent, orchestrator dispatches, implementor submits, Docket freezes a bundle, verifier challenges, reviewer decides, orchestrator freezes the aggregate, then delivery + suite qualify a frozen final packet.</p>
+<div class="pipe">
+<div class="node"><strong>Planner defines</strong><span>intent + batches</span><small>plan.mdx, complexity, executor</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Orchestrator assigns</strong><span>validates + dispatches</span><small>assign, roots, baselines, dispatch</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Implementor discovers</strong><span>scope + submits</span><small>scope --submit, preflight, submit</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Docket verifies + freezes</strong><span>gate + bundle</span><small>verify cmd, sha256 addr</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Verifier records</strong><span>pass / fail / uncertain</span><small>*-verification-NN</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Reviewer decides</strong><span>approve / waive / changes</span><small>*-decision-NN, binds digest</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Orchestrator freezes</strong><span>aggregate bundle</span><small>orch-report + constituents</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Delivery + suite</strong><span>qualify</span><small>delivery, suite, metrics</small></div><div class="arr">&rarr;</div>
+<div class="node"><strong>Frozen final packet</strong><span>review-packet --final</span><small>release digest</small></div>
+</div>
+<div class="legend"><span><i class="dot" style="background:var(--planner)"></i>planner</span><span><i class="dot" style="background:var(--orch)"></i>orchestrator</span><span><i class="dot" style="background:var(--impl)"></i>implementor</span><span><i class="dot" style="background:var(--verif)"></i>verifier</span><span><i class="dot" style="background:var(--rev)"></i>reviewer</span><span><i class="dot" style="background:var(--cli)"></i>CLI / infra (no model turns)</span></div>
+<svg class="diagram" viewBox="0 0 1100 300" font-family="monospace" font-size="12">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#6b7691" stroke-width="1.5"/></marker></defs>
+<rect x="10" y="20" width="1000" height="260" rx="12" fill="none" stroke="#26314d"/>
+<text x="26" y="44" fill="#9aa6c2">SWIMLANES (who spends model tokens where; CLI spends none)</text>
+<g>
+<rect x="26" y="56" width="150" height="52" rx="8" fill="#1a1430" stroke="#b388ff"/><text x="36" y="76" fill="#e8ecf4">PLANNER (capable)</text><text x="36" y="94" fill="#9aa6c2">plan, amendments</text>
+<rect x="26" y="116" width="150" height="52" rx="8" fill="#0e1c30" stroke="#4cc2ff"/><text x="36" y="136" fill="#e8ecf4">ORCH (cheap)</text><text x="36" y="154" fill="#9aa6c2">assign/route/packet</text>
+<rect x="26" y="176" width="150" height="52" rx="8" fill="#0e2a20" stroke="#5eeaa8"/><text x="36" y="196" fill="#e8ecf4">IMPL (cheap)</text><text x="36" y="214" fill="#9aa6c2">scope/code/report</text>
+<rect x="26" y="236" width="150" height="34" rx="8" fill="#2a2111" stroke="#ffc857"/><text x="36" y="257" fill="#e8ecf4">VERIFIER / REVIEWER</text>
+<line x1="190" y1="60" x2="990" y2="60" stroke="#26314d"/><line x1="190" y1="140" x2="990" y2="140" stroke="#26314d"/><line x1="190" y1="205" x2="990" y2="205" stroke="#26314d"/>
+<circle cx="230" cy="82" r="10" fill="#b388ff"/><text x="262" y="72" fill="#e8ecf4">plan.mdx</text><text x="262" y="88" fill="#6b7691">objective/risks/tasks</text>
+<circle cx="400" cy="142" r="10" fill="#4cc2ff"/><text x="420" y="132" fill="#e8ecf4">assign+roots+baselines</text><text x="420" y="148" fill="#6b7691">refused if incomplete</text>
+<circle cx="580" cy="202" r="10" fill="#5eeaa8"/><text x="600" y="192" fill="#e8ecf4">scope submit, preflight</text><text x="600" y="208" fill="#6b7691">silent if disjoint</text>
+<rect x="700" y="120" width="150" height="60" rx="8" fill="#141a2e" stroke="#ffd479"/><text x="710" y="142" fill="#ffd479">SUBMIT GATE+BUNDLE</text><text x="710" y="160" fill="#9aa6c2">verify last; freeze</text>
+<circle cx="900" cy="82" r="10" fill="#ff7a9e"/><text x="860" y="110" fill="#e8ecf4">approve/waive/changes</text>
+<line x1="240" y1="92" x2="400" y2="132" stroke="#6b7691" marker-end="url(#ah)"/><line x1="410" y1="152" x2="580" y2="192" stroke="#6b7691" marker-end="url(#ah)"/><line x1="590" y1="192" x2="700" y2="150" stroke="#6b7691" marker-end="url(#ah)"/><line x1="850" y1="120" x2="895" y2="92" stroke="#6b7691" marker-end="url(#ah)"/>
+<text x="700" y="200" fill="#6b7691">verifier pass = ready, never approved</text>
+<text x="700" y="240" fill="#9aa6c2">aggregate pins constituents; reopen invalidates it</text>
+</g></svg>
+</section>
+
+<section id="lifecycle">
+<h2>5. Lifecycle state machine</h2>
+<p class="lede">Only <code>submit</code> leaves <code>draft</code>; only <code>decide</code> leaves <code>submitted/blocked</code>. Nothing else may write <code>status:</code>. Round numbers are per-owner and monotonic; only <code>decide --changes</code> opens a round.</p>
+<pre>                  docket assign
+                        |
+                        v
+              implementor discovery
+                        |
+                docket scope --submit
+                        |
+                   scope ready
+                        |
+                     draft ------------------.
+                        |                    | implementor sets
+            docket submit (THE GATE)         | status: blocked
+                        |                    | + states a question
+                        v                    v
+                   submitted              blocked
+                        |                    |
+                        '------- docket decide -------.
+                                                      |
+                  .-----------------------------------'
+                  |                                   |
+             --approve                            --changes
+                  |                                   |
+                  v                                   v
+              approved                        changes-requested
+                                                      |
+                                        opens &lt;owner&gt;-report-NN+1.mdx
+                                                      |
+                                                      '--&gt; draft (next round)
+
+verifier (five-role): submitted --verify(pass/fail/uncertain)--&gt; submitted (finding filed, status unchanged)
+reviewer correction loop shares ONE budget per chain (correction_limit, default 2) -&gt; exhaustion = one escalation, never auto-approve
+waived --reopen--&gt; draft(next round), prior evidence preserved byte-for-byte</pre>
+<div class="grid g3">
+<div class="card"><h4>Draft</h4><p>Implementor owns it. <code>depend --on</code> may record inputs <b>only here</b>. Blocked reports skip acceptance + verification but must state <i>Decisions needed</i>.</p></div>
+<div class="card"><h4>Submitted</h4><p>Evidence frozen. Verifier files one numbered finding per round (retry = next attempt number). Reviewer binds verdict to bundle digest.</p></div>
+<div class="card"><h4>Decided</h4><p><code>approved / changes-requested / waived</code>. Repeating same verdict is a no-op; different verdict refused. Edited body &rarr; <code>--re-review</code>.</p></div>
+</div>
+</section>
+
+<section id="datamodel">
+<h2>6. Data model - everything is a file</h2>
+<p class="lede"><code>owner</code> is <code>T03</code> or literal <code>orch</code>. Frontmatter is the single source of truth - deliberately no <code>state.json</code>, flat <code>key: value</code> only (stdlib parser, no YAML).</p>
+<pre>.docket/
+  watch.conf                 armed (run, role) pairs, one per line
+  templates/                 optional per-project schema overrides
+  runs/&lt;run&gt;/
+    plan.mdx                 planner output; functional tasks + ownership + policy
+    &lt;owner&gt;-task.mdx         assignment intent, constraints, optional hints
+    &lt;owner&gt;-scope.mdx        implementor discovery capsule + claimed paths
+    &lt;owner&gt;-handoff-NN.mdx   resumable partial-work checkpoint
+    &lt;owner&gt;-report-NN.mdx    subordinate report for round NN (evidence once submitted)
+    &lt;owner&gt;-decision-NN.mdx  reviewer verdict + reason + evidence digest
+    &lt;owner&gt;-verification-NN.mdx  verifier finding (round, attempt, contract rev, source digest)
+    docs/                    supporting material
+    .snapshots/roots.json    declared checkout roots (alias=path, immutable, fail-closed)
+    .snapshots/run.json      run baseline, BEFORE first implementor edit
+    .snapshots/&lt;owner&gt;.json  task baseline + accepted scope
+    .snapshots/&lt;owner&gt;/      baseline patches + untracked content
+    .baselines/&lt;owner&gt;.json  preflight verification result
+    .bundles/&lt;owner&gt;/rounds.json   append-only ledger of frozen bundles
+    .bundles/&lt;owner&gt;/NN/&lt;addr&gt;/    one frozen round, named by digest
+    .bundles/objects/        run-private Git object store (never prune; grows)
+    .bundles/work/           private index scratch (never evidence)
+    .deps/&lt;owner&gt;.json       consumed inputs + terms (frozen per round, empty set included)
+    .transitions/&lt;owner&gt;.json  in-flight decision identity + progress (retry-safe)
+    .locks/&lt;owner&gt;.lock      owner-scoped decision lock
+    .delivery/&lt;role&gt;/pending|announce  durable events + announcement leases
+    .woke-&lt;role&gt;             per-role wake ledger, append-only</pre>
+<div class="callout"><b>Roots are explicit.</b> <code>docket init --root alias=path</code> or <code>docket roots &lt;run&gt; --declare</code>. Only a declared root is captured. Omitting = enclosing checkout as <code>root</code>. Linked worktrees / nested repos must be named. <code>--redeclare</code> refused once any baseline exists. Multi-root paths render <code>&lt;alias&gt;:&lt;path&gt;</code>.</div>
+</section>
+
+<section id="bundle">
+<h2>7. Frozen evidence bundles - why review can trust the bytes</h2>
+<p class="lede">A change list describes a surface; it does not preserve one. <code>submit</code> rebuilds both sides as real Git trees (private index + private object store, zero writes to the checkout) and diffs the trees, then freezes the whole round. Address = <code>sha256(manifest)</code>; manifest carries <code>sha256</code> of every artifact. Later edits only ever produce a <b>new address</b>.</p>
+<div class="grid g2">
+<div class="card"><h4>Task bundle <span class="mono">.bundles/&lt;owner&gt;/NN/&lt;addr&gt;/</span></h4>
+<table><tr><th>Inside</th><th>Pins</th></tr>
+<tr><td class="mono">contract.mdx</td><td>exact task revision worked against</td></tr>
+<tr><td class="mono">baseline/snapshot.json + baseline/&lt;alias&gt;.{staged,worktree}.patch + untracked.json</td><td>self-contained baseline copy (survives .snapshots deletion)</td></tr>
+<tr><td class="mono">&lt;alias&gt;.patch</td><td>root-qualified full patch baseline &rarr; result (committed work included)</td></tr>
+<tr><td class="mono">source</td><td>resulting tree + HEAD + branch per root</td></tr>
+<tr><td class="mono">report.mdx</td><td>body exactly as submitted</td></tr>
+<tr><td class="mono">dependencies.json</td><td>consumed-input record verification ran against</td></tr>
+<tr><td class="mono">verify.stdout / verify.stderr</td><td>captured verification + exit + timing</td></tr>
+<tr><td class="mono">delta/&lt;alias&gt;.patch</td><td>correction vs previous bundle (reproducible from pins)</td></tr>
+</table></div>
+<div class="card"><h4>Aggregate bundle <span class="mono">.bundles/orch/</span></h4><ul>
+<li>Baseline = <b>run baseline</b> (before first implementor edit), patch = full aggregate diff.</li>
+<li>Contract = plan; additionally <code>constituents[]</code> = every decided task-round digest.</li>
+<li>Moved / missing / damaged constituent &rarr; <span class="warn">stale</span>, never read as current.</li>
+<li>Waived constituent reopened &rarr; aggregate visibly invalidated.</li>
+<li>Own integration <code>verify:</code> declared at assignment, run at submit, frozen with outputs.</li>
+</ul><h4>Integrity = 4 checks</h4><ul><li>manifest addresses itself; artifacts present with recorded bytes;</li><li>frozen deps record hashes to named revision;</li><li>every pinned tree resolvable in <code>.bundles/objects</code> else <span class="bad">DAMAGED</span>.</li></ul></div>
+</div>
+<details><summary>How a patch against a dirty baseline is produced (no commit, no stash, no loose object)</summary>
+<pre>1. baseline_tree: pinned base_tree -&gt; PRIVATE index, apply staged+worktree patches (--cached),
+                  hash untracked content back in with modes -&gt; write tree
+2. source_tree:   current HEAD -&gt; second PRIVATE index, git add -A whole worktree
+                  (committed-during-task work is INSIDE) -&gt; write tree
+3. tree_patch:    git diff --binary -M baseline_tree source_tree
+env: GIT_INDEX_FILE + GIT_OBJECT_DIRECTORY under .docket (new objects -&gt; run-private store)
+     GIT_ALTERNATE_OBJECT_DIRECTORIES reads the real store. Prune .docket + undeclared checkouts.</pre>
+</details>
+<div class="callout bad"><b>Submission is one locked transition</b> (owner lock, report read &rarr; verify &rarr; freeze &rarr; ledger append &rarr; report write). Source identity pinned before AND after <code>verify:</code>; moved checkout = refused. Contract/report/scope/deps captured <b>before</b> the command and handed as bytes to the freeze - never re-read after the drift recheck. Concurrent edit is left intact, not overwritten.</div>
+</section>
+
+<section id="gate">
+<h2>8. The gate - <code>docket submit</code> (load-bearing function)</h2>
+<p class="lede">Rejects in order so the subordinate sees the most fundamental failure first. Verify runs <b>last, only if structural + scope checks passed</b>. Checks 2-8 live in <code>gate_problems()</code>, shared with <code>--re-review</code>.</p>
+<table><tr><th>#</th><th>Rejects a report that...</th><th>Notes</th></tr>
+<tr><td>1</td><td><code>status:</code> not <code>draft/blocked</code></td><td>no double submit</td></tr>
+<tr><td>2</td><td>missing / empty required section (HTML comments stripped)</td><td>schema per owner</td></tr>
+<tr><td>3</td><td>contains placeholder (<code>&lt;!-- TODO, TODO:, FIXME, XXX</code>)</td><td></td></tr>
+<tr><td>4</td><td>unchecked acceptance, or none checked (unless blocked)</td><td>copy criteria exactly; flip checkboxes only</td></tr>
+<tr><td>5</td><td><code>blocked</code> with "none" under <i>Decisions needed</i></td><td>a block must state its question</td></tr>
+<tr><td>6</td><td>changes paths outside accepted scope</td><td>amend capsule + resubmit; baseline never moves</td></tr>
+<tr><td>7</td><td>omits task-local changed files</td><td>multi-root: <code>&lt;alias&gt;:&lt;path&gt;</code></td></tr>
+<tr><td>8</td><td>cannot produce declared diff coverage</td><td><code>unavailable</code> rejected under <code>evidence_mode: git</code>; never empty diff</td></tr>
+<tr><td>9</td><td>fails task <code>verify:</code> (runs under <code>/bin/sh</code>, no aliases/functions)</td><td>structural failures never waste a test run</td></tr>
+</table>
+<div class="callout good"><b><code>status: blocked</code> is the designed escape hatch, not failure.</b> It lets a subordinate stop honestly instead of fabricating a pass - the single most valuable behaviour the gate buys. Do not make blocking harder than submitting. Blocked skips evidence-table enforcement + completion verification, at submit and at re-review.</div>
+</section>
+
+<section id="verify">
+<h2>9. Verification capture + acceptance evidence</h2>
+<div class="grid g2">
+<div class="card"><h4>Captured verification (never reused across changed identity)</h4><ul>
+<li>command bytes, cwd, start/end, exit, timeout, stdout/stderr artifacts</li><li>source identity pinned before + after; declared <code>env:</code> inputs</li><li>model as <b>observed / requested / unknown</b> (flag never reported as observed)</li><li>framework counts by supported parser (<code>pytest, tap</code>) else <code>unknown</code></li><li>any change to command / roots / source / inputs &rarr; runs again</li><li>contract revision binds the verdict too: edited task needs a fresh round</li></ul></div>
+<div class="card"><h4>Acceptance &rarr; evidence (<code>## Evidence</code> table, optional but mechanical)</h4>
+<p class="mono">| A1 | met | verify.stdout | none |  (states: met/partial/not-met/not-verified)</p><ul>
+<li>criteria in task order are A1, A2...; every required ID exactly once</li><li><code>met</code> names frozen artifacts or existing paths, carries no gaps</li><li>free prose never keyword-policed ("no limitations" passes on structure)</li><li>blocked / amendment path skips enforcement</li></ul></div>
+</div>
+<h3>Verifier obligations (every submission)</h3>
+<table><tr><th>Risk</th><th>Obligation</th></tr>
+<tr><td>Runner ignores input</td><td>two materially different inputs &rarr; independently expected differences; capture input identity</td></tr>
+<tr><td>Circular parity</td><td>separate actual provenance from oracle derivation; fail when behaviour removed in isolated copy</td></tr>
+<tr><td>Weak fingerprint</td><td>byte change w/o shape change must change fingerprint</td></tr>
+<tr><td>One-to-one accident</td><td>zero / one / many per aggregation boundary</td></tr>
+<tr><td>Changed oracle</td><td>per-value independent derivation + explicit review of change</td></tr>
+<tr><td>Offline claim</td><td>controlled network-disabled run or explicit gap; logs alone prove nothing</td></tr>
+</table>
+<pre>docket verify R01 T03 --result pass|fail|uncertain --as verifier --detail "numbered defects + evidence pointers"
+# pass = ready for review, NEVER approved. fail opens no round by itself.
+# --open-correction only under verifier_correction: allowed (records provenance, counts to budget)</pre>
+</section>
+
+<section id="signal">
+<h2>10. Signalling - idle for free, woken by the harness</h2>
+<p class="lede">A supervisor must be re-entered while <b>idle, having already ended its turn</b>. Polling costs turns; self re-entry depends on model compliance. So the <b>harness wakes the model</b>: Claude Code <code>Stop</code> hook with <code>asyncRewake:true</code> runs <code>hooks/wake.sh &rarr; docket watch --armed</code>, which sleeps at zero token cost and exits 2 with a banner on stderr when something is actionable.</p>
+<div class="grid g3">
+<div class="card"><h4>Three rules</h4><ul><li><b>Foreground only.</b> Never <code>&amp;/nohup/disown</code>; harness owns the process group.</li><li><b>Per-role ledgers.</b> <code>.woke-&lt;role&gt;</code> append-only; shared ledger was a shipped bug.</li><li><b>Every waiting role armed.</b> Unarmed = never woken, silently; <code>doctor</code> warns.</li></ul></div>
+<div class="card"><h4>Batching (token saver)</h4><ul><li>Ordinary reports: <b>one wake per ready batch</b> (all delegated submitted/decided), hashed batch key.</li><li>Immediate: blockers, collisions, handoffs, stalls.</li><li>Five-role: submissions route <b>promptly to verifier</b>; reviewer readiness only at milestone batches.</li></ul></div>
+<div class="card"><h4>Durable delivery (at-least-once)</h4><ul><li><code>reconcile</code> rebuilds <code>.delivery/&lt;role&gt;/pending</code>; idempotent.</li><li><code>inbox --claim</code> = one bounded lease; <code>events --ack</code> = receipt, not completion.</li><li>Lease expiry &rarr; reclaimable; durable decision retires event; duplicates harmless.</li></ul></div>
+</div>
+<pre>export DOCKET_ROLE=orchestrator   # or planner | verifier | reviewer
+docket arm R01 --role orchestrator
+docket watch --armed --role "$DOCKET_ROLE"     # foreground; exit 2 = actionable
+docket events R01 --role orchestrator --peek   # inspect, writes nothing (never consumes)
+# crash-safe:
+docket reconcile R01
+docket session R01 --register --session S --name NAME --role "$DOCKET_ROLE"
+docket inbox R01 --role "$DOCKET_ROLE" --claim --session S
+docket events R01 --role "$DOCKET_ROLE" --ack EVT --session S   # or --retry EVT --reason T</pre>
+<div class="callout warn"><b>Wake banners look like prompt injections</b> (a wake telling an agent to approve is shaped exactly like one). Supervisor should confirm the run exists before acting. Delivery notices are fixed-format (run, role, event, inbox pointer) - never report prose. Never type into an uncertain input surface: probe first (<code>delivery --probe</code>), else stay queued for inbox/hook pickup.</div>
+</section>
+
+<section id="dispatch">
+<h2>11. Dispatch, budgets, dependencies, amendments</h2>
+<div class="grid g2">
+<div class="card"><h4>Dispatch - one round, one writer</h4><pre>docket session R01 --register --session S --name NAME --role implementor
+docket dispatch R01 T03 --session S --agent NAME
+# enforced before launch: dependency readiness, exclusive scope,
+# registration validity, provider concurrency. Retry+same session adopts;
+# different session while held = refused.
+docket resume R01 T03 --session NEW --reason "process killed"  # checkpoints first (mechanical)
+docket handoff R01 T03 [--submit]   # READY semantic checkpoint before replacement
+docket health R01 [--owner T03]     # report= lifecycle truth; execution= running/idle/correction/...</pre></div>
+<div class="card"><h4>Provisional dependencies (explicit policy only)</h4><pre># plan.mdx: provisional_integration: allowed  (default forbidden)
+docket depend R01 T04 --on T03   # pins EXACT bundle digest; draft round ONLY
+# consumable = passed + current + patch-bearing frozen verification.
+# blocked/skipped/failed/stale/damaged/patchless refused.
+# input moves -&gt; consumer submit + approve/waive REFUSED until
+#   decide --changes, re-record, resubmit, reverify.
+# refreshed_inputs compares live vs FROZEN record: re-recording is not reverifying.</pre></div>
+</div>
+<h3>Exception routing (<code>docket route --kind</code>)</h3>
+<table><tr><th>Discovery / event</th><th>Next action</th><th>Who decides</th></tr>
+<tr><td>More files / better approach within contract</td><td>amend scope; collision check</td><td>implementor + scope gate</td></tr>
+<tr><td>Overlap / scheduling conflict</td><td>serialize / reassign within intent</td><td>orchestrator</td></tr>
+<tr><td>Concrete test defect</td><td>forward diagnostics / numbered findings; verifier rechecks</td><td>implementor</td></tr>
+<tr><td>Rate limit / crash</td><td>resume / checkpoint / approved fallback</td><td>orchestrator within policy</td></tr>
+<tr><td>Requirement vs repo contradiction</td><td>compact amendment (need/conflicts/alternative/impact)</td><td>planner; user if beyond scope</td></tr>
+<tr><td>Dispute / budget exhausted</td><td>preserve both claims; one escalation packet</td><td>reviewer / stronger verifier</td></tr>
+<tr><td>Waiver / out-of-policy spend</td><td>explicit decision packet</td><td>reviewer / budget owner</td></tr>
+</table>
+<pre>docket propose-amendment R01 T03 --need T --conflicts C --alternative A --impact I
+docket amendment R01 --accept ID|--reject ID --by planner
+# acceptance versions contract (old+new revs), retires dependents' events,
+# blocks their accepting verdicts until a fresh round reverifies the new oracle.</pre>
+</section>
+
+<section id="packet">
+<h2>12. Review packets, suite, and the release gate</h2>
+<p class="lede">The reviewer works from a self-contained packet in a fresh context (1-2k tokens; evidence shrinks first, risks/waivers/decisions never shorten). Every referenced bundle is integrity-checked before rendering - missing/damaged/stale/unbound refuses with a specific error instead of rendering reviewable-looking evidence.</p>
+<div class="grid g2">
+<div class="card"><h4>Packet contents</h4><ul><li>objective, per-task coverage (bundle + verification + decision revs, A-IDs + states)</li><li>evidence deltas (root-qualified), aggregate bundle + digest + constituent pins</li><li>verifier findings, integration evidence, waivers, stalls, escalations, amendments, plan risks</li><li><code>--correction T03</code>: old/new digests, delta, refreshed verification, expanded scope, addressed findings</li></ul><pre>docket review-packet R01 --role reviewer [--correction T03] [--out FILE]
+docket review-packet R01 --role reviewer --final [--release DIGEST]</pre></div>
+<div class="card"><h4>Qualification chain (all content-addressed)</h4><ul><li><code>suite --qualify</code>: command bytes, cwd, bounded timestamps, exits, outputs, tree before/after; refuses drift or output w/o unittest summary.</li><li><code>delivery --qualify</code>: real hook announce, SIGKILL restart, claim/send/ack round-trip, active-input refusal, herdr pane lifecycle - or honest <code>blocked</code>.</li><li><code>release --freeze</code>: binds suite + qualifications + aggregate + contracts + findings + decisions + snapshots + M4-M11 digests under one digest.</li></ul><pre>docket suite R01 --qualify --command CMD
+docket release R01 --freeze [--suite-artifact P] [--milestone M=DIGEST]</pre></div>
+</div>
+<div class="callout"><b>Metrics separation:</b> approval counts from reviewer decisions; prompt renders as invocation proxy, never proven calls; wall time as first-to-last artifact span. <code>READY</code> = ready for independent review, never approved. Never drop independent final review even if first-round approvals improve.</div>
+</section>
+
+<section id="invariants">
+<h2>13. Invariants (break these and the system stops being trustworthy)</h2>
+<div class="grid g2">
+<div class="card"><ul>
+<li>Only <code>submit</code> reaches reviewer-visible state; never hand-edit <code>status:</code>; never <code>--skip-verify</code> to push through.</li>
+<li>Submitted report + task-local diff = review truth. Capsule/handoff = context only.</li>
+<li><code>verify:</code> runs under <code>/bin/sh</code> (no aliases/functions/PATH additions).</li>
+<li>Watcher in hook foreground tree; ledgers per-role append-only; rounds per-owner monotonic.</li>
+<li>Frontmatter is lifecycle state; JSON holds mechanical evidence only.</li>
+<li>Reviewer reads the diff, not only the report.</li>
+<li>Submitted body is evidence; verdict lives in decision artifact with evidence digest.</li>
+<li>Unavailable coverage reported as unavailable, never empty, never silently gated.</li></ul></div>
+<div class="card"><ul>
+<li>Inspection (<code>peek/status/doctor</code>) never writes delivery state.</li>
+<li>Atomic publication; owner-serialized, retry-safe transitions (same verdict finishes, different refused).</li>
+<li>Five-role authority exclusive; budgets exhaust to escalation, never auto-verdict.</li>
+<li>Changed evidence needs <code>--re-review</code> (full gate + re-verify).</li>
+<li>Baselines immutable/complete/before-work; roots by worktree, declared by name.</li>
+<li>Every round frozen before reviewable; verdict binds digest; damaged/stale blocks.</li>
+<li>Rebuilds never write to measured checkout; one writer per round; verification bound to exact bytes.</li>
+<li>Provisional consumption explicit + pinned + reverified; frozen inputs (even empty) bind accepting verdicts.</li></ul></div>
+</div>
+<details><summary>Known gaps (stated plainly)</summary>
+<ul>
+<li>Interrupted publication leaves <code>.&lt;name&gt;.&lt;pid&gt;.tmp</code> (never swept; live vs dead indistinguishable).</li>
+<li><code>.bundles/objects</code> only grows; deleting it = every pinning bundle <code>DAMAGED</code>.</li>
+<li><code>verify:</code> writing non-ignored files fails the freeze (make it clean up / ignore).</li>
+<li>Root declaration one-time; post-declaration checkouts not picked up.</li>
+<li>Oversize untracked file blocks <code>git</code> assignment (ignore / move / documents-only).</li>
+<li>3-round cap is playbook advice, not code. No <code>verify:</code> sanity check at scope submit.</li>
+<li>Wakes unauthenticated - confirm run exists before acting. <code>status</code> verify column truncated to 20 chars.</li>
+</ul>
+</details>
+</section>
+
+<section id="example">
+<h2>14. Worked example - one task through the workflow</h2>
+<div class="flow">
+<div class="row"><span class="pill">planner (Opus, high)</span> writes <span class="mono">plan.mdx</span> + T01..T03 (complexity, executor) &rarr; human approves &rarr; hands to orchestrator</div>
+<div class="row"><span class="pill">orchestrator (cheap)</span> <span class="mono">roots --declare app=/repo</span> &rarr; <span class="mono">assign R01 T01 --complexity low --harness opencode</span> (run + task baselines captured) &rarr; <span class="mono">batch --create B1 --members T01,T02 --close B1</span> &rarr; <span class="mono">dispatch --session S --agent impl-a</span> &rarr; one dispatch notice, then silent wait</div>
+<div class="row"><span class="pill">implementor (cheap)</span> reads task &rarr; discovers &rarr; <span class="mono">scope --submit</span> (silent accept; collision would wake orch) &rarr; <span class="mono">preflight</span> &rarr; codes &rarr; runs <span class="mono">verify:</span> &rarr; fills report + Evidence table &rarr; <span class="mono">submit</span> (gate runs 1-8, then verify, then freeze &rarr; <span class="mono">.bundles/T01/01/&lt;sha&gt;/</span>)</div>
+<div class="row"><span class="pill">verifier (cheap, fresh)</span> woken promptly &rarr; reads contract + report + bundle + captured outputs &rarr; applies obligations &rarr; <span class="mono">verify --result pass --as verifier</span> (report stays <span class="mono">submitted</span>)</div>
+<div class="row"><span class="pill">reviewer (capable, fresh)</span> milestone packet &rarr; inspects bundle + delta + findings &rarr; <span class="mono">decide --approve --as reviewer --reason ...</span> (binds digest) - or <span class="mono">--changes</span> (opens report-02; budget counts down)</div>
+<div class="row"><span class="pill">orchestrator</span> batch ready &rarr; reviews each bundle &rarr; <span class="mono">assign R01 orch</span> &rarr; writes <span class="mono">orch-report-01</span> &rarr; <span class="mono">submit</span> (aggregate bundle pins constituents) &rarr; split: planner reviews aggregate; combined: recorded complete</div>
+<div class="row"><span class="pill">qualification</span> <span class="mono">suite --qualify</span> + <span class="mono">delivery --qualify</span> &rarr; <span class="mono">release --freeze</span> &rarr; <span class="mono">review-packet --final</span> (renders frozen bytes only)</div>
+</div>
+<h3>Everyday commands by role</h3>
+<pre>docket help planner|orchestrator|implementor|verifier|reviewer|signalling
+docket status R01 [--role planner|orchestrator|verifier|reviewer]
+docket bundle R01 T03 [--round N] [--list]   # read what was actually frozen
+docket diff R01 T03                            # task-local diff + coverage state
+docket prompt R01 T03 --role implementor [--model M]  # deterministic prompt render
+docket feedback R01 --add --role ROLE --category C --body T  # optional, never a gate
+docket retrospective R01   # mechanical, no model calls; premium tokens read unknown</pre>
+</section>
+
+<footer>
+<div>Sources: <span class="mono">ARCHITECTURE.md</span> (data model, lifecycle, bundles, signalling, invariants), <span class="mono">skills/docket/SKILL.md</span> (command surface, role rules), <span class="mono">skills/docket/references/{planner,orchestrator,implementor,verifier,reviewer,signalling,verification-obligations}.md</span>, <span class="mono">improvements/workflow-improvement-plan.md</span> (five-role requirements). Generated as a static single-file visual; no external assets.</div>
+</footer>
+</div>
+<script>
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{
+  const wrap=b.parentElement;
+  wrap.querySelectorAll('button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');
+  const sec=b.closest('section');
+  sec.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('active'));
+  sec.querySelector('#'+b.dataset.tab).classList.add('active');
+}));
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+Combine verification and review as two separately recorded duties under combined-checker, never as an independent verifier opinion: challenge whether evidence proves acceptance, then judge correctness and integration from a fresh context. Never approve without passing verification for the exact frozen bundle.

@@ -12,9 +12,12 @@
 # watcher and break that guarantee.
 #
 # This arm-a-foreground-watcher-from-Stop pattern, including the never-background rule
-# above and the exactly-once event ledger in `docket watch`, is taken from firstmate's
+# above and the per-role announcement ledger in `docket watch`, is taken from firstmate's
 # event-driven supervision: https://github.com/kunchenguid/firstmate (Kun Chen, MIT).
 # No code copied; see that project for the full-featured version.
+# Delivery is at-least-once with a bounded announcement lease: a crash after the
+# ledger write but before the harness accepts the wake re-announces the same
+# actionable event after lease expiry, and duplicates are harmless.
 #
 # Inert unless .docket/watch.conf and DOCKET_ROLE exist, so an idle or unscoped
 # session costs nothing and cannot consume another supervisor's event.
@@ -28,7 +31,7 @@ CONF="$ROOT/.docket/watch.conf"
 [ -f "$CONF" ] || exit 0
 [ -n "${DOCKET_ROLE:-}" ] || exit 0
 case "$DOCKET_ROLE" in
-  planner|orchestrator) ;;
+  planner|orchestrator|verifier|reviewer|coordinator|checker) ;;
   *) exit 0 ;;
 esac
 cd "$ROOT" || exit 0

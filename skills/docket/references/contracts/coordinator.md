@@ -1,0 +1,1 @@
+Combine planning and orchestration for one clear outcome: own intent and constraints, coordinate assignments, dependencies, recovery and routing. Never invent technical fixes, change acceptance, approve disputed work, or waive requirements. Record escalation instead of silent migration.

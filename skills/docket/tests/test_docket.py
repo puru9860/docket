@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
+import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -8,8 +14,36 @@ import unittest
 from pathlib import Path
 
 
-DOCKET = Path(__file__).parents[1] / "bin" / "docket"
+# `DOCKET_BIN` points the suite at another build of the CLI. It exists so a change
+# can be demonstrated failing against the previous implementation before it ships.
+DOCKET = Path(os.environ.get("DOCKET_BIN") or Path(__file__).parents[1] / "bin" / "docket")
 HOOK = Path(__file__).parents[1] / "hooks" / "wake.sh"
+
+
+def _docket_constant(name: str) -> str:
+    """Reference a constant from the CLI binary itself, not a duplicated literal."""
+    text = Path(DOCKET).read_text()
+    match = re.search(rf"^{name}\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
+    assert match is not None, f"{name} not found in {DOCKET}"
+    return match.group(1)
+
+
+COVERAGE_UNAVAILABLE = _docket_constant("COVERAGE_UNAVAILABLE")
+
+
+def sha(data: bytes) -> str:
+    """The digest form Docket records for frozen evidence."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def parse_meta(path: Path) -> dict[str, str]:
+    """Flat frontmatter of a document, read the way the CLI reads it."""
+    text = path.read_text()
+    head = text[3:text.find("\n---", 3)]
+    return {
+        line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip()
+        for line in head.splitlines() if ":" in line
+    }
 
 
 class DocketCLI(unittest.TestCase):
@@ -20,24 +54,140 @@ class DocketCLI(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def cli(self, *args: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
+    def assert_disposable(self, target: Path) -> Path:
+        """Mechanically refuse to destroy anything outside this test's temp root.
+
+        Every destructive test operation resolves its target first and proves
+        the result is inside the disposable root this test created and outside
+        the repository and the installed skill. Ancestry is checked on resolved
+        paths, never as a string prefix.
+        """
+        resolved = Path(target).resolve()
+        root = self.root.resolve()
+        self.assertTrue(resolved == root or root in resolved.parents,
+                        f"{resolved} is outside the disposable test root {root}")
+        repo = Path(__file__).resolve().parents[3]
+        installed = (Path.home() / ".agents" / "skills" / "docket").resolve()
+        for forbidden in (repo, installed):
+            self.assertFalse(resolved == forbidden or forbidden in resolved.parents,
+                             f"{resolved} is inside protected {forbidden}")
+        return resolved
+
+    def cli(
+        self, *args: str, ok: bool = True, fault: str = "", perturb: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env.pop("DOCKET_FAULT", None)
+        env.pop("DOCKET_PERTURB", None)
+        if fault:
+            env["DOCKET_FAULT"] = fault
+        if perturb:
+            env["DOCKET_PERTURB"] = perturb
         result = subprocess.run(
-            [sys.executable, str(DOCKET), *args], cwd=self.root, text=True, capture_output=True
+            [sys.executable, str(DOCKET), *args], cwd=self.root, text=True, capture_output=True,
+            env=env,
         )
         if ok and result.returncode:
             self.fail(f"command failed: {args}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         return result
 
-    def init(self, topology: str = "split") -> Path:
-        self.cli("init", "demo", "--harness", "claude", "--topology", topology)
-        return self.root / ".docket" / "runs" / "demo"
+    def cli_env(
+        self, extra: dict[str, str], *args: str, ok: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the CLI with a scoped dependency-root seam injected."""
+        env = dict(os.environ)
+        env.pop("DOCKET_FAULT", None)
+        env.pop("DOCKET_PERTURB", None)
+        env.update(extra)
+        result = subprocess.run(
+            [sys.executable, str(DOCKET), *args], cwd=self.root, text=True, capture_output=True,
+            env=env,
+        )
+        if ok and result.returncode:
+            self.fail(f"command failed: {args}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        return result
+
+    def init(
+        self, topology: str = "split", *, evidence_mode: str = "",
+        roots: tuple[str, ...] = (),
+    ) -> Path:
+        """Scaffold the run. Checkout roots are declared explicitly or not at all."""
+        extra = ["--evidence-mode", evidence_mode] if evidence_mode else []
+        for spec in roots:
+            extra += ["--root", spec]
+        self.cli("init", "demo", "--harness", "claude", "--topology", topology,
+                 "--workflow", "five-role-v1", *extra)
+        run = self.root / ".docket" / "runs" / "demo"
+        plan = run / "plan.mdx"
+        text = plan.read_text().replace("workflow: five-role-v1", "workflow: legacy")
+        sessions = ("planner, orchestrator, implementor"
+                    if topology == "split" else "coordinator, implementor")
+        text = text.replace("independent-verifier-reviewer", "legacy-completion")
+        for line in text.splitlines():
+            if line.startswith("role_sessions:"):
+                text = text.replace(line, f"role_sessions: {sessions}")
+                break
+        plan.write_text(text)
+        return run
+
+    def init_legacy_as(self, run_id: str, topology: str = "split",
+                       evidence_mode: str = "") -> Path:
+        """Simulate a historical legacy run without using the closed init door."""
+        extra = ["--evidence-mode", evidence_mode] if evidence_mode else []
+        self.cli("init", run_id, "--harness", "claude", "--topology", topology,
+                 "--workflow", "five-role-v1", *extra)
+        run = self.root / ".docket" / "runs" / run_id
+        plan = run / "plan.mdx"
+        text = plan.read_text().replace("workflow: five-role-v1", "workflow: legacy")
+        sessions = ("planner, orchestrator, implementor"
+                    if topology == "split" else "coordinator, implementor")
+        text = text.replace("independent-verifier-reviewer", "legacy-completion")
+        for line in text.splitlines():
+            if line.startswith("role_sessions:"):
+                text = text.replace(line, f"role_sessions: {sessions}")
+                break
+        plan.write_text(text)
+        return run
+
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        """Run a real Git command. Baseline behavior cannot be proved against a fake."""
+        result = subprocess.run(
+            ["git", *args], cwd=str(cwd or self.root), text=True, capture_output=True,
+        )
+        if result.returncode:
+            self.fail(f"git {' '.join(args)} failed:\n{result.stdout}\n{result.stderr}")
+        return result.stdout
+
+    def repo(self, where: Path | None = None) -> Path:
+        """A checkout with one commit, so a baseline has a real commit to pin."""
+        where = where or self.root
+        where.mkdir(parents=True, exist_ok=True)
+        self.git("init", "-q", "-b", "main", ".", cwd=where)
+        self.git("config", "user.email", "docket@example.test", cwd=where)
+        self.git("config", "user.name", "Docket Test", cwd=where)
+        (where / "src").mkdir(exist_ok=True)
+        (where / "src" / "a.py").write_text("allowed = 1\n")
+        self.git("add", "src/a.py", cwd=where)
+        self.git("commit", "-qm", "baseline", cwd=where)
+        return where
+
+    @staticmethod
+    def body_of(path: Path) -> str:
+        """The document body exactly as the CLI frontmatter parser yields it."""
+        text = path.read_text()
+        return text[text.find("\n---", 3) + 4:].lstrip("\n")
 
     def assign(
-        self, owner: str = "T01", *, executor: str = "implementor", claim_scope: bool = True
+        self, owner: str = "T01", *, executor: str = "implementor", claim_scope: bool = True,
+        file: str = "src/a.py",
     ) -> Path:
+        # The aggregate declares an integration verify command only when a test
+        # passes one explicitly; the default orch assignment carries none, so a
+        # bare --skip-verify keeps working exactly as before.
+        verify_args: list[str] = [] if owner == "orch" else ["--verify", f'printf "{owner} ok\\n"']
         self.cli(
             "assign", "demo", owner, "--complexity", "high", "--executor", executor,
-            "--harness", "opencode", "--file", "src/a.py", "--verify", f'printf "{owner} ok\\n"',
+            "--harness", "opencode", "--file", file, *verify_args,
         )
         run = self.root / ".docket" / "runs" / "demo"
         if executor == "implementor" and claim_scope:
@@ -70,7 +220,10 @@ class DocketCLI(unittest.TestCase):
         path.write_text(text)
 
     @staticmethod
-    def fill_task_report(path: Path, criterion: str = "The feature works.", *, blocked: bool = False) -> None:
+    def fill_task_report(
+        path: Path, criterion: str = "The feature works.", *,
+        blocked: bool = False, files: str = "- `src/a.py:1` - implemented the feature.",
+    ) -> None:
         text = path.read_text()
         text = text.replace(
             "<!-- TODO: what you actually did, 2-4 sentences. No plans, only past tense. -->",
@@ -78,7 +231,7 @@ class DocketCLI(unittest.TestCase):
         )
         text = text.replace(
             '<!-- TODO: one bullet per change as `path/to/file.py:120` plus a short note. Write "none" if nothing changed. -->',
-            "- `src/a.py:1` - implemented the feature.",
+            files,
         )
         text = text.replace("- [ ] <!-- TODO -->", f"- [{' ' if blocked else 'x'}] {criterion}")
         text = text.replace(
@@ -95,7 +248,7 @@ class DocketCLI(unittest.TestCase):
     def fill_orch_report(path: Path) -> None:
         replacements = {
             "<!-- TODO: summarize the delivered outcome for the planner. -->": "Delivered every planned task.",
-            "<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->": "| task | outcome | verification |\n| --- | --- | --- |\n| T01 | approved | passed |",
+            "<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->": "| task | outcome | verification |\n| --- | --- | --- |\n| T01 | approved | passed |\n| T02 | approved | passed |",
             "<!-- TODO: summarize the task-local changes the planner should review. -->": "Updated `src/a.py`.",
             "<!-- TODO: exact integrated command and real output. -->": "Command: `printf ok`\n\nOutput: `ok`",
         }
@@ -123,6 +276,7 @@ class DocketCLI(unittest.TestCase):
     def test_supported_harnesses_and_topology_are_recorded(self) -> None:
         run = self.init("combined")
         plan = (run / "plan.mdx").read_text()
+        self.assertIn("evidence_mode:", plan)
         self.assertIn("topology: combined", plan)
         self.assertIn("planner_harness: claude", plan)
         self.assertIn("progress_updates: quiet", plan)
@@ -173,7 +327,79 @@ class DocketCLI(unittest.TestCase):
             "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
         )
         self.assertEqual(2, orchestrator_watch.returncode)
-        self.assertIn("T01 submitted", orchestrator_watch.stderr)
+        self.assertIn("review batch ready", orchestrator_watch.stderr)
+        self.assertIn("T01 round 1", orchestrator_watch.stderr)
+        self.assertIn("Process normal review batches silently", orchestrator_watch.stderr)
+
+    def test_submitted_reports_wake_once_only_when_the_batch_is_ready(self) -> None:
+        self.init("combined")
+        run = self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        for owner in ("T01", "T02"):
+            self.fill_task(run / f"{owner}-task.mdx")
+            self.fill_task_report(run / f"{owner}-report-01.mdx")
+
+        self.cli("submit", "demo", "T01")
+        early = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(0, early.returncode)
+
+        self.cli("submit", "demo", "T02")
+        ready = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(2, ready.returncode)
+        self.assertIn("review batch ready with 2 submitted task report(s)", ready.stderr)
+        self.assertIn("T01 round 1", ready.stderr)
+        self.assertIn("T02 round 1", ready.stderr)
+
+        repeated = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(0, repeated.returncode)
+
+        self.cli("decide", "demo", "T01", "--approve")
+        self.cli("decide", "demo", "T02", "--changes")
+        decision = run / "T02-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/b.py:1` and rerun verification.",
+        ))
+        self.cli("decide", "demo", "T02", "--changes")
+        self.fill_task_report(run / "T02-report-02.mdx")
+        self.cli("submit", "demo", "T02")
+        revision = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(2, revision.returncode)
+        self.assertIn("review batch ready with 1 submitted task report(s)", revision.stderr)
+        self.assertIn("T02 round 2", revision.stderr)
+
+        self.cli("decide", "demo", "T02", "--approve")
+        self.assign("orch", executor="orchestrator")
+        aggregate = run / "orch-report-01.mdx"
+        self.fill_orch_report(aggregate)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+        stale = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(0, stale.returncode)
+
+    def test_blocker_wakes_immediately_without_waiting_for_batch(self) -> None:
+        self.init("combined")
+        run = self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx", blocked=True)
+        self.cli("submit", "demo", "T01", "--blocked")
+
+        wake = self.cli(
+            "watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False
+        )
+        self.assertEqual(2, wake.returncode)
+        self.assertIn("T01 is BLOCKED", wake.stderr)
+        self.assertNotIn("review batch ready", wake.stderr)
 
     def test_split_orchestrator_report_is_standardized_and_planner_reviewed(self) -> None:
         self.init("split")
@@ -219,6 +445,24 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("unassigned", status)
         self.assertIn("0/2 decided", status)
 
+    def test_status_shows_full_verify_command_beyond_twenty_characters(self) -> None:
+        self.init()
+        prefix = "echo 123456789012345"
+        commands = {"T01": prefix + "6789", "T02": prefix + "678A"}
+        self.assertEqual(20, len(prefix))
+        for owner, command in commands.items():
+            self.assertEqual(prefix, command[:20])
+            self.cli(
+                "assign", "demo", owner, "--complexity", "high", "--executor", "implementor",
+                "--harness", "opencode", "--file", f"src/{owner.lower()}.py", "--verify", command,
+            )
+            self.fill_scope(self.root / ".docket" / "runs" / "demo" / f"{owner}-scope.mdx")
+            self.cli("scope", "demo", owner, "--submit")
+        self.assertNotEqual(commands["T01"], commands["T02"])
+        status = self.cli("status", "demo").stdout
+        for owner, command in commands.items():
+            self.assertIn(command, status, f"{owner} verify command was truncated in status")
+
     def test_assignment_snapshot_rejects_new_out_of_scope_changes(self) -> None:
         subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "user.email", "docket@example.test"], cwd=self.root, check=True)
@@ -229,8 +473,9 @@ class DocketCLI(unittest.TestCase):
         subprocess.run(["git", "add", "src/a.py", "outside.py"], cwd=self.root, check=True)
         subprocess.run(["git", "commit", "-qm", "baseline"], cwd=self.root, check=True)
 
-        self.init()
-        run = self.assign()
+        run = self.init()
+        self.assertIn("evidence_mode: git", (run / "plan.mdx").read_text())
+        self.assign()
         self.fill_task(run / "T01-task.mdx")
         self.fill_task_report(run / "T01-report-01.mdx")
         (self.root / "src" / "a.py").write_text("allowed = 2\n")
@@ -293,7 +538,8 @@ class DocketCLI(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(2, orchestrator.returncode)
-        self.assertIn("T01 submitted", orchestrator.stderr)
+        self.assertIn("review batch ready", orchestrator.stderr)
+        self.assertIn("Process normal review batches silently", orchestrator.stderr)
 
     def test_changes_decision_is_filled_before_state_transition(self) -> None:
         self.init()
@@ -370,7 +616,7 @@ class DocketCLI(unittest.TestCase):
         self.fill_scope(capsule)
         collision = self.cli("scope", "demo", "T02", "--submit", ok=False)
         self.assertIn("SCOPE COLLISION", collision.stderr)
-        self.assertIn("src/a.py overlaps T01:src/a.py", collision.stderr)
+        self.assertIn("src/a.py overlaps T01 at src/a.py", collision.stderr)
         self.assertIn("status: collision", capsule.read_text())
 
         wake = self.cli(
@@ -424,6 +670,8416 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(2, wake.returncode)
         self.assertIn("handoff checkpoint 1 is ready", wake.stderr)
 
+    def test_approval_preserves_the_report_body_and_records_review_evidence(self) -> None:
+        """Regression: approval used to overwrite the report body with decision text."""
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        submitted_body = self.body_of(report)
 
-if __name__ == "__main__":
-    unittest.main()
+        self.cli("decide", "demo", "T01", "--approve", "--reason", "Diff matches the criterion.")
+
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertIn("Implemented the feature and verified its behavior.", submitted_body)
+        self.assertIn("- [x] The feature works.", submitted_body)
+        self.assertNotIn("# Decision:", submitted_body)
+        self.assertIn("status: approved", report.read_text())
+        self.assertIn("decision: T01-decision-01.mdx", report.read_text())
+
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("verdict: approved", decision)
+        self.assertIn("reviewer: orch", decision)
+        self.assertIn("applied: yes", decision)
+        self.assertIn("Diff matches the criterion.", decision)
+        digest = "sha256:" + hashlib.sha256(submitted_body.encode()).hexdigest()
+        self.assertIn(f"evidence_digest: {digest}", decision)
+
+    def test_waiver_preserves_the_report_body_and_its_reason(self) -> None:
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, blocked=True)
+        self.cli("submit", "demo", "T01", "--blocked")
+        submitted_body = self.body_of(report)
+
+        self.cli("decide", "demo", "T01", "--waive", "--reason", "Upstream API is down.")
+
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertIn("The reviewer must decide whether to waive", submitted_body)
+        self.assertNotIn("## Waiver reason", self.body_of(report))
+        self.assertIn("status: waived", report.read_text())
+
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("verdict: waived", decision)
+        self.assertIn("applied: yes", decision)
+        self.assertIn("Upstream API is down.", decision)
+        digest = "sha256:" + hashlib.sha256(submitted_body.encode()).hexdigest()
+        self.assertIn(f"evidence_digest: {digest}", decision)
+
+    def test_changes_transition_preserves_report_body_and_reviewer_text(self) -> None:
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        submitted_body = self.body_of(report)
+
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        self.assertIn("applied: no", decision.read_text())
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/a.py:1` and add a regression assertion.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", "The guard is untested.")
+
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertIn("status: changes-requested", report.read_text())
+        settled = decision.read_text()
+        self.assertIn("1. Correct `src/a.py:1` and add a regression assertion.", settled)
+        self.assertIn("The guard is untested.", settled)
+        self.assertIn("verdict: changes-requested", settled)
+        self.assertIn("applied: yes", settled)
+        self.assertTrue((run / "T01-report-02.mdx").exists())
+
+    def test_repeated_decision_neither_rewrites_evidence_nor_opens_an_extra_round(self) -> None:
+        self.init()
+        run = self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        for owner in ("T01", "T02"):
+            self.fill_task(run / f"{owner}-task.mdx")
+            self.fill_task_report(run / f"{owner}-report-01.mdx")
+            self.cli("submit", "demo", owner)
+
+        self.cli("decide", "demo", "T01", "--approve", "--reason", "Correct as submitted.")
+        approved_report = (run / "T01-report-01.mdx").read_bytes()
+        approved_decision = (run / "T01-decision-01.mdx").read_bytes()
+        repeated = self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("already approved", repeated.stdout)
+        self.assertIn("Nothing was rewritten", repeated.stdout)
+        self.assertEqual(approved_report, (run / "T01-report-01.mdx").read_bytes())
+        self.assertEqual(approved_decision, (run / "T01-decision-01.mdx").read_bytes())
+        conflicting = self.cli(
+            "decide", "demo", "T01", "--waive", "--reason", "second thoughts", ok=False
+        )
+        self.assertEqual(1, conflicting.returncode)
+        self.assertIn("already approved", conflicting.stderr)
+        self.assertEqual(approved_decision, (run / "T01-decision-01.mdx").read_bytes())
+
+        self.cli("decide", "demo", "T02", "--changes")
+        changes = run / "T02-decision-01.mdx"
+        changes.write_text(changes.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Handle the empty input in `src/b.py:1`.",
+        ))
+        self.cli("decide", "demo", "T02", "--changes")
+        round_two = (run / "T02-report-02.mdx").read_bytes()
+        requested_decision = changes.read_bytes()
+        again = self.cli("decide", "demo", "T02", "--changes")
+        self.assertIn("already changes-requested", again.stdout)
+        self.assertFalse((run / "T02-report-03.mdx").exists())
+        self.assertEqual(round_two, (run / "T02-report-02.mdx").read_bytes())
+        self.assertEqual(requested_decision, changes.read_bytes())
+
+    def test_unavailable_git_evidence_is_never_reported_as_an_empty_diff(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assertIn("evidence_mode: git", (run / "plan.mdx").read_text())
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        # The baseline was complete at dispatch. The evidence under it went away.
+        shutil.rmtree(self.root / ".git")
+
+        diff = self.cli("diff", "demo", "T01", ok=False)
+        self.assertEqual(1, diff.returncode)
+        self.assertIn("diff coverage unavailable", diff.stderr)
+        self.assertIn("Git cannot report changes in", diff.stderr)
+        self.assertIn("not an empty diff", diff.stderr)
+        self.assertNotIn("no worktree changes", diff.stdout)
+
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+        self.assertIn("diff coverage is unavailable", rejected.stderr)
+        self.assertIn("evidence_mode: documents-only", rejected.stderr)
+        self.assertIn("status: draft", (run / "T01-report-01.mdx").read_text())
+
+    def test_documents_only_mode_stays_usable_and_labels_coverage_unavailable(self) -> None:
+        run = self.init(evidence_mode="documents-only")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        diff = self.cli("diff", "demo", "T01")
+        self.assertIn("diff coverage unavailable", diff.stdout)
+        self.assertIn("evidence_mode: documents-only", diff.stdout)
+        self.assertNotIn("no worktree changes", diff.stdout)
+        self.assertIn("evidence: documents-only", self.cli("status", "demo").stdout)
+
+        submitted = self.cli("submit", "demo", "T01")
+        self.assertIn("diff coverage: documents-only", submitted.stdout)
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_peek_inspects_pending_events_without_consuming_them(self) -> None:
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        ledger = run / ".woke-orchestrator"
+
+        for _ in range(2):
+            peek = self.cli("events", "demo", "--role", "orchestrator", "--peek")
+            self.assertEqual(0, peek.returncode)
+            self.assertIn("1 pending of 1 derived event(s)", peek.stdout)
+            self.assertIn("[pending  ]", peek.stdout)
+            self.assertIn("review batch ready", peek.stdout)
+            self.assertIn("Nothing was claimed", peek.stdout)
+            self.assertFalse(ledger.exists())
+
+        empty = self.cli("events", "demo", "--role", "planner", "--peek")
+        self.assertIn("no derived events for this role", empty.stdout)
+        self.assertFalse((run / ".woke-planner").exists())
+
+        wake = self.cli("watch", "demo", "--role", "orchestrator", "--timeout", "0", ok=False)
+        self.assertEqual(2, wake.returncode)
+        delivered = ledger.read_bytes()
+
+        after = self.cli("events", "demo", "--role", "orchestrator", "--peek")
+        self.assertIn("0 pending of 1 derived event(s)", after.stdout)
+        self.assertIn("[delivered]", after.stdout)
+        self.assertEqual(delivered, ledger.read_bytes())
+
+    # ------------------------------- atomic publication and retry-safe transitions
+
+    REQUIREMENT = "1. Correct `src/a.py:1` and add a regression assertion."
+    REASON = "The guard is untested."
+
+    def changes_draft(self) -> tuple[Path, Path, Path, str]:
+        """A submitted report plus a filled, not yet applied changes decision draft."""
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        submitted_body = self.body_of(report)
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        return run, report, decision, submitted_body
+
+    @staticmethod
+    def rounds(run: Path, owner: str = "T01") -> list[str]:
+        return sorted(path.name for path in run.glob(f"{owner}-report-*.mdx"))
+
+    def test_an_interrupted_publication_never_exposes_a_partial_document(self) -> None:
+        run, report, decision, submitted_body = self.changes_draft()
+        drafted = decision.read_bytes()
+
+        crash = self.cli(
+            "decide", "demo", "T01", "--changes", ok=False, fault="publish:T01-decision-01.mdx"
+        )
+        self.assertEqual(70, crash.returncode)
+        self.assertEqual(drafted, decision.read_bytes())
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+        # The crash journalled a decision with no reason, and the journalled payload is
+        # immutable, so the retry finishes it with the bare verdict.
+        self.cli("decide", "demo", "T01", "--changes")
+        self.assertIn("applied: yes", decision.read_text())
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+
+    def test_an_interrupted_next_round_write_leaves_no_partial_round(self) -> None:
+        run, report, _, _ = self.changes_draft()
+        crash = self.cli(
+            "decide", "demo", "T01", "--changes", ok=False, fault="publish:T01-report-02.mdx"
+        )
+        self.assertEqual(70, crash.returncode)
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+        self.assertTrue(
+            list(run.glob(".T01-report-02.mdx.*.tmp")),
+            "an interrupted publication leaves its temporary file, never the artifact",
+        )
+
+        self.cli("decide", "demo", "T01", "--changes")
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+        self.assertIn("# Report: T01 round 2", (run / "T01-report-02.mdx").read_text())
+
+    def test_every_interrupted_changes_boundary_finishes_on_retry(self) -> None:
+        """Interrupt each material write boundary; a retry must complete that transition."""
+        boundaries = (
+            "transition:begin", "transition:decision", "transition:report", "transition:next-round",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                self.tearDown()
+                self.setUp()
+                run, report, decision, submitted_body = self.changes_draft()
+                journal = run / ".transitions" / "T01.json"
+
+                crash = self.cli(
+                    "decide", "demo", "T01", "--changes", "--reason", self.REASON,
+                    ok=False, fault=boundary,
+                )
+                self.assertEqual(70, crash.returncode)
+                self.assertIn(f"injected fault at {boundary}", crash.stderr)
+                self.assertEqual("in-progress", json.loads(journal.read_text())["state"])
+
+                self.cli("decide", "demo", "T01", "--changes", "--reason", self.REASON)
+
+                self.assertEqual(submitted_body, self.body_of(report))
+                settled = decision.read_text()
+                self.assertIn("applied: yes", settled)
+                self.assertIn("verdict: changes-requested", settled)
+                self.assertIn("transition: txn:", settled)
+                self.assertIn(self.REQUIREMENT, settled)
+                self.assertIn(self.REASON, settled)
+                self.assertIn("status: changes-requested", report.read_text())
+                self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+                self.assertEqual("complete", json.loads(journal.read_text())["state"])
+
+                again = self.cli("decide", "demo", "T01", "--changes")
+                self.assertIn("already changes-requested", again.stdout)
+                self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+
+    def test_an_interrupted_approval_finishes_without_touching_review_evidence(self) -> None:
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        submitted_body = self.body_of(report)
+
+        crash = self.cli(
+            "decide", "demo", "T01", "--approve", "--reason", "Diff matches the criterion.",
+            ok=False, fault="transition:decision",
+        )
+        self.assertEqual(70, crash.returncode)
+        decision = run / "T01-decision-01.mdx"
+        self.assertIn("applied: yes", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        stranded = decision.read_bytes()
+
+        resumed = self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("resumed interrupted approved transition txn:", resumed.stdout)
+        self.assertEqual(stranded, decision.read_bytes())
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertIn("status: approved", report.read_text())
+        self.assertIn("decision: T01-decision-01.mdx", report.read_text())
+        self.assertEqual(1, len(list(run.glob("T01-decision-*.mdx"))))
+        digest = "sha256:" + hashlib.sha256(submitted_body.encode()).hexdigest()
+        self.assertIn(f"evidence_digest: {digest}", decision.read_text())
+
+    def test_a_transition_interrupted_without_a_journal_still_opens_one_next_round(self) -> None:
+        """Regression: this exact state used to be terminal.
+
+        Before retry-safe transitions, an interruption between the report status
+        write and the next round left `status: changes-requested` with no round 2,
+        and every retry answered "already changes-requested" and returned, so the
+        round was never opened. The state is reconstructed by hand here, without
+        fault injection, so it is exactly what an older docket would leave behind.
+        """
+        run, report, decision, submitted_body = self.changes_draft()
+        decision.write_text(decision.read_text().replace("applied: no", "applied: yes"))
+        report.write_text(report.read_text().replace(
+            "status: submitted", "status: changes-requested\ndecision: T01-decision-01.mdx"
+        ))
+        self.assertFalse((run / ".transitions").exists())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+        recovered = self.cli("decide", "demo", "T01", "--changes")
+        self.assertIn("resumed interrupted changes-requested transition txn:", recovered.stdout)
+        self.assertIn("applied next-round", recovered.stdout)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+        self.assertEqual(submitted_body, self.body_of(report))
+        self.assertIn(self.REQUIREMENT, decision.read_text())
+
+        again = self.cli("decide", "demo", "T01", "--changes")
+        self.assertIn("already changes-requested", again.stdout)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+
+    def test_an_unfinished_transition_blocks_a_different_verdict_and_is_visible(self) -> None:
+        run, report, decision, _ = self.changes_draft()
+        self.cli("decide", "demo", "T01", "--changes", ok=False, fault="transition:begin")
+
+        status = self.cli("status", "demo").stdout
+        self.assertIn("unfinished decision transitions", status)
+        self.assertIn("T01 round 1 changes-requested txn:", status)
+
+        hijack = self.cli("decide", "demo", "T01", "--approve", ok=False)
+        self.assertEqual(1, hijack.returncode)
+        self.assertIn("unfinished changes-requested transition", hijack.stderr)
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+        self.cli("decide", "demo", "T01", "--changes")
+        self.assertNotIn("unfinished decision transitions", self.cli("status", "demo").stdout)
+
+    def test_concurrent_deciders_are_serialized_into_one_next_round(self) -> None:
+        run, report, decision, submitted_body = self.changes_draft()
+        command = [
+            sys.executable, str(DOCKET), "decide", "demo", "T01", "--changes",
+            "--reason", self.REASON,
+        ]
+        first = subprocess.Popen(
+            command, cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        second = subprocess.Popen(
+            command, cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        first.communicate(timeout=30)
+        second.communicate(timeout=30)
+
+        self.assertEqual([0, 0], [first.returncode, second.returncode])
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+        self.assertEqual(1, len(list(run.glob("T01-decision-*.mdx"))))
+        self.assertIn("applied: yes", decision.read_text())
+        self.assertEqual(submitted_body, self.body_of(report))
+
+    def test_a_decision_cannot_apply_to_report_evidence_that_changed_after_review(self) -> None:
+        run, report, decision, _ = self.changes_draft()
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Implemented the feature, verified its behavior, and rewrote the guard.",
+        ))
+
+        stale = self.cli("decide", "demo", "T01", "--changes", ok=False)
+        self.assertEqual(1, stale.returncode)
+        self.assertIn("changed after review began", stale.stderr)
+        self.assertIn("--re-review", stale.stderr)
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+        changed_body = self.body_of(report)
+        applied = self.cli(
+            "decide", "demo", "T01", "--changes", "--re-review", "--reason", self.REASON
+        )
+        self.assertIn("re-verifying changed evidence", applied.stdout)
+        self.assertIn("re-verification passed", applied.stdout)
+        settled = decision.read_text()
+        digest = "sha256:" + hashlib.sha256(changed_body.encode()).hexdigest()
+        self.assertIn(f"evidence_digest: {digest}", settled)
+        self.assertIn("reverified: yes", settled)
+        self.assertIn("superseded_evidence: sha256:", settled)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+        self.assertEqual(changed_body, self.body_of(report))
+
+    def submitted_report(self, *, blocked: bool = False) -> tuple[Path, Path, str]:
+        """A submitted report, blocked or not, with nothing decided yet."""
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, blocked=blocked)
+        self.cli("submit", "demo", "T01", *(["--blocked"] if blocked else []))
+        return run, report, self.body_of(report)
+
+    def begun_transition(self, verdict: str) -> tuple[Path, Path]:
+        """A transition interrupted before it published any artifact.
+
+        `transition:begin` fires after the journal and before the first document, so
+        the reviewer's text exists only where the recovery path can find it.
+        """
+        if verdict == "--changes":
+            run, report, decision, _ = self.changes_draft()
+        else:
+            run, report, _ = self.submitted_report(blocked=verdict == "--waive")
+            decision = run / "T01-decision-01.mdx"
+        crash = self.cli(
+            "decide", "demo", "T01", verdict, "--reason", self.REASON, "--reviewer", "planner",
+            ok=False, fault="transition:begin",
+        )
+        self.assertEqual(70, crash.returncode)
+        self.assertEqual("in-progress", json.loads((run / ".transitions" / "T01.json").read_text())["state"])
+        return run, decision
+
+    def test_an_interrupted_transition_keeps_reviewer_text_a_retry_does_not_repeat(self) -> None:
+        """Regression: the retry used to rebuild the decision from the arguments.
+
+        An approve or waive interrupted before its decision artifact existed left the
+        reviewer's reason nowhere on disk, so a retry that supplied only the verdict
+        recorded `none` instead - and a waiver retry could not even run, because the
+        reason was mandatory. The payload is now journalled before the first write.
+        """
+        for verdict, recorded in (
+            ("--approve", "approved"), ("--waive", "waived"), ("--changes", "changes-requested"),
+        ):
+            with self.subTest(verdict=verdict):
+                self.tearDown()
+                self.setUp()
+                run, decision = self.begun_transition(verdict)
+
+                resumed = self.cli("decide", "demo", "T01", verdict)
+
+                self.assertIn(f"resumed interrupted {recorded} transition txn:", resumed.stdout)
+                settled = decision.read_text()
+                self.assertIn(f"verdict: {recorded}", settled)
+                self.assertIn("reviewer: planner", settled)
+                self.assertIn("applied: yes", settled)
+                self.assertIn(self.REASON, settled)
+                self.assertNotIn("## Reason\n\nnone", settled)
+                if verdict == "--changes":
+                    self.assertIn(self.REQUIREMENT, settled)
+                    self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+                self.assertEqual("complete", json.loads((run / ".transitions" / "T01.json").read_text())["state"])
+
+    def test_a_fresh_waiver_still_requires_a_stated_reason(self) -> None:
+        """Only a retry may omit it, because only a retry has one already recorded."""
+        run, report, _ = self.submitted_report(blocked=True)
+
+        refused = self.cli("decide", "demo", "T01", "--waive", ok=False)
+
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("--waive requires --reason TEXT", refused.stderr)
+        self.assertIn("status: blocked", report.read_text())
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+
+    def test_a_retry_cannot_rewrite_the_reason_a_transition_already_recorded(self) -> None:
+        run, decision = self.begun_transition("--approve")
+
+        conflict = self.cli(
+            "decide", "demo", "T01", "--approve", "--reason", "Different rationale.", ok=False
+        )
+        self.assertEqual(1, conflict.returncode)
+        self.assertIn("already recorded the reason", conflict.stderr)
+        self.assertFalse(decision.exists())
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+        hijack = self.cli("decide", "demo", "T01", "--approve", "--reviewer", "orch", ok=False)
+        self.assertEqual(1, hijack.returncode)
+        self.assertIn("recorded reviewer 'planner'", hijack.stderr)
+
+        self.cli("decide", "demo", "T01", "--approve")
+        settled = decision.read_text()
+        self.assertIn(self.REASON, settled)
+        self.assertNotIn("Different rationale.", settled)
+        self.assertIn("reviewer: planner", settled)
+
+    def test_a_retry_cannot_fill_in_a_reason_the_transition_recorded_as_absent(self) -> None:
+        """The journalled payload is immutable in every field, empty ones included.
+
+        A retry used to be allowed to fill in a reason the interrupted attempt had
+        recorded as `none`, on the argument that nothing was published under it. But
+        the journal is written before the first artifact precisely so that it, and not
+        the invocation, is the decision: adding a reason there publishes a decision
+        nobody made under an identity somebody else began.
+        """
+        run, report, decision, _ = self.changes_draft()
+        crash = self.cli("decide", "demo", "T01", "--changes", ok=False, fault="transition:begin")
+        self.assertEqual(70, crash.returncode)
+        journal = json.loads((run / ".transitions" / "T01.json").read_text())
+        self.assertIn("## Reason\n\nnone", journal["decision_body"])
+
+        conflict = self.cli(
+            "decide", "demo", "T01", "--changes", "--reason", self.REASON, ok=False
+        )
+
+        self.assertEqual(1, conflict.returncode)
+        self.assertIn("already recorded the reason 'none'", conflict.stderr)
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+        self.cli("decide", "demo", "T01", "--changes")
+        settled = decision.read_text()
+        self.assertIn("## Reason\n\nnone", settled)
+        self.assertNotIn(self.REASON, settled)
+        self.assertIn("applied: yes", settled)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run))
+
+    def test_re_review_of_a_changed_blocked_report_skips_completion_verification(self) -> None:
+        """A blocked report is waived, not verified, and re-review must keep it that way.
+
+        Re-review used to run the registered command for every changed body. A report
+        blocked *because* that command fails could then never be re-reviewed after an
+        edit, so the lightweight waiver path the gate promises was unreachable exactly
+        where it matters. Submission skips completion verification for a blocked
+        report; re-review now does the same.
+        """
+        run, report, _ = self.submitted_report(blocked=True)
+        task = run / "T01-task.mdx"
+        text = task.read_text()
+        registered = next(line for line in text.splitlines() if line.startswith("verify:"))
+        task.write_text(text.replace(registered, "verify: false"))
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        report.write_text(report.read_text().replace(
+            "The reviewer must decide whether to waive the external failure.",
+            "The upstream dependency is still broken; the reviewer must decide on a waiver.",
+        ))
+        changed_body = self.body_of(report)
+
+        stale = self.cli("decide", "demo", "T01", "--waive", "--reason", self.REASON, ok=False)
+        self.assertEqual(1, stale.returncode)
+        self.assertIn("changed after review began", stale.stderr)
+
+        waived = self.cli(
+            "decide", "demo", "T01", "--waive", "--re-review", "--reason", self.REASON
+        )
+
+        self.assertIn("re-review passed the report gate", waived.stdout)
+        self.assertIn("skips completion verification", waived.stdout)
+        self.assertNotIn("re-verifying changed evidence", waived.stdout)
+        settled = decision.read_text()
+        self.assertIn("verdict: waived", settled)
+        self.assertIn("reverified: blocked", settled)
+        self.assertIn("superseded_evidence: sha256:", settled)
+        self.assertIn(self.REASON, settled)
+        self.assertIn("status: waived", report.read_text())
+        self.assertEqual(changed_body, self.body_of(report))
+
+    def test_re_review_refuses_changed_evidence_that_no_longer_passes_the_gate(self) -> None:
+        """A passing verify command is not a passing report.
+
+        Re-verification used to run only the registered command, so a report edited
+        into a state `docket submit` would have rejected could still be decided.
+        """
+        edits = {
+            "unchecked acceptance": ("- [x] The feature works.", "- [ ] The feature works."),
+            "emptied summary": (
+                "Implemented the feature and verified its behavior.",
+                "<!-- TODO: what you actually did. -->",
+            ),
+            "rewritten acceptance criterion": (
+                "- [x] The feature works.", "- [x] The feature mostly works.",
+            ),
+        }
+        for label, (old, new) in edits.items():
+            with self.subTest(edit=label):
+                self.tearDown()
+                self.setUp()
+                run, report, decision, _ = self.changes_draft()
+                report.write_text(report.read_text().replace(old, new))
+
+                refused = self.cli(
+                    "decide", "demo", "T01", "--changes", "--re-review", "--reason", self.REASON,
+                    ok=False,
+                )
+
+                self.assertEqual(1, refused.returncode)
+                self.assertIn("no longer passes the report gate", refused.stderr)
+                self.assertNotIn("re-verification passed", refused.stdout)
+                self.assertIn("applied: no", decision.read_text())
+                self.assertIn("status: submitted", report.read_text())
+                self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+    def test_re_review_re_runs_the_scope_and_diff_checks_under_git_evidence(self) -> None:
+        """Structural checks are not the only ones a changed body has to clear again."""
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.email", "docket@example.test"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.name", "Docket Test"], cwd=self.root, check=True)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "a.py").write_text("allowed = 1\n")
+        subprocess.run(["git", "add", "src/a.py"], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "baseline"], cwd=self.root, check=True)
+
+        run = self.init()
+        self.assertIn("evidence_mode: git", (run / "plan.mdx").read_text())
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        report.write_text(report.read_text().replace(
+            "- `src/a.py:1` - implemented the feature.", "- Nothing worth listing.",
+        ))
+
+        refused = self.cli(
+            "decide", "demo", "T01", "--changes", "--re-review", "--reason", self.REASON, ok=False
+        )
+
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("no longer passes the report gate", refused.stderr)
+        self.assertIn("task-local changes omitted from 'Files changed': src/a.py", refused.stderr)
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+    def test_re_review_refuses_a_changed_report_that_fails_verification(self) -> None:
+        run, report, decision, _ = self.changes_draft()
+        task = run / "T01-task.mdx"
+        text = task.read_text()
+        registered = next(line for line in text.splitlines() if line.startswith("verify:"))
+        task.write_text(text.replace(registered, "verify: false"))
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.", "Rewrote the feature entirely.",
+        ))
+
+        refused = self.cli("decide", "demo", "T01", "--changes", "--re-review", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("re-verification failed", refused.stderr)
+        self.assertIn("applied: no", decision.read_text())
+        self.assertIn("status: submitted", report.read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run))
+
+    # ------------------------------------------------------- multi-root baselines
+
+    def test_a_git_run_declares_every_checkout_root_before_dispatch(self) -> None:
+        self.repo()
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        self.repo(self.root / "vendor" / "lib")
+
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt", "lib=vendor/lib"))
+        listing = self.cli("roots", "demo").stdout
+        self.assertIn("3 declared checkout root(s)", listing)
+
+        declared = json.loads((run / ".snapshots" / "roots.json").read_text())["roots"]
+        by_alias = {record["alias"]: record for record in declared}
+        self.assertEqual({"root", "wt", "lib"}, set(by_alias))
+        self.assertEqual(str(self.root.resolve()), by_alias["root"]["path"])
+        self.assertEqual("main", by_alias["root"]["branch"])
+        self.assertEqual("feature", by_alias["wt"]["branch"])
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), by_alias["root"]["head"])
+        # Two worktrees of one repository share Git storage and are still distinct
+        # change surfaces, so identity is the worktree, never the common directory.
+        self.assertEqual(by_alias["root"]["common_dir"], by_alias["wt"]["common_dir"])
+        self.assertNotEqual(by_alias["root"]["git_dir"], by_alias["wt"]["git_dir"])
+        self.assertNotEqual(by_alias["root"]["common_dir"], by_alias["lib"]["common_dir"])
+        self.assertIn("Some roots share Git storage", listing)
+
+    def test_worktrees_sharing_git_storage_do_not_collide_on_equal_paths(self) -> None:
+        self.repo()
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt"))
+
+        for owner, claimed in (("T01", "src/a.py"), ("T02", "wt:src/a.py")):
+            self.cli("assign", "demo", owner, "--file", claimed, "--verify", "true")
+            self.fill_scope(run / f"{owner}-scope.mdx")
+            accepted = self.cli("scope", "demo", owner, "--submit")
+            self.assertIn("scope accepted", accepted.stdout)
+
+        self.cli("assign", "demo", "T03", "--file", "src/a.py", "--verify", "true")
+        self.fill_scope(run / "T03-scope.mdx")
+        clash = self.cli("scope", "demo", "T03", "--submit", ok=False)
+        self.assertIn("SCOPE COLLISION", clash.stderr)
+        self.assertIn("root:src/a.py overlaps T01 at root:src/a.py", clash.stderr)
+        self.assertNotIn("T02", clash.stderr)
+
+    def test_a_nested_repository_resolves_to_its_own_declared_root(self) -> None:
+        self.repo()
+        nested = self.repo(self.root / "vendor" / "lib")
+        run = self.init(evidence_mode="git", roots=("root=.", "lib=vendor/lib"))
+        self.cli("assign", "demo", "T01", "--file", "vendor/lib/src/a.py", "--verify", "true")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+
+        (nested / "src" / "a.py").write_text("allowed = 2\n")
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertIn("changes since assignment", diff)
+        self.assertIn("[in scope] lib:src/a.py", diff)
+        # The outer checkout never owns a nested repository's paths.
+        self.assertNotIn("root:vendor", diff)
+        self.assertNotIn("no worktree changes", diff)
+
+    def test_a_task_baseline_reconstructs_the_dirt_it_was_assigned_over(self) -> None:
+        self.repo()
+        tracked = self.root / "src" / "a.py"
+        tracked.write_text("allowed = 2\n")
+        self.git("add", "src/a.py")
+        tracked.write_text("allowed = 3\n")
+
+        run = self.init(evidence_mode="git")
+        self.assign()
+        record = json.loads((run / ".snapshots" / "T01.json").read_text())["roots"][0]
+        self.assertEqual("recorded", record["status"])
+        # A fingerprint of the dirty file is gone the moment the implementor edits it.
+        tracked.write_text("allowed = 4\n")
+
+        with tempfile.TemporaryDirectory() as scratch:
+            clone = Path(scratch) / "clone"
+            self.git("clone", "-q", str(self.root), str(clone))
+            self.git("checkout", "-q", record["head"], cwd=clone)
+            captured = run / ".snapshots" / "T01"
+            for name, expected in (
+                (record["staged_patch"], "allowed = 2\n"),
+                (record["worktree_patch"], "allowed = 3\n"),
+            ):
+                patch = Path(scratch) / name
+                patch.write_bytes((captured / name).read_bytes())
+                self.git("apply", "--binary", str(patch), cwd=clone)
+                self.assertEqual(expected, (clone / "src" / "a.py").read_text())
+
+    def test_a_baseline_captures_untracked_content_modes_symlinks_and_binaries(self) -> None:
+        self.repo()
+        (self.root / "notes.txt").write_text("dirty note\n")
+        script = self.root / "tool.sh"
+        script.write_text("#!/bin/sh\necho hi\n")
+        script.chmod(0o755)
+        payload = bytes(range(256)) * 8
+        (self.root / "asset.bin").write_bytes(payload)
+        (self.root / "link.txt").symlink_to("notes.txt")
+
+        run = self.init(evidence_mode="git")
+        self.assign()
+        record = json.loads((run / ".snapshots" / "T01.json").read_text())["roots"][0]
+        manifest = run / ".snapshots" / "T01" / record["untracked_manifest"]
+        entries = json.loads(manifest.read_text())["entries"]
+
+        self.assertEqual(b"dirty note\n", base64.b64decode(entries["notes.txt"]["content_base64"]))
+        self.assertEqual(payload, base64.b64decode(entries["asset.bin"]["content_base64"]))
+        self.assertEqual("executable", entries["tool.sh"]["kind"])
+        self.assertEqual({"kind": "symlink", "target": "notes.txt"}, entries["link.txt"])
+        self.assertEqual("full", record["reconstructable"])
+
+    def test_a_baseline_records_initial_deletions_and_mode_changes(self) -> None:
+        self.repo()
+        keep = self.root / "src" / "keep.sh"
+        keep.write_text("#!/bin/sh\necho keep\n")
+        gone = self.root / "src" / "gone.py"
+        gone.write_text("gone = 1\n")
+        self.git("add", "src/keep.sh", "src/gone.py")
+        self.git("commit", "-qm", "more")
+        gone.unlink()
+        keep.chmod(0o755)
+
+        run = self.init(evidence_mode="git")
+        self.assign()
+        record = json.loads((run / ".snapshots" / "T01.json").read_text())["roots"][0]
+        patch = (run / ".snapshots" / "T01" / record["worktree_patch"]).read_text()
+        self.assertIn("src/gone.py", patch)
+        self.assertIn("deleted file mode 100644", patch)
+        self.assertIn("old mode 100644", patch)
+        self.assertIn("new mode 100755", patch)
+
+    def test_the_run_baseline_is_taken_before_the_first_implementor_edit(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assertFalse((run / ".snapshots" / "run.json").is_file())
+
+        self.assign()
+        captured = json.loads((run / ".snapshots" / "run.json").read_text())
+        self.assertEqual("run", captured["kind"])
+        self.assertEqual("recorded", captured["baseline"])
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), captured["roots"][0]["head"])
+
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        (self.root / "src" / "b.py").write_text("b = 1\n")
+        diff = self.cli("diff", "demo", "run").stdout
+        self.assertIn("src/a.py", diff)
+        self.assertIn("src/b.py", diff)
+        self.assertNotIn("OUTSIDE SCOPE", diff)
+
+    def test_edits_committed_during_a_task_are_not_reported_as_an_empty_diff(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.git("add", "src/a.py")
+        self.git("commit", "-qm", "implementor commit")
+
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertIn("[in scope] src/a.py", diff)
+        self.assertNotIn("no worktree changes", diff)
+
+        (self.root / "outside.py").write_text("outside = 1\n")
+        self.git("add", "outside.py")
+        self.git("commit", "-qm", "committed outside the accepted scope")
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+        self.assertIn("outside the task scope: outside.py", rejected.stderr)
+
+    def test_unresolved_and_missing_roots_block_a_claim_of_diff_coverage(self) -> None:
+        self.repo()
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt"))
+
+        self.cli("assign", "demo", "T01", "--file", "ghost:src/a.py", "--verify", "true")
+        self.fill_scope(run / "T01-scope.mdx")
+        noted = self.cli("scope", "demo", "T01", "--submit")
+        self.assertIn("undeclared root alias", noted.stderr)
+        unresolved = self.cli("diff", "demo", "T01", ok=False)
+        self.assertIn("undeclared root alias 'ghost'", unresolved.stderr)
+        self.assertIn("not an empty diff", unresolved.stderr)
+
+        self.cli("assign", "demo", "T02", "--file", "wt:src/a.py", "--verify", "true")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.git("worktree", "remove", "--force", "wt")
+        missing = self.cli("diff", "demo", "T02", ok=False)
+        self.assertIn("is missing", missing.stderr)
+        self.assertIn("not an empty diff", missing.stderr)
+        self.assertNotIn("no worktree changes", missing.stdout)
+
+    def test_documents_only_runs_declare_no_roots_and_admit_it(self) -> None:
+        run = self.init(evidence_mode="documents-only")
+        listing = self.cli("roots", "demo").stdout
+        self.assertIn("Git baseline coverage is unavailable", listing)
+        self.assertIn("not claiming an unchanged tree", listing)
+        self.assertFalse((run / ".snapshots" / "roots.json").is_file())
+
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        submitted = self.cli("submit", "demo", "T01")
+        self.assertIn("diff coverage: documents-only", submitted.stdout)
+
+    def test_a_declared_root_set_is_not_rediscovered_once_a_baseline_exists(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign()
+        self.git("worktree", "add", "-q", "-b", "late", "late")
+
+        unchanged = self.cli("roots", "demo").stdout
+        self.assertIn("1 declared checkout root(s)", unchanged)
+        refused = self.cli("roots", "demo", "--redeclare", "root=.", "late=late", ok=False)
+        self.assertIn("baselines already reference the declared roots", refused.stderr)
+        declared = json.loads((run / ".snapshots" / "roots.json").read_text())["roots"]
+        self.assertEqual(["root"], [record["alias"] for record in declared])
+
+        # A declaration that goes missing under a baseline is never rediscovered.
+        (run / ".snapshots" / "roots.json").unlink()
+        blocked = self.cli(
+            "assign", "demo", "T02", "--file", "src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("cannot capture a complete task baseline", blocked.stderr)
+        self.assertFalse((run / "T02-task.mdx").exists())
+        self.assertFalse((run / "T02-report-01.mdx").exists())
+        again = self.cli("roots", "demo", "--declare", "root=.", ok=False)
+        self.assertIn("baselines were captured against a root declaration", again.stderr)
+
+    def test_multi_root_change_lists_are_root_qualified_through_the_gate(self) -> None:
+        self.repo()
+        linked = self.root / "wt"
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt"))
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--harness", "opencode",
+            "--file", "src/a.py", "--file", "wt:src/a.py", "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        (linked / "src" / "a.py").write_text("allowed = 3\n")
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertIn("[in scope] root:src/a.py", diff)
+        self.assertIn("[in scope] wt:src/a.py", diff)
+
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+        self.assertIn("root:src/a.py", rejected.stderr)
+        self.assertIn("wt:src/a.py", rejected.stderr)
+
+        report = run / "T01-report-01.mdx"
+        report.write_text(report.read_text().replace(
+            "- `src/a.py:1` - implemented the feature.",
+            "- `root:src/a.py:1` - implemented the feature.\n"
+            "- `wt:src/a.py:1` - mirrored it in the linked worktree.",
+        ))
+        submitted = self.cli("submit", "demo", "T01")
+        self.assertIn("diff coverage: available", submitted.stdout)
+        self.assertIn("status: submitted", report.read_text())
+
+    def test_only_explicitly_declared_checkout_roots_are_captured(self) -> None:
+        """`.docket` in a plain parent holding several checkouts is a real layout."""
+        app = self.repo(self.root / "app")
+        lib = self.repo(self.root / "lib")
+        self.git("worktree", "add", "-q", "-b", "feature", str(self.root / "app-wt"), cwd=app)
+        (self.root / "app-wt" / "secret.txt").write_text("unrelated worktree dirt\n")
+
+        run = self.init(evidence_mode="git", roots=("app=app", "lib=lib"))
+        declared = json.loads((run / ".snapshots" / "roots.json").read_text())["roots"]
+        self.assertEqual(["app", "lib"], [record["alias"] for record in declared])
+
+        self.cli("assign", "demo", "T01", "--file", "app:src/a.py", "--verify", "true")
+        captured = run / ".snapshots" / "T01"
+        self.assertEqual(
+            ["app.staged.patch", "app.untracked.json", "app.worktree.patch",
+             "lib.staged.patch", "lib.untracked.json", "lib.worktree.patch"],
+            sorted(path.name for path in captured.iterdir()),
+        )
+        # An undeclared linked worktree is never copied into secret-bearing evidence.
+        for path in captured.iterdir():
+            self.assertNotIn("unrelated worktree dirt", path.read_text(errors="replace"))
+
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        (app / "src" / "a.py").write_text("allowed = 2\n")
+        (lib / "src" / "a.py").write_text("allowed = 3\n")
+        (self.root / "app-wt" / "src" / "a.py").write_text("allowed = 4\n")
+
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertIn("[in scope] app:src/a.py", diff)
+        self.assertIn("[OUTSIDE SCOPE] lib:src/a.py", diff)
+        self.assertNotIn("app-wt", diff)
+
+    def test_a_git_run_refuses_dispatch_without_a_declared_root(self) -> None:
+        self.repo(self.root / "app")
+        run = self.init(evidence_mode="git")
+        self.assertFalse((run / ".snapshots" / "roots.json").is_file())
+
+        refused = self.cli(
+            "assign", "demo", "T01", "--file", "app:src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("cannot capture a complete run baseline", refused.stderr)
+        self.assertIn("Nothing was dispatched", refused.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+        self.assertFalse((run / "T01-report-01.mdx").exists())
+        self.assertFalse((run / ".snapshots" / "run.json").is_file())
+
+        listing = self.cli("roots", "demo", ok=False)
+        self.assertIn("no checkout root is declared", listing.stderr)
+        self.assertIn("Only a declared root is captured", listing.stderr)
+        # A hint, not a declaration: the checkout is named but nothing is captured.
+        self.assertIn(str(self.root / "app"), listing.stderr)
+
+        self.cli("roots", "demo", "--declare", "app=app")
+        self.cli("assign", "demo", "T01", "--file", "app:src/a.py", "--verify", "true")
+        self.assertTrue((run / "T01-task.mdx").exists())
+        self.assertEqual(
+            "recorded", json.loads((run / ".snapshots" / "T01.json").read_text())["baseline"]
+        )
+
+    def test_dispatch_fails_when_a_declared_root_cannot_be_captured(self) -> None:
+        self.repo()
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt"))
+        self.git("worktree", "remove", "--force", "wt")
+
+        refused = self.cli(
+            "assign", "demo", "T01", "--file", "src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("cannot capture a complete run baseline", refused.stderr)
+        self.assertIn("is missing", refused.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+        self.assertFalse((run / ".snapshots" / "run.json").is_file())
+        # A half-captured baseline is discarded, never left for a later read to trust.
+        self.assertFalse((run / ".snapshots" / "run").exists())
+
+    def test_an_oversize_untracked_file_fails_the_baseline_instead_of_truncating(self) -> None:
+        self.repo()
+        (self.root / "huge.bin").write_bytes(b"\0" * (8 * 1024 * 1024 + 1))
+        run = self.init(evidence_mode="git")
+
+        refused = self.cli(
+            "assign", "demo", "T01", "--file", "src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("huge.bin", refused.stderr)
+        self.assertIn("baseline capture limit", refused.stderr)
+        self.assertIn("captured in full or not at all", refused.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+        self.assertFalse((run / ".snapshots" / "run.json").is_file())
+
+        (self.root / ".gitignore").write_text("huge.bin\n")
+        self.cli("assign", "demo", "T01", "--file", "src/a.py", "--verify", "true")
+        record = json.loads((run / ".snapshots" / "T01.json").read_text())["roots"][0]
+        self.assertEqual("full", record["reconstructable"])
+
+    def test_an_unreadable_untracked_file_fails_the_baseline(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root can read a mode 000 file, so there is nothing to fail on")
+        self.repo()
+        secret = self.root / "unreadable.txt"
+        secret.write_text("cannot be captured\n")
+        secret.chmod(0o000)
+        run = self.init(evidence_mode="git")
+
+        refused = self.cli(
+            "assign", "demo", "T01", "--file", "src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("unreadable.txt cannot be read", refused.stderr)
+        self.assertIn("Nothing was dispatched", refused.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+        self.assertFalse((run / ".snapshots" / "run.json").is_file())
+
+    def test_a_corrupt_root_declaration_is_refused_rather_than_rediscovered(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        declaration = run / ".snapshots" / "roots.json"
+        declaration.write_text("{ not json")
+
+        listing = self.cli("roots", "demo", ok=False)
+        self.assertIn("is unreadable", listing.stderr)
+        self.assertIn("never rediscovered", listing.stderr)
+
+        refused = self.cli(
+            "assign", "demo", "T01", "--file", "src/a.py", "--verify", "true", ok=False
+        )
+        self.assertIn("is unreadable", refused.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+
+        blocked = self.cli("roots", "demo", "--declare", "root=.", ok=False)
+        self.assertIn("never rediscovered", blocked.stderr)
+
+        # An entry missing a field is invalid too, not "nothing declared yet".
+        declaration.write_text(json.dumps({"roots": [{"alias": "root", "path": "/tmp"}]}))
+        incomplete = self.cli("roots", "demo", ok=False)
+        self.assertIn("malformed entry", incomplete.stderr)
+
+    def test_a_commit_between_declaration_and_assignment_is_captured_coherently(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        declared_head = self.git("rev-parse", "HEAD").strip()
+
+        (self.root / "src" / "b.py").write_text("b = 1\n")
+        self.git("add", "src/b.py")
+        self.git("commit", "-qm", "committed after the roots were declared")
+        head_now = self.git("rev-parse", "HEAD").strip()
+        self.assertNotEqual(declared_head, head_now)
+
+        self.assign()
+        record = json.loads((run / ".snapshots" / "T01.json").read_text())["roots"][0]
+        # Branch, HEAD, and the pinned base tree all describe the instant of capture.
+        self.assertEqual(head_now, record["head"])
+        self.assertEqual(head_now, record["base_tree"])
+        self.assertEqual("main", record["branch"])
+        self.assertEqual(declared_head, record["declared_head"])
+        # The commit predates the task, so it is not attributed to it.
+        self.assertIn("no worktree changes", self.cli("diff", "demo", "T01").stdout)
+
+    def test_a_mode_change_on_initially_dirty_content_is_detected(self) -> None:
+        self.repo()
+        tracked = self.root / "src" / "a.py"
+        tracked.write_text("allowed = 2\n")
+        untracked = self.root / "notes.sh"
+        untracked.write_text("#!/bin/sh\necho hi\n")
+
+        run = self.init(evidence_mode="git")
+        self.cli(
+            "assign", "demo", "T01", "--file", "src/a.py", "--file", "notes.sh",
+            "--verify", "true",
+        )
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.assertIn("no worktree changes", self.cli("diff", "demo", "T01").stdout)
+
+        # Only the executable bit moves. Both files are byte-for-byte what they were.
+        tracked.chmod(0o755)
+        untracked.chmod(0o755)
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertIn("[in scope] src/a.py", diff)
+        self.assertIn("[in scope] notes.sh", diff)
+
+    def test_staging_work_that_was_already_dirty_is_detected_as_a_change(self) -> None:
+        self.repo()
+        tracked = self.root / "src" / "a.py"
+        tracked.write_text("allowed = 2\n")
+
+        self.init(evidence_mode="git")
+        self.assign()
+        self.assertIn("no worktree changes", self.cli("diff", "demo", "T01").stdout)
+
+        # The index moves; the worktree content does not.
+        self.git("add", "src/a.py")
+        diff = self.cli("diff", "demo", "T01").stdout
+        self.assertEqual("allowed = 2\n", tracked.read_text())
+        self.assertIn("[in scope] src/a.py", diff)
+
+    # ------------------------------------------------- frozen evidence bundles
+
+    ALL_SHAPES = (
+        "- `src/a.py` `src/blob.bin` `src/gone.py` `src/link` `src/mode.py` `src/new.bin` "
+        "`src/note.txt` `src/renamed.py` `src/staged.py` `src/tool.sh` `src/unstaged.py` - "
+        "reshaped the module."
+    )
+
+    def ledger(self, owner: str = "T01") -> list[dict]:
+        path = self.root / ".docket" / "runs" / "demo" / ".bundles" / owner / "rounds.json"
+        return json.loads(path.read_text())["entries"] if path.is_file() else []
+
+    def frozen(self, owner: str = "T01", index: int = -1) -> tuple[dict, Path]:
+        """One frozen bundle manifest and the directory it was published into."""
+        entry = self.ledger(owner)[index]
+        where = self.root / ".docket" / "runs" / "demo" / ".bundles" / owner / entry["dir"]
+        return json.loads((where / "bundle.json").read_text()), where
+
+    def frozen_patch(self, owner: str = "T01", index: int = -1) -> str:
+        manifest, where = self.frozen(owner, index)
+        record = manifest["patch"]["roots"][0]
+        return (where / record["file"]).read_text(errors="replace")
+
+    def dirty_task_over_every_shape(self) -> Path:
+        """A task dispatched over real dirt, then every change shape a patch must carry.
+
+        The dirt is deliberately not the implementor's work: it is staged, unstaged,
+        untracked, symlinked, and mode-changed content that already existed when the
+        task was assigned, so a patch taken against the last commit rather than
+        against the baseline shows up immediately.
+        """
+        self.repo()
+        (self.root / "src" / "blob.bin").write_bytes(bytes(range(256)))
+        for name in ("gone.py", "mode.py", "unstaged.py"):
+            (self.root / "src" / name).write_text(f"{name.split('.')[0]} = 1\n")
+        self.git("add", "src")
+        self.git("commit", "-qm", "more tracked content")
+
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.git("add", "src/a.py")
+        (self.root / "src" / "a.py").write_text("allowed = 3\n")
+        (self.root / "src" / "note.txt").write_text("dirty note\n")
+        (self.root / "src" / "link").symlink_to("a.py")
+        (self.root / "src" / "blob.bin").chmod(0o755)
+
+        run = self.init(evidence_mode="git")
+        self.assign(file="src")
+        self.fill_task(run / "T01-task.mdx")
+
+        self.git("mv", "src/a.py", "src/renamed.py")
+        (self.root / "src" / "renamed.py").write_text("allowed = 3\nguard = 1\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "committed during the task")
+        (self.root / "src" / "gone.py").unlink()
+        (self.root / "src" / "note.txt").unlink()
+        (self.root / "src" / "new.bin").write_bytes(bytes(range(256)) * 4)
+        tool = self.root / "src" / "tool.sh"
+        tool.write_text("#!/bin/sh\necho hi\n")
+        tool.chmod(0o755)
+        (self.root / "src" / "mode.py").chmod(0o755)
+        (self.root / "src" / "staged.py").write_text("staged = 1\n")
+        self.git("add", "src/staged.py")
+        (self.root / "src" / "unstaged.py").write_text("unstaged = 2\n")
+        (self.root / "src" / "link").unlink()
+        (self.root / "src" / "link").symlink_to("renamed.py")
+        return run
+
+    def test_a_submission_freezes_the_whole_task_round_as_one_bundle(self) -> None:
+        """A verdict has to bind to something, so submission freezes what it binds to."""
+        run = self.dirty_task_over_every_shape()
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files=self.ALL_SHAPES)
+        body = self.body_of(report)
+
+        submitted = self.cli("submit", "demo", "T01")
+
+        self.assertIn("frozen task-round bundle sha256:", submitted.stdout)
+        manifest, where = self.frozen()
+        self.assertEqual("task-round", manifest["kind"])
+        self.assertEqual(1, manifest["round"])
+        self.assertEqual(manifest["digest"], parse_meta(report)["bundle_digest"])
+        # The contract revision under review, frozen with its own bytes.
+        task_bytes = (run / "T01-task.mdx").read_bytes()
+        self.assertEqual("T01-task.mdx", manifest["contract"]["source"])
+        self.assertEqual(sha(task_bytes), manifest["contract"]["revision"])
+        self.assertEqual(task_bytes, (where / manifest["contract"]["file"]).read_bytes())
+        # The immutable task baseline it was dispatched over.
+        snapshot = (run / ".snapshots" / "T01.json").read_bytes()
+        self.assertEqual("T01.json", manifest["baseline"]["snapshot"])
+        self.assertEqual(sha(snapshot), manifest["baseline"]["revision"])
+        # The report body as submitted.
+        self.assertEqual(sha(body.encode()), manifest["report"]["body_digest"])
+        self.assertEqual(body, (where / manifest["report"]["file"]).read_text())
+        # The verification as captured, not as claimed.
+        verification = manifest["verification"]
+        self.assertEqual("passed", verification["status"])
+        self.assertEqual(0, verification["returncode"])
+        self.assertEqual('printf "T01 ok\\n"', verification["command"])
+        self.assertEqual("T01 ok\n", (where / verification["stdout"]["file"]).read_text())
+        # The resulting source revision, pinned per declared root.
+        source = manifest["source"]["roots"][0]
+        self.assertEqual("root", source["alias"])
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), source["head"])
+        self.assertEqual(40, len(source["tree"]))
+        # And a root-qualified change list, never a bare one.
+        self.assertIn("root:src/renamed.py", manifest["changed_paths"])
+
+    def test_a_frozen_patch_carries_every_change_shape_against_the_task_baseline(self) -> None:
+        """The patch is baseline-relative, so the dirt the task inherited is not in it.
+
+        A patch taken against HEAD instead would show `allowed = 1` being replaced,
+        which is somebody else's uncommitted work, and would lose the untracked file
+        the task deleted entirely.
+        """
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+
+        patch = self.frozen_patch()
+        self.assertNotIn("allowed = 1", patch)
+        self.assertIn("rename from src/a.py", patch)
+        self.assertIn("rename to src/renamed.py", patch)
+        self.assertIn("+guard = 1", patch)
+        self.assertIn("+unstaged = 2", patch)
+        self.assertIn("+staged = 1", patch)
+        self.assertIn("deleted file mode 100644", patch)
+        self.assertIn("src/gone.py", patch)
+        self.assertIn("src/note.txt", patch)
+        self.assertIn("GIT binary patch", patch)
+        self.assertIn("new file mode 100755", patch)
+        self.assertIn("old mode 100644", patch)
+        self.assertIn("new mode 100755", patch)
+        self.assertIn("120000", patch)
+        self.assertIn("+renamed.py", patch)
+
+        # The whole patch is reconstructable: applying it to the rebuilt baseline
+        # yields exactly the source revision the bundle pinned.
+        manifest, _ = self.frozen()
+        record = manifest["patch"]["roots"][0]
+        objects = run / ".bundles" / "objects"
+        env = dict(os.environ)
+        env.update({
+            "GIT_DIR": str(self.root / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.root / ".git" / "objects"),
+        })
+        listed = subprocess.run(
+            ["git", "ls-tree", "-r", record["source_tree"]],
+            cwd=self.root, env=env, text=True, capture_output=True,
+        )
+        self.assertEqual(0, listed.returncode, listed.stderr)
+        self.assertIn("src/renamed.py", listed.stdout)
+        self.assertIn("120000", listed.stdout)
+        self.assertNotIn("src/note.txt", listed.stdout)
+
+    def test_a_project_that_gitignores_docket_still_freezes_its_rounds(self) -> None:
+        """Regression: excluding an already-ignored path made `git add` refuse outright.
+
+        Ignoring `.docket` is the normal thing for a project to do, and Docket's own
+        repository does it. Building the source tree with an exclude pathspec naming an
+        ignored path fails the whole invocation, which surfaced as unavailable patch
+        coverage on exactly the projects most likely to be using Docket.
+        """
+        self.repo()
+        (self.root / ".gitignore").write_text(".docket/\n__pycache__/\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignore docket state")
+        run = self.init(evidence_mode="git")
+        self.assign(file="src/a.py")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+
+        submitted = self.cli("submit", "demo", "T01")
+
+        self.assertIn("frozen task-round bundle sha256:", submitted.stdout)
+        self.assertNotIn("patch coverage unavailable", submitted.stdout)
+        manifest, _ = self.frozen()
+        self.assertEqual("available", manifest["patch"]["coverage"])
+        self.assertEqual(["root:src/a.py"], manifest["changed_paths"])
+        self.assertIn("+allowed = 2", self.frozen_patch())
+        # The run's own state never becomes part of the reviewed change surface.
+        self.assertNotIn(".docket", self.frozen_patch())
+
+    def test_a_correction_round_keeps_the_full_patch_and_a_reproducible_delta(self) -> None:
+        """Round two answers both questions: what changed overall, and what changed since."""
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+        first, _ = self.frozen()
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", self.REASON)
+
+        (self.root / "src" / "renamed.py").write_text("allowed = 3\nguard = 2\n")
+        self.fill_task_report(run / "T01-report-02.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+
+        second, where = self.frozen()
+        self.assertEqual(2, second["round"])
+        # The complete task-baseline-relative patch is still there.
+        full = self.frozen_patch()
+        self.assertIn("+guard = 2", full)
+        self.assertIn("GIT binary patch", full)
+        self.assertIn("src/note.txt", full)
+        # And so is a delta that reproduces only the correction.
+        self.assertEqual(first["digest"], second["delta"]["from"])
+        self.assertEqual(1, second["delta"]["from_round"])
+        record = second["delta"]["roots"][0]
+        delta = (where / record["file"]).read_text()
+        self.assertIn("-guard = 1", delta)
+        self.assertIn("+guard = 2", delta)
+        self.assertNotIn("GIT binary patch", delta)
+        self.assertNotIn("src/note.txt", delta)
+        # The delta is reproducible from the two pinned trees, not only from the file.
+        self.assertEqual(first["source"]["roots"][0]["tree"], record["from_tree"])
+        self.assertEqual(second["source"]["roots"][0]["tree"], record["to_tree"])
+
+    def test_later_edits_retries_and_rounds_never_rewrite_an_earlier_bundle(self) -> None:
+        """Regression: review evidence used to be whatever the workspace held later."""
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+        first, where = self.frozen()
+        preserved = {path.name: path.read_bytes() for path in where.iterdir() if path.is_file()}
+
+        # A later workspace edit, a later report edit, a retry, and a whole later round.
+        (self.root / "src" / "renamed.py").write_text("allowed = 3\nrewritten = 1\n")
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", self.REASON)
+        self.cli("decide", "demo", "T01", "--changes")
+        self.fill_task_report(run / "T01-report-02.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+
+        self.assertEqual(
+            preserved, {path.name: path.read_bytes() for path in where.iterdir() if path.is_file()}
+        )
+        again, _ = self.frozen("T01", index=0)
+        self.assertEqual(first, again)
+        self.assertEqual([1, 2], [entry["round"] for entry in self.ledger()])
+        self.assertNotEqual(self.ledger()[0]["digest"], self.ledger()[1]["digest"])
+        listing = self.cli("bundle", "demo", "T01", "--list").stdout
+        self.assertEqual(2, listing.count("intact"))
+
+    def test_a_verdict_refuses_a_bundle_that_is_stale_for_the_report_body(self) -> None:
+        """Regression: a first review used to bind to nothing, so an edit rode along.
+
+        Nothing had recorded an evidence digest yet when the first verdict was formed,
+        so a body edited between submission and approval inherited the approval of a
+        body nobody read.
+        """
+        run = self.dirty_task_over_every_shape()
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+        frozen_digest = self.frozen()[0]["digest"]
+
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Implemented the feature, verified it, and quietly widened the change.",
+        ))
+        stale = self.cli("decide", "demo", "T01", "--approve", ok=False)
+
+        self.assertEqual(1, stale.returncode)
+        self.assertIn("changed after review began", stale.stderr)
+        self.assertIn(frozen_digest, stale.stderr)
+        self.assertIn("--re-review", stale.stderr)
+        self.assertIn("status: submitted", report.read_text())
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+
+        applied = self.cli("decide", "demo", "T01", "--approve", "--re-review")
+
+        self.assertIn("froze the re-reviewed evidence as sha256:", applied.stdout)
+        settled = (run / "T01-decision-01.mdx").read_text()
+        rebound = self.frozen()[0]["digest"]
+        self.assertNotEqual(frozen_digest, rebound)
+        self.assertIn(f"bundle_digest: {rebound}", settled)
+        self.assertIn(f"superseded_bundle: {frozen_digest}", settled)
+        self.assertEqual("re-review", self.ledger()[-1]["trigger"])
+
+    def test_a_verdict_refuses_missing_or_damaged_bundle_evidence(self) -> None:
+        """Stale or absent evidence blocks approval; it never approves by default."""
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+        _, where = self.frozen()
+
+        patch = where / "root.patch"
+        kept = patch.read_bytes()
+        patch.write_bytes(b"not the patch that was reviewed\n")
+        damaged = self.cli("decide", "demo", "T01", "--approve", ok=False)
+        self.assertEqual(1, damaged.returncode)
+        self.assertIn("damaged frozen evidence", damaged.stderr)
+        self.assertIn("no longer matches its recorded artifact root.patch", damaged.stderr)
+        patch.write_bytes(kept)
+
+        (where / "bundle.json").unlink()
+        missing = self.cli("decide", "demo", "T01", "--approve", ok=False)
+        self.assertEqual(1, missing.returncode)
+        self.assertIn("is missing or unreadable", missing.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_an_interrupted_freeze_publishes_no_partial_bundle(self) -> None:
+        """A bundle directory arrives whole or not at all, and hands nothing off."""
+        run = self.dirty_task_over_every_shape()
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files=self.ALL_SHAPES)
+
+        crash = self.cli("submit", "demo", "T01", ok=False, fault="bundle:publish")
+
+        self.assertEqual(70, crash.returncode)
+        self.assertIn("status: draft", report.read_text())
+        self.assertEqual([], self.ledger())
+        self.assertFalse(any((run / ".bundles" / "T01").glob("*/*/bundle.json")))
+        absent = self.cli("bundle", "demo", "T01", ok=False)
+        self.assertEqual(1, absent.returncode)
+        self.assertIn("no frozen evidence bundle", absent.stderr)
+
+        self.cli("submit", "demo", "T01")
+
+        self.assertEqual(1, len(self.ledger()))
+        self.assertIn("intact", self.cli("bundle", "demo", "T01", "--list").stdout)
+        self.assertIn("status: submitted", report.read_text())
+
+    def test_a_green_result_is_never_frozen_against_a_checkout_it_did_not_describe(self) -> None:
+        """Regression: a verify run that edits the tree used to inherit its own result."""
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.cli(
+            "assign", "demo", "T01", "--executor", "orchestrator", "--harness", "claude",
+            "--file", "src", "--verify", "printf 'allowed = 9\\n' > src/a.py",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+
+        self.assertEqual(1, rejected.returncode)
+        self.assertIn("could not be frozen as review evidence", rejected.stderr)
+        self.assertIn("changed while the verification ran", rejected.stderr)
+        self.assertIn("status: draft", report.read_text())
+        self.assertEqual([], self.ledger())
+
+    def test_documents_only_bundles_record_unavailable_patch_coverage(self) -> None:
+        """A run without Git evidence still freezes a round, and still says so plainly."""
+        run = self.init(evidence_mode="documents-only")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        submitted = self.cli("submit", "demo", "T01")
+
+        self.assertIn("patch coverage unavailable", submitted.stdout)
+        self.assertIn("This is not an empty patch.", submitted.stdout)
+        manifest, where = self.frozen()
+        self.assertEqual("documents-only", manifest["evidence_mode"])
+        self.assertEqual("unavailable", manifest["patch"]["coverage"])
+        self.assertEqual("unavailable", manifest["source"]["coverage"])
+        self.assertIn("documents-only", manifest["patch"]["reason"])
+        self.assertEqual([], manifest["changed_paths"])
+        self.assertEqual([], list(where.glob("*.patch")))
+        shown = self.cli("bundle", "demo", "T01").stdout
+        self.assertIn("patch coverage unavailable", shown)
+        self.assertIn("This is not an empty patch.", shown)
+        # The round is still decidable, because documents-only runs stay usable.
+        self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("status: approved", (run / "T01-report-01.mdx").read_text())
+
+    def test_scope_stays_owned_through_verification_and_until_the_review_boundary(self) -> None:
+        """Accepted scope is not released when the work is handed to the reviewer."""
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign("T01", file="src/a.py")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        self.assertEqual(1, len(self.ledger()))
+
+        self.cli("assign", "demo", "T02", "--file", "src/a.py", "--verify", "true")
+        self.fill_scope(run / "T02-scope.mdx")
+        held = self.cli("scope", "demo", "T02", "--submit", ok=False)
+        self.assertEqual(1, held.returncode)
+        self.assertIn("overlaps T01", held.stderr)
+
+        self.cli("decide", "demo", "T01", "--approve")
+        released = self.cli("scope", "demo", "T02", "--submit")
+        self.assertIn("scope accepted", released.stdout)
+
+    def test_provisional_integration_needs_an_explicit_run_policy(self) -> None:
+        """Consuming unapproved work is a declared run choice, never a default."""
+        run = self.init("combined", evidence_mode="documents-only")
+        self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+
+        refused = self.cli("depend", "demo", "T02", "--on", "T01", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("provisional_integration: forbidden", refused.stderr)
+        self.assertFalse((run / ".deps" / "T02.json").exists())
+
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace(
+            "provisional_integration: forbidden", "provisional_integration: allowed"
+        ))
+        allowed = self.cli("depend", "demo", "T02", "--on", "T01")
+        self.assertIn("readiness, never approval", allowed.stdout)
+        recorded = json.loads((run / ".deps" / "T02.json").read_text())["dependencies"][0]
+        self.assertEqual("provisional", recorded["kind"])
+        self.assertEqual("submitted", recorded["state"])
+        self.assertEqual(self.frozen("T01")[0]["digest"], recorded["bundle"])
+
+        # Readiness is not approval: T01 stays submitted while T02 is approved.
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx")
+        self.cli("submit", "demo", "T02")
+        approved = self.cli("decide", "demo", "T02", "--approve")
+        self.assertIn("readiness, not an approval of T01", approved.stdout)
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_a_consumed_input_that_moves_invalidates_the_work_that_consumed_it(self) -> None:
+        """Provisional work is reverified when its input changes, not silently kept."""
+        run = self.init("combined", evidence_mode="documents-only")
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace(
+            "provisional_integration: forbidden", "provisional_integration: allowed"
+        ))
+        self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        self.cli("depend", "demo", "T02", "--on", "T01")
+        consumed = self.frozen("T01")[0]["digest"]
+
+        # T01 freezes different evidence under the same round.
+        report.write_text(report.read_text().replace("status: submitted", "status: draft").replace(
+            "Implemented the feature and verified its behavior.", "Reimplemented it differently.",
+        ))
+        self.cli("submit", "demo", "T01")
+        self.assertNotEqual(consumed, self.frozen("T01")[0]["digest"])
+
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx")
+        blocked = self.cli("submit", "demo", "T02", ok=False)
+        self.assertEqual(1, blocked.returncode)
+        self.assertIn("dependency T01 changed since T02 consumed it", blocked.stderr)
+        self.assertIn("status: draft", (run / "T02-report-01.mdx").read_text())
+        self.assertIn("stale: dependency T01 changed", self.cli("status", "demo").stdout)
+
+        self.cli("depend", "demo", "T02", "--on", "T01")
+        self.cli("submit", "demo", "T02")
+        self.assertIn("status: submitted", (run / "T02-report-01.mdx").read_text())
+
+    def allow_provisional(self, run: Path) -> None:
+        """Turn on the run policy that permits consuming verified-but-unapproved work."""
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace(
+            "provisional_integration: forbidden", "provisional_integration: allowed"
+        ))
+
+    def assign_with_verify(
+        self, owner: str, verify: str, file: str = "src/a.py",
+        executor: str = "orchestrator",
+    ) -> None:
+        """A task whose verification command is the thing under test."""
+        self.cli(
+            "assign", "demo", owner, "--complexity", "high", "--executor", executor,
+            "--harness", "claude", "--file", file, "--verify", verify,
+        )
+        if executor == "implementor":
+            run = self.root / ".docket" / "runs" / "demo"
+            self.fill_scope(run / f"{owner}-scope.mdx")
+            self.cli("scope", "demo", owner, "--submit")
+
+    def resolves(self, owner: str = "T01") -> None:
+        """The report's recorded bundle digest names exactly one intact ledger entry."""
+        run = self.root / ".docket" / "runs" / "demo"
+        recorded = parse_meta(run / f"{owner}-report-01.mdx")["bundle_digest"]
+        matching = [entry for entry in self.ledger(owner) if entry["digest"] == recorded]
+        self.assertEqual(1, len(matching), f"{recorded} does not resolve to one ledger entry")
+        manifest = json.loads(
+            (run / ".bundles" / owner / matching[0]["dir"] / "bundle.json").read_text()
+        )
+        self.assertEqual(recorded, manifest["digest"])
+
+    def test_a_frozen_bundle_keeps_the_baseline_evidence_it_depends_on(self) -> None:
+        """Regression: a bundle used to point at `.snapshots`, which anything may rewrite.
+
+        The manifest recorded the snapshot's name and digest but stored neither the
+        record nor the staged, worktree and untracked artifacts a reconstruction needs.
+        Deleting or rewriting the capture afterwards left `docket bundle` still calling
+        the round intact while nothing could rebuild the baseline it was measured from.
+        """
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+
+        manifest, where = self.frozen()
+        snapshots = run / ".snapshots"
+        # The baseline record and every reconstruction artifact are inside the bundle.
+        self.assertEqual(
+            (snapshots / "T01.json").read_bytes(), (where / manifest["baseline"]["file"]).read_bytes()
+        )
+        record = manifest["baseline"]["roots"][0]
+        for key in ("staged_patch", "worktree_patch", "untracked_manifest"):
+            frozen_copy = where / record[key]["file"]
+            self.assertEqual(
+                (snapshots / "T01" / Path(record[key]["file"]).name).read_bytes(),
+                frozen_copy.read_bytes(),
+            )
+            self.assertEqual(sha(frozen_copy.read_bytes()), record[key]["sha256"])
+
+        # Deleting the mutable capture cannot reach evidence that was already frozen.
+        shutil.rmtree(snapshots / "T01")
+        (snapshots / "T01.json").write_text('{"baseline": "recorded", "roots": []}\n')
+
+        self.assertIn("intact", self.cli("bundle", "demo", "T01", "--list").stdout)
+        self.assertEqual(manifest, self.frozen()[0])
+        self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("status: approved", (run / "T01-report-01.mdx").read_text())
+
+    def test_a_verdict_refuses_a_bundle_whose_pinned_git_objects_are_gone(self) -> None:
+        """Regression: tree identities were never checked, only artifact digests.
+
+        A bundle states its patch, delta and source against trees in the run-private
+        object store. Losing that store leaves the manifest hashing perfectly to itself
+        and the round unreconstructable, which used to read as intact evidence.
+        """
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES)
+        self.cli("submit", "demo", "T01")
+        self.assertIn("intact", self.cli("bundle", "demo", "T01", "--list").stdout)
+
+        shutil.rmtree(run / ".bundles" / "objects")
+
+        damaged = self.cli("bundle", "demo", "T01", ok=False)
+        self.assertEqual(1, damaged.returncode)
+        self.assertIn("DAMAGED", damaged.stderr)
+        self.assertIn("Git can no longer read", damaged.stderr)
+        self.assertIn("DAMAGED", self.cli("bundle", "demo", "T01", "--list").stdout)
+
+        refused = self.cli("decide", "demo", "T01", "--approve", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("damaged frozen evidence", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_concurrent_and_interrupted_submissions_publish_one_coherent_round(self) -> None:
+        """Regression: two submitters could race verification, the ledger, and the report.
+
+        Nothing serialized a submission, so both writers passed the gate, both froze a
+        round, and the last read-modify-write of `rounds.json` discarded the other
+        entry - leaving a published report pointing at a bundle the ledger no longer
+        retained.
+        """
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign_with_verify("T01", 'sleep 2; printf "T01 ok\\n"', executor="implementor")
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+
+        racing = [
+            subprocess.Popen(
+                [sys.executable, str(DOCKET), "submit", "demo", "T01"],
+                cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+        finished = [(process, *process.communicate()) for process in racing]
+
+        won = [item for item in finished if item[0].returncode == 0]
+        lost = [item for item in finished if item[0].returncode != 0]
+        self.assertEqual(1, len(won), f"both submitters succeeded: {finished}")
+        self.assertIn("reports stay draft until submit", lost[0][2])
+        self.assertEqual(1, len(self.ledger()))
+        self.assertEqual(1, self.cli("bundle", "demo", "T01", "--list").stdout.count("intact"))
+        self.resolves()
+
+        # An interruption between the freeze and the ledger append leaves neither a
+        # visible submission nor an entry, and the retry still resolves exactly.
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", self.REASON)
+        (self.root / "src" / "a.py").write_text("allowed = 3\n")
+        second = run / "T01-report-02.mdx"
+        self.fill_task_report(second)
+
+        crash = self.cli("submit", "demo", "T01", ok=False, fault="publish:rounds.json")
+
+        self.assertEqual(70, crash.returncode)
+        self.assertIn("status: draft", second.read_text())
+        self.assertEqual([1], [entry["round"] for entry in self.ledger()])
+
+        self.cli("submit", "demo", "T01")
+
+        self.assertEqual([1, 2], [entry["round"] for entry in self.ledger()])
+        recorded = parse_meta(second)["bundle_digest"]
+        self.assertEqual(self.ledger()[-1]["digest"], recorded)
+        self.assertEqual(2, self.cli("bundle", "demo", "T01", "--list").stdout.count("intact"))
+
+    def test_a_task_contract_edited_during_verification_is_never_frozen(self) -> None:
+        """Regression: the freeze re-read the task after the verification had finished.
+
+        The gate checked one contract, the command ran against it, and whatever the
+        file held afterwards was frozen as the revision under review.
+        """
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign_with_verify(
+            "T01", "printf 'Amended mid-run.\\n' >> .docket/runs/demo/T01-task.mdx"
+        )
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+
+        self.assertEqual(1, rejected.returncode)
+        self.assertIn("the task contract changed while the verification ran", rejected.stderr)
+        self.assertIn("status: draft", report.read_text())
+        self.assertEqual([], self.ledger())
+        # The concurrent edit is left exactly as its writer left it.
+        self.assertIn("Amended mid-run.", (run / "T01-task.mdx").read_text())
+
+    def test_a_report_edited_during_verification_is_never_overwritten(self) -> None:
+        """Regression: the report was republished from the body read before the run."""
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.assign_with_verify(
+            "T01",
+            "printf 'Added by a concurrent writer.\\n' >> .docket/runs/demo/T01-report-01.mdx",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+
+        rejected = self.cli("submit", "demo", "T01", ok=False)
+
+        self.assertEqual(1, rejected.returncode)
+        self.assertIn("the report changed while the verification ran", rejected.stderr)
+        self.assertIn("the concurrent edit was left in place", rejected.stderr)
+        self.assertIn("Added by a concurrent writer.", report.read_text())
+        self.assertIn("status: draft", report.read_text())
+        self.assertEqual([], self.ledger())
+
+    def test_a_dependency_that_moves_during_verification_stops_the_submission(self) -> None:
+        """Regression: consumed inputs were checked before the run and never again."""
+        run = self.init("combined", evidence_mode="documents-only")
+        self.allow_provisional(run)
+        self.assign("T01", file="src/a.py")
+        self.assign_with_verify(
+            "T02", f"{sys.executable} {DOCKET} submit demo T01", file="src/b.py"
+        )
+        self.fill_task(run / "T01-task.mdx")
+        first = run / "T01-report-01.mdx"
+        self.fill_task_report(first)
+        self.cli("submit", "demo", "T01")
+        self.cli("depend", "demo", "T02", "--on", "T01")
+        consumed = self.frozen("T01")[0]["digest"]
+
+        # T02's verification is what moves T01: it resubmits a differently worded round.
+        first.write_text(first.read_text().replace("status: submitted", "status: draft").replace(
+            "Implemented the feature and verified its behavior.", "Reimplemented it differently.",
+        ))
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx")
+
+        rejected = self.cli("submit", "demo", "T02", ok=False)
+
+        self.assertEqual(1, rejected.returncode)
+        self.assertIn("a consumed input moved while the verification ran", rejected.stderr)
+        self.assertIn("dependency T01 changed since T02 consumed it", rejected.stderr)
+        self.assertNotEqual(consumed, self.frozen("T01")[0]["digest"])
+        self.assertIn("status: draft", (run / "T02-report-01.mdx").read_text())
+        self.assertEqual([], self.ledger("T02"))
+
+    def test_provisional_integration_refuses_evidence_without_a_passed_verification(self) -> None:
+        """Regression: any frozen bundle was consumable once the policy said allowed.
+
+        The policy permits consuming verified-but-unapproved work. Blocked and skipped
+        rounds carry no usable verification result at all.
+        """
+        run = self.init("combined", evidence_mode="documents-only")
+        self.allow_provisional(run)
+        for owner, file in (("T01", "src/a.py"), ("T02", "src/b.py"), ("T03", "src/c.py")):
+            self.assign(owner, file=file)
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx", blocked=True)
+        self.cli("submit", "demo", "T01", "--blocked")
+
+        blocked = self.cli("depend", "demo", "T03", "--on", "T01", ok=False)
+        self.assertEqual(1, blocked.returncode)
+        self.assertIn("submitted blocked, so no verification was run", blocked.stderr)
+        self.assertIn("not usable work", blocked.stderr)
+        self.assertFalse((run / ".deps" / "T03.json").exists())
+
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx")
+        self.cli("submit", "demo", "T02", "--skip-verify", "--skip-verify-reason", "provider outage")
+
+        skipped = self.cli("depend", "demo", "T03", "--on", "T02", ok=False)
+        self.assertEqual(1, skipped.returncode)
+        self.assertIn("its frozen verification was skipped", skipped.stderr)
+        self.assertFalse((run / ".deps" / "T03.json").exists())
+
+    def test_provisional_integration_refuses_stale_and_patchless_evidence(self) -> None:
+        """A consumed bundle must still describe its task, and must carry its patch."""
+        self.repo()
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init("combined", evidence_mode="git", roots=("root=.", "wt=wt"))
+        self.allow_provisional(run)
+        self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files="- `root:src/a.py:1` - implemented the feature.")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.cli("submit", "demo", "T01")
+
+        # The report moved on after the freeze, so the bundle no longer describes T01.
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.", "Quietly widened the change.",
+        ))
+        stale = self.cli("depend", "demo", "T03", "--on", "T01", ok=False)
+        self.assertEqual(1, stale.returncode)
+        self.assertIn("edited its report after freezing", stale.stderr)
+        self.assertIn("stale evidence", stale.stderr)
+
+        # A blocked round whose declared root has gone froze no patch at all.
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx", blocked=True)
+        self.git("worktree", "remove", "--force", "wt")
+        self.cli("submit", "demo", "T02", "--blocked")
+        self.assertEqual("unavailable", self.frozen("T02")[0]["patch"]["coverage"])
+
+        patchless = self.cli("depend", "demo", "T03", "--on", "T02", ok=False)
+        self.assertEqual(1, patchless.returncode)
+        self.assertIn("froze no root-qualified patch", patchless.stderr)
+        self.assertIn("This is not an empty patch", patchless.stderr)
+        self.assertFalse((run / ".deps" / "T03.json").exists())
+
+    def test_a_moved_input_withdraws_review_readiness_until_it_is_reverified(self) -> None:
+        """Regression: only approval was blocked, so a waiver settled moved evidence.
+
+        Dependency readiness is never final approval, and it does not survive the input
+        moving: an accepting verdict needs fresh verification and a fresh review.
+        """
+        run = self.init("combined", evidence_mode="documents-only")
+        self.allow_provisional(run)
+        for owner, file in (("T01", "src/a.py"), ("T02", "src/b.py"), ("T03", "src/c.py")):
+            self.assign(owner, file=file)
+        self.fill_task(run / "T01-task.mdx")
+        first = run / "T01-report-01.mdx"
+        self.fill_task_report(first)
+        self.cli("submit", "demo", "T01")
+        for owner in ("T02", "T03"):
+            self.cli("depend", "demo", owner, "--on", "T01")
+            self.fill_task(run / f"{owner}-task.mdx")
+        self.fill_task_report(run / "T02-report-01.mdx", blocked=True)
+        self.cli("submit", "demo", "T02", "--blocked")
+        self.fill_task_report(run / "T03-report-01.mdx")
+        self.cli("submit", "demo", "T03")
+
+        # T01 freezes different evidence after both consumers submitted.
+        first.write_text(first.read_text().replace("status: submitted", "status: draft").replace(
+            "Implemented the feature and verified its behavior.", "Reimplemented it differently.",
+        ))
+        self.cli("submit", "demo", "T01")
+
+        approval = self.cli("decide", "demo", "T03", "--approve", ok=False)
+        self.assertEqual(1, approval.returncode)
+        self.assertIn("T03 cannot be approved against consumed evidence that moved", approval.stderr)
+        waiver = self.cli("decide", "demo", "T02", "--waive", "--reason", "external", ok=False)
+        self.assertEqual(1, waiver.returncode)
+        self.assertIn("T02 cannot be waived against consumed evidence that moved", waiver.stderr)
+        for owner in ("T02", "T03"):
+            self.assertFalse((run / f"{owner}-decision-01.mdx").exists())
+        status = self.cli("status", "demo").stdout
+        self.assertIn("review readiness withdrawn for T02, T03", status)
+
+        # Readiness comes back through a fresh round, never through re-recording the pin
+        # under the submitted one: that would swap the inputs without reverifying anything.
+        refused = self.cli("depend", "demo", "T03", "--on", "T01", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("T03 is submitted", refused.stderr)
+        self.assertIn("docket decide demo T03 --changes", refused.stderr)
+
+    def reseal(self, owner: str, mutate: object, index: int = -1) -> dict:
+        """Rewrite a frozen manifest and re-address it the way the CLI does.
+
+        A forger who edits a bundle also fixes up its address and its ledger entry, so
+        the self-address check alone proves nothing about the fields inside. This is how
+        the suite reaches the checks that come after it.
+        """
+        run = self.root / ".docket" / "runs" / "demo"
+        entry = self.ledger(owner)[index]
+        where = run / ".bundles" / owner / entry["dir"]
+        manifest = json.loads((where / "bundle.json").read_text())
+        mutate(manifest)
+        payload = {key: value for key, value in manifest.items() if key != "digest"}
+        manifest["digest"] = sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+        (where / "bundle.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        ledger_path = run / ".bundles" / owner / "rounds.json"
+        ledger = json.loads(ledger_path.read_text())
+        ledger["entries"][index]["digest"] = manifest["digest"]
+        ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+        return manifest
+
+    def consuming_pair(self) -> Path:
+        """T01 submitted and frozen, T02 recording it as a provisional input."""
+        run = self.init("combined", evidence_mode="documents-only")
+        self.allow_provisional(run)
+        self.assign("T01", file="src/a.py")
+        self.assign("T02", file="src/b.py")
+        for owner in ("T01", "T02"):
+            self.fill_task(run / f"{owner}-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        self.cli("depend", "demo", "T02", "--on", "T01")
+        return run
+
+    def test_a_bundle_freezes_the_consumed_input_record_it_was_verified_against(self) -> None:
+        """Regression: the manifest said nothing about the inputs the round consumed.
+
+        `submission_identity` checked `.deps/<owner>.json` around the verification, but
+        the freeze kept no copy, so nothing downstream could tell which inputs a captured
+        result had actually described.
+        """
+        run = self.consuming_pair()
+        self.fill_task_report(run / "T02-report-01.mdx")
+        self.cli("submit", "demo", "T02")
+
+        live = (run / ".deps" / "T02.json").read_bytes()
+        manifest, where = self.frozen("T02")
+        block = manifest["dependencies"]
+        self.assertEqual(".deps/T02.json", block["source"])
+        self.assertEqual(sha(live), block["revision"])
+        self.assertEqual(live, (where / block["file"]).read_bytes())
+        self.assertEqual(
+            [{"on": "T01", "kind": "provisional", "round": "1",
+              "bundle": self.frozen("T01")[0]["digest"]}],
+            block["consumed"],
+        )
+
+        # A task that consumes nothing freezes the explicit empty set, not an absent
+        # artifact that cannot be told apart from one that was lost.
+        empty, where = self.frozen("T01")
+        self.assertEqual([], empty["dependencies"]["consumed"])
+        self.assertEqual(
+            {"owner": "T01", "dependencies": []},
+            json.loads((where / empty["dependencies"]["file"]).read_text()),
+        )
+        self.assertEqual(
+            sha((where / empty["dependencies"]["file"]).read_bytes()),
+            empty["dependencies"]["revision"],
+        )
+
+        # The record is checked like any other part of the evidence, past the address.
+        self.reseal("T02", lambda m: m.pop("dependencies"))
+        damaged = self.cli("bundle", "demo", "T02", ok=False)
+        self.assertEqual(1, damaged.returncode)
+        self.assertIn("froze no consumed-input record", damaged.stderr)
+        self.assertIn("DAMAGED", self.cli("bundle", "demo", "T02", "--list").stdout)
+
+    def test_a_refreshed_pin_cannot_approve_a_round_verified_against_the_old_input(self) -> None:
+        """Regression: re-recording a moved input silenced the staleness and approved it.
+
+        `dependency_problems` compared the live record against the input's newest bundle,
+        so `docket depend` alone restored review readiness with no second verification.
+        The verdict now binds to the record frozen into the round, and the refresh itself
+        is refused while the consumer is submitted.
+        """
+        run = self.init("combined", evidence_mode="documents-only")
+        self.allow_provisional(run)
+        counter = self.root / "verify.log"
+        self.assign("T01", file="src/a.py")
+        self.assign_with_verify(
+            "T03", f'printf x >> "{counter}"', file="src/c.py", executor="implementor",
+        )
+        for owner in ("T01", "T03"):
+            self.fill_task(run / f"{owner}-task.mdx")
+        first = run / "T01-report-01.mdx"
+        self.fill_task_report(first)
+        self.cli("submit", "demo", "T01")
+        self.cli("depend", "demo", "T03", "--on", "T01")
+        consumed = self.frozen("T01")[0]["digest"]
+        self.fill_task_report(run / "T03-report-01.mdx", files="- `src/c.py:1` - built on T01.")
+        self.cli("submit", "demo", "T03")
+        self.assertEqual("x", counter.read_text())
+        pinned = (run / ".deps" / "T03.json").read_bytes()
+        stale_bundle = self.ledger("T03")[0]
+
+        # T01 freezes different evidence after T03 was verified against the old bundle.
+        first.write_text(first.read_text().replace("status: submitted", "status: draft").replace(
+            "Implemented the feature and verified its behavior.", "Reimplemented it differently.",
+        ))
+        self.cli("submit", "demo", "T01")
+        moved = self.frozen("T01")[0]["digest"]
+        self.assertNotEqual(consumed, moved)
+
+        # Layer one: the refresh is refused outright, and nothing on disk moves.
+        refused = self.cli("depend", "demo", "T03", "--on", "T01", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("T03 is submitted", refused.stderr)
+        self.assertIn(f"Round 1 stays frozen at {stale_bundle['digest']}", refused.stderr)
+        self.assertEqual(pinned, (run / ".deps" / "T03.json").read_bytes())
+        self.assertEqual([stale_bundle], self.ledger("T03"))
+        self.assertIn("intact", self.cli("bundle", "demo", "T03", "--list").stdout)
+
+        # Dropping the record entirely is the same kind of move, and stays visible even
+        # though there is no live consumption left to list.
+        record = run / ".deps" / "T03.json"
+        record.write_text(json.dumps({"owner": "T03", "dependencies": []}, indent=2) + "\n")
+        dropped = self.cli("decide", "demo", "T03", "--approve", ok=False)
+        self.assertEqual(1, dropped.returncode)
+        self.assertIn(f"T03 no longer records consuming T01 at {consumed}", dropped.stderr)
+        self.assertIn("review readiness withdrawn for T03", self.cli("status", "demo").stdout)
+
+        # Layer two: the record moves anyway, and the verdict still refuses it because
+        # the round was frozen against the pin it no longer holds.
+        (run / ".deps" / "T03.json").write_text(
+            json.dumps({"owner": "T03", "dependencies": [{
+                "on": "T01", "kind": "provisional", "state": "submitted",
+                "round": "1", "bundle": moved, "recorded_at": "2026-01-01T00:00:00Z",
+            }]}, indent=2, sort_keys=True) + "\n"
+        )
+        approval = self.cli("decide", "demo", "T03", "--approve", ok=False)
+        self.assertEqual(1, approval.returncode)
+        self.assertIn("T03 cannot be approved against consumed evidence that moved", approval.stderr)
+        self.assertIn("re-recording a pin is not a reverification", approval.stderr)
+        self.assertFalse((run / "T03-decision-01.mdx").exists())
+        self.assertIn("review readiness withdrawn for T03", self.cli("status", "demo").stdout)
+        self.assertEqual("x", counter.read_text())
+
+        # Recovery: a changes-requested round, then the refresh, then a real reverification.
+        self.cli("decide", "demo", "T03", "--changes")
+        decision = run / "T03-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Reverify `src/c.py:1` against the new T01 evidence.",
+        ))
+        self.cli("decide", "demo", "T03", "--changes", "--reason", "The input moved.")
+        self.cli("depend", "demo", "T03", "--on", "T01")
+        self.fill_task_report(run / "T03-report-02.mdx", files="- `src/c.py:1` - rebuilt on T01.")
+        self.cli("submit", "demo", "T03")
+        self.assertEqual("xx", counter.read_text(), "the correction round reran the verification")
+        self.assertEqual(
+            sha((run / ".deps" / "T03.json").read_bytes()),
+            self.frozen("T03")[0]["dependencies"]["revision"],
+        )
+        self.cli("decide", "demo", "T03", "--approve")
+        self.assertIn("status: approved", (run / "T03-report-02.mdx").read_text())
+        # The superseded round keeps its own address and its own bytes.
+        self.assertEqual(stale_bundle, self.ledger("T03")[0])
+
+    def test_a_decided_consumer_stays_visibly_stale_rather_than_quietly_refreshed(self) -> None:
+        """An approved round is not reopened by re-recording its input from the side."""
+        run = self.consuming_pair()
+        self.fill_task_report(run / "T02-report-01.mdx")
+        self.cli("submit", "demo", "T02")
+        self.cli("decide", "demo", "T02", "--approve")
+        approved = self.ledger("T02")
+        pinned = (run / ".deps" / "T02.json").read_bytes()
+
+        first = run / "T01-report-01.mdx"
+        first.write_text(first.read_text().replace("status: submitted", "status: draft").replace(
+            "Implemented the feature and verified its behavior.", "Reimplemented it differently.",
+        ))
+        self.cli("submit", "demo", "T01")
+
+        refused = self.cli("depend", "demo", "T02", "--on", "T01", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("T02 is approved", refused.stderr)
+        self.assertIn("audited work this build does not do", refused.stderr)
+        self.assertEqual(pinned, (run / ".deps" / "T02.json").read_bytes())
+        self.assertEqual(approved, self.ledger("T02"))
+        self.assertIn("status: approved", (run / "T02-report-01.mdx").read_text())
+
+        status = self.cli("status", "demo").stdout
+        self.assertIn("stale: dependency T01 changed since T02 consumed it", status)
+        self.assertIn("review readiness withdrawn for T02", status)
+
+    def test_a_baseline_artifact_that_disappears_fails_the_freeze(self) -> None:
+        """Regression: a lost reconstruction artifact was recorded as `unavailable`.
+
+        A blocked round freezes without requiring a patch, so a capture deleted between
+        reconstructing the trees and copying them left a placeholder inside a bundle that
+        `docket bundle` still called intact.
+        """
+        run = self.dirty_task_over_every_shape()
+        self.fill_task_report(run / "T01-report-01.mdx", files=self.ALL_SHAPES, blocked=True)
+        lost = run / ".snapshots" / "T01" / "root.worktree.patch"
+        self.assertTrue(lost.is_file())
+        lost.unlink()
+
+        refused = self.cli("submit", "demo", "T01", "--blocked", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("root.worktree.patch", refused.stderr)
+        self.assertIn("could not be read while the round was being frozen", refused.stderr)
+        self.assertIn("Nothing was handed off", refused.stderr)
+        self.assertEqual([], self.ledger("T01"))
+        self.assertIn("status: draft", (run / "T01-report-01.mdx").read_text())
+
+    def test_the_contract_and_inputs_frozen_are_the_ones_the_verification_described(self) -> None:
+        """Regression: the freeze re-read the task after the drift recheck had passed.
+
+        Between the recheck and the freeze a writer could still land, and the bundle then
+        carried a contract and a consumed-input record the captured result never saw. Both
+        are captured before the verification runs and handed to the freeze.
+        """
+        run = self.consuming_pair()
+        task = run / "T02-task.mdx"
+        self.fill_task_report(run / "T02-report-01.mdx")
+        verified_contract = task.read_bytes()
+        verified_record = (run / ".deps" / "T02.json").read_bytes()
+
+        # A writer lands in the window between the drift recheck and the freeze.
+        deps = run / ".deps" / "T02.json"
+        self.cli("submit", "demo", "T02", perturb="\n".join([
+            'submit:before-freeze=printf "late contract edit\\n" >> "%s"' % task,
+            'submit:before-freeze=printf \'{"owner": "T02", "dependencies": []}\' > "%s"' % deps,
+        ]))
+
+        manifest, where = self.frozen("T02")
+        self.assertEqual(verified_contract, (where / manifest["contract"]["file"]).read_bytes())
+        self.assertEqual(sha(verified_contract), manifest["contract"]["revision"])
+        self.assertEqual(verified_record, (where / manifest["dependencies"]["file"]).read_bytes())
+        self.assertEqual(sha(verified_record), manifest["dependencies"]["revision"])
+        self.assertEqual("T01", manifest["dependencies"]["consumed"][0]["on"])
+        # The perturbation really landed; it just never reached the frozen evidence.
+        self.assertIn("late contract edit", task.read_text())
+        self.assertEqual([], json.loads(deps.read_text())["dependencies"])
+
+    def test_a_multi_root_task_bundle_freezes_every_root_it_measured(self) -> None:
+        """Two checkouts are two change surfaces, and both belong in one frozen round."""
+        self.repo()
+        linked = self.root / "wt"
+        self.git("worktree", "add", "-q", "-b", "feature", "wt")
+        run = self.init(evidence_mode="git", roots=("root=.", "wt=wt"))
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor", "orchestrator",
+            "--harness", "claude", "--file", "src/a.py", "--file", "wt:src/a.py",
+            "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_task(run / "T01-task.mdx")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        (linked / "src" / "a.py").write_text("allowed = 3\n")
+        self.fill_task_report(
+            run / "T01-report-01.mdx",
+            files="- `root:src/a.py:1` - outer checkout.\n- `wt:src/a.py:1` - linked worktree.",
+        )
+
+        self.cli("submit", "demo", "T01")
+
+        manifest, where = self.frozen()
+        self.assertEqual(["root", "wt"], sorted(r["alias"] for r in manifest["patch"]["roots"]))
+        self.assertEqual(["root", "wt"], sorted(r["alias"] for r in manifest["baseline"]["roots"]))
+        self.assertEqual(["root", "wt"], sorted(r["alias"] for r in manifest["source"]["roots"]))
+        self.assertEqual(
+            ["root:src/a.py", "wt:src/a.py"], sorted(manifest["changed_paths"])
+        )
+        wanted = {"root": "+allowed = 2", "wt": "+allowed = 3"}
+        for record in manifest["patch"]["roots"]:
+            self.assertIn(wanted[record["alias"]], (where / record["file"]).read_text())
+        # Every root's baseline evidence is frozen, and every pinned tree still resolves.
+        for record in manifest["baseline"]["roots"]:
+            for key in ("staged_patch", "worktree_patch", "untracked_manifest"):
+                self.assertTrue((where / record[key]["file"]).is_file())
+        self.assertIn("intact", self.cli("bundle", "demo", "T01", "--list").stdout)
+
+    # ------------------------------------------------------ aggregate bundles
+
+    def setup_aggregate_run(self, evidence_mode: str = "git") -> Path:
+        """A run with two decided tasks, ready for aggregate submission."""
+        if evidence_mode == "git":
+            self.repo()
+            (self.root / "src" / "b.py").write_text("b = 1\n")
+            self.git("add", "src/b.py")
+            self.git("commit", "-qm", "add b")
+        self.init("split", evidence_mode=evidence_mode)
+        run = self.root / ".docket" / "runs" / "demo"
+        # Serialize through one checkout: assign, edit, and submit T01 before
+        # assigning T02, so T02's baseline already contains T01's worktree
+        # change. Assigning both upfront would leave T01's edit outside T02's
+        # scope and the scope gate would correctly reject T02's submission.
+        for owner, fname in (("T01", "a.py"), ("T02", "b.py")):
+            if evidence_mode == "git":
+                self.assign(owner, file=f"src/{fname}")
+            else:
+                self.cli(
+                    "assign", "demo", owner, "--complexity", "high", "--executor", "implementor",
+                    "--harness", "opencode", "--file", f"src/{fname}",
+                    "--verify", f'printf "{owner} ok\\n"',
+                )
+                self.fill_scope(run / f"{owner}-scope.mdx")
+                self.cli("scope", "demo", owner, "--submit")
+            task = run / f"{owner}-task.mdx"
+            if task.is_file():
+                self.fill_task(task)
+            self.fill_task_report(run / f"{owner}-report-01.mdx",
+                                  files=f"- `src/{fname}:1` - implemented {owner}.")
+            if evidence_mode == "git":
+                (self.root / "src" / fname).write_text(f"changed for {owner}\n")
+            self.cli("submit", "demo", owner)
+            self.cli("decide", "demo", owner, "--approve")
+        return run
+
+    def aggregate(self, index: int = -1) -> tuple[dict, Path]:
+        return self.frozen("orch", index)
+
+    def setup_overlapping_aggregate_run(self) -> Path:
+        """Two decided tasks sharing one path, over pre-baseline dirt, with every patch shape.
+
+        The run baseline is captured over pre-existing user dirt that no task
+        touches, so the aggregate must not attribute it to the run. T01 and T02
+        then change `src/shared.py` in sequence: T02 is assigned only after T01
+        is approved releases the scope, per the plan's explicit serialization
+        for writers sharing one checkout. The aggregate patch must therefore
+        carry the composed run-baseline-to-final change for that path, not two
+        stacked task hunks. The remaining edits mirror the T42 shape catalogue
+        in `dirty_task_over_every_shape` (committed, staged, unstaged,
+        untracked, deleted, renamed, executable-mode, symlink, binary) because
+        the aggregate freeze renders its patch with the same
+        `baseline_tree`/`source_tree`/`tree_patch` routine the task-round
+        freeze uses, measured from the run baseline instead of a task baseline.
+        """
+        self.repo()
+        (self.root / "src" / "shared.py").write_text("shared = 1\n")
+        (self.root / "src" / "blob.bin").write_bytes(bytes(range(256)))
+        for name in ("gone.py", "mode.py"):
+            (self.root / "src" / name).write_text(f"{name.split('.')[0]} = 1\n")
+        # Enough shared lines that rename detection still pairs old.py with
+        # new.py after the one-line edit below (git needs 50 percent similarity).
+        (self.root / "src" / "old.py").write_text("old = 1\nguard = 0\nkeep = 1\n")
+        (self.root / "src" / "pre.py").write_text("pre = 1\n")
+        (self.root / "src" / "stage.py").write_text("stage = 1\n")
+        self.git("add", "src")
+        self.git("commit", "-qm", "more tracked content")
+
+        # Initial dirt: somebody else's uncommitted work, dirty before the run
+        # baseline is taken. A tracked worktree edit, a staged edit, and an
+        # untracked file, none of which any task will touch.
+        (self.root / "src" / "pre.py").write_text("pre = 999\n")
+        (self.root / "src" / "stage.py").write_text("stage = 999\n")
+        self.git("add", "src/stage.py")
+        (self.root / "src" / "predirt.txt").write_text("pre-existing untracked\n")
+
+        run = self.init("split", evidence_mode="git")
+
+        # T01 takes the first pass over the shared path, plus a staged rename,
+        # a deletion, a mode change, a new executable, and a new symlink.
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src", "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task(run / "T01-task.mdx")
+        (self.root / "src" / "shared.py").write_text("shared = 2\n")
+        self.git("mv", "src/old.py", "src/new.py")
+        (self.root / "src" / "new.py").write_text("old = 1\nguard = 1\nkeep = 1\n")
+        (self.root / "src" / "gone.py").unlink()
+        (self.root / "src" / "mode.py").chmod(0o755)
+        tool = self.root / "src" / "tool.sh"
+        tool.write_text("#!/bin/sh\necho hi\n")
+        tool.chmod(0o755)
+        (self.root / "src" / "link").symlink_to("new.py")
+        self.fill_task_report(
+            run / "T01-report-01.mdx",
+            files="- `src/shared.py` `src/old.py` `src/new.py` `src/gone.py` "
+            "`src/mode.py` `src/tool.sh` `src/link` - first pass over the shared path.",
+        )
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--approve")
+
+        # T02 is assigned after the approval released the scope, changes the
+        # shared path again, and adds binary, staged, and unstaged shapes,
+        # committing midway so committed-during-the-task work is included too.
+        self.cli(
+            "assign", "demo", "T02", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src", "--verify", 'printf "T02 ok\\n"',
+        )
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.fill_task(run / "T02-task.mdx")
+        (self.root / "src" / "shared.py").write_text("shared = 3\n")
+        self.git("add", "src/shared.py")
+        # Commit only this task's own path: the staged rename and staged dirt
+        # inherited at assignment stay staged, so the gate does not attribute
+        # committing somebody else's staged state to this task.
+        self.git("commit", "-qm", "committed during T02", "--", "src/shared.py")
+        (self.root / "src" / "blob.bin").write_bytes(bytes(range(256)) * 4)
+        (self.root / "src" / "new.bin").write_bytes(bytes(range(256)) * 2)
+        (self.root / "src" / "staged.py").write_text("staged = 1\n")
+        self.git("add", "src/staged.py")
+        (self.root / "src" / "unstaged.py").write_text("unstaged = 2\n")
+        self.fill_task_report(
+            run / "T02-report-01.mdx",
+            files="- `src/shared.py` `src/blob.bin` `src/new.bin` `src/staged.py` "
+            "`src/unstaged.py` - second pass over the shared path.",
+        )
+        self.cli("submit", "demo", "T02")
+        self.cli("decide", "demo", "T02", "--approve")
+        return run
+
+    def test_an_aggregate_submission_freezes_an_aggregate_bundle(self) -> None:
+        """The orch submission freezes its own immutable bundle with constituent pins."""
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        manifest, where = self.aggregate()
+        self.assertEqual("aggregate", manifest["kind"])
+        self.assertEqual("orch", manifest["owner"])
+        self.assertEqual(1, manifest["round"])
+        self.assertIn("constituents", manifest)
+        self.assertEqual(2, len(manifest["constituents"]))
+        for item in manifest["constituents"]:
+            self.assertIn(item["owner"], ("T01", "T02"))
+            self.assertTrue(item["bundle"].startswith("sha256:"))
+        self.assertEqual(
+            "orch-report-01.mdx", manifest["report"]["source"]
+        )
+        self.assertIn("intact", self.cli("bundle", "demo", "orch", "--list").stdout)
+        self.assertEqual("plan.mdx", manifest["contract"]["source"])
+        self.assertEqual(
+            (run / "plan.mdx").read_bytes(),
+            (where / manifest["contract"]["file"]).read_bytes(),
+        )
+        # The aggregate pins the run baseline, provably not any task baseline:
+        # the frozen revision is the digest of run.json, and no task snapshot
+        # digests to it. The reconstruction artifacts travel with the bundle.
+        self.assertEqual("run.json", manifest["baseline"]["snapshot"])
+        run_snapshot = (run / ".snapshots" / "run.json").read_bytes()
+        self.assertEqual(sha(run_snapshot), manifest["baseline"]["revision"])
+        self.assertEqual(
+            run_snapshot, (where / manifest["baseline"]["file"]).read_bytes()
+        )
+        for owner in ("T01", "T02"):
+            task_snapshot = (run / ".snapshots" / f"{owner}.json").read_bytes()
+            self.assertNotEqual(sha(task_snapshot), manifest["baseline"]["revision"])
+        for record in manifest["baseline"]["roots"]:
+            for key in ("staged_patch", "worktree_patch", "untracked_manifest"):
+                self.assertTrue((where / record[key]["file"]).is_file())
+        # The integrated source revision is recorded.
+        self.assertEqual("available", manifest["source"]["coverage"])
+        source = manifest["source"]["roots"][0]
+        self.assertEqual("root", source["alias"])
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), source["head"])
+        self.assertEqual(40, len(source["tree"]))
+        # The captured verification. An orch report structurally has no verify
+        # command (there is no orch-task.mdx, so task_verify returns ""), hence
+        # the recorded status is none with an empty command and --skip-verify
+        # is vacuous rather than a skipped run of a real command.
+        self.assertEqual("none", manifest["verification"]["status"])
+        self.assertEqual("", manifest["verification"]["command"])
+
+    def test_aggregate_patch_is_from_the_run_baseline(self) -> None:
+        """The aggregate patch is composed from the run baseline, not concatenated tasks."""
+        run = self.setup_overlapping_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        result = self.cli("submit", "demo", "orch", "--skip-verify")
+
+        manifest, where = self.aggregate()
+        self.assertEqual("available", manifest["patch"]["coverage"])
+        # Overlapping scopes compose into one net change per path. The
+        # intermediate value is real task evidence: T01's own frozen patch
+        # carries `shared = 2`. A concatenation of the two task patches would
+        # repeat that intermediate value as both an addition and a removal.
+        t01_patch = self.frozen_patch("T01")
+        self.assertIn("+shared = 2", t01_patch)
+        patch = "\n".join(
+            (where / record["file"]).read_text(errors="replace")
+            for record in manifest["patch"]["roots"]
+        )
+        self.assertIn("-shared = 1", patch)
+        self.assertIn("+shared = 3", patch)
+        self.assertNotIn("shared = 2", patch)
+        section = [part for part in patch.split("diff --git") if "src/shared.py" in part]
+        self.assertEqual(1, len(section))
+        self.assertEqual(
+            1, sum(1 for line in section[0].splitlines() if line.startswith("@@"))
+        )
+        # Initial dirt is nobody's work: it predates the run baseline, so none
+        # of its paths or values may appear in the aggregate change surface.
+        for dirt in ("root:src/pre.py", "root:src/stage.py", "root:src/predirt.txt"):
+            self.assertNotIn(dirt, manifest["changed_paths"])
+        self.assertNotIn("pre = 999", patch)
+        self.assertNotIn("stage = 999", patch)
+        self.assertNotIn("pre-existing untracked", patch)
+        # The remaining criterion shapes, asserted once at aggregate level. The
+        # same routine renders task and aggregate patches, so one pass suffices.
+        for path in (
+            "root:src/shared.py", "root:src/new.py", "root:src/gone.py",
+            "root:src/mode.py", "root:src/tool.sh", "root:src/link",
+            "root:src/blob.bin", "root:src/new.bin",
+            "root:src/staged.py", "root:src/unstaged.py",
+        ):
+            self.assertIn(path, manifest["changed_paths"])
+        self.assertIn("rename from src/old.py", patch)
+        self.assertIn("rename to src/new.py", patch)
+        self.assertIn("+guard = 1", patch)
+        self.assertIn("deleted file mode 100644", patch)
+        self.assertIn("src/gone.py", patch)
+        self.assertIn("new file mode 100755", patch)
+        self.assertIn("old mode 100644", patch)
+        self.assertIn("new mode 100755", patch)
+        self.assertIn("120000", patch)
+        self.assertIn("+new.py", patch)
+        self.assertIn("GIT binary patch", patch)
+        self.assertIn("+staged = 1", patch)
+        self.assertIn("+unstaged = 2", patch)
+        # Work committed during T02 is inside the aggregate patch, not lost
+        # with the commit: the mid-task commit exists and its change is carried.
+        self.assertIn("committed during T02", self.git("log", "--oneline"))
+        self.assertIn("frozen aggregate bundle", result.stdout)
+
+    def test_constituent_staleness_blocks_aggregate_decision(self) -> None:
+        """A damaged pinned constituent makes the aggregate stale and blocks verdicts."""
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        # Damage a pinned constituent: an approved task cannot open another
+        # round, so staleness through a moved pin is exercised through the
+        # reopen path elsewhere. Here the constituent bundle itself becomes
+        # unreconstructable, which must also invalidate the aggregate.
+        _, where_t01 = self.frozen("T01")
+        manifest_t01, _ = self.frozen("T01")
+        damaged_target = where_t01 / str(manifest_t01["report"]["file"])
+        damaged_target.unlink()
+
+        status = self.cli("status", "demo").stdout
+        self.assertIn("aggregate bundle staleness", status)
+        self.assertIn("T01", status)
+
+        # The aggregate stale info appears in the bundle listing.
+        bundle_list = self.cli("bundle", "demo", "orch", "--list")
+        self.assertIn("DAMAGED", bundle_list.stdout)
+
+        # Decision on the stale aggregate is blocked.
+        result = self.cli("decide", "demo", "orch", "--approve", ok=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("damaged aggregate evidence", result.stderr)
+
+    def test_aggregate_decision_binds_to_bundle_digest(self) -> None:
+        """Approval of the aggregate records the bundle digest in the decision."""
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        manifest, _ = self.aggregate()
+        self.cli("decide", "demo", "orch", "--approve")
+        dec = run / "orch-decision-01.mdx"
+        self.assertTrue(dec.is_file())
+        meta = parse_meta(dec)
+        self.assertEqual("approved", meta["verdict"])
+        self.assertEqual("yes", meta["applied"])
+        self.assertEqual(manifest["digest"], meta["bundle_digest"])
+        self.assertEqual("aggregate", meta["bundle_kind"])
+
+    def test_aggregate_bundle_immutability_across_rounds(self) -> None:
+        """Later rounds produce new aggregate addresses, never rewrite old ones."""
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        first, _ = self.aggregate()
+        first_digest = first["digest"]
+
+        # Open round 2 and submit again.
+        self.cli("decide", "demo", "orch", "--changes", ok=False)
+        decision = run / "orch-decision-01.mdx"
+        if decision.is_file():
+            decision.write_text(decision.read_text().replace(
+                "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+                "1. Update the summary.",
+            ))
+        self.cli("decide", "demo", "orch", "--changes")
+        r2 = run / "orch-report-02.mdx"
+        self.fill_orch_report(r2)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        second, _ = self.aggregate()
+        self.assertNotEqual(first_digest, second["digest"])
+        # First bundle still intact.
+        self.assertIn("intact", self.cli("bundle", "demo", "orch", "--list").stdout)
+
+    def test_documents_only_still_freezes_aggregate(self) -> None:
+        """Documents-only runs freeze an aggregate and label coverage explicitly."""
+        run = self.setup_aggregate_run(evidence_mode="documents-only")
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        manifest, _ = self.aggregate()
+        self.assertEqual("aggregate", manifest["kind"])
+        self.assertEqual(COVERAGE_UNAVAILABLE, manifest["patch"]["coverage"])
+        self.assertIn("documents-only", manifest["patch"]["reason"])
+        self.assertIn("documents-only", manifest["source"]["reason"])
+        self.assertEqual(2, len(manifest["constituents"]))
+
+    def test_reopen_preserves_prior_round_and_invalidates_aggregate(self) -> None:
+        """Reopening a waived task preserves its round, opens one next round, and breaks the aggregate."""
+        run = self.setup_aggregate_run()
+        # Approved T01/T02 cannot be waived, so use a fresh T03 for the waiver.
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_task_report(run / "T03-report-01.mdx", blocked=True,
+                              files="- `src/c.py:1` - blocked change.")
+        self.cli("submit", "demo", "T03", "--blocked")
+        self.cli("decide", "demo", "T03", "--waive", "--reason", "external outage")
+
+        # Create aggregate with T01/T02 approved and T03 waived.
+        self.assign("orch", executor="orchestrator")
+        agg_report = run / "orch-report-01.mdx"
+        agg_report.write_text(
+            agg_report.read_text()
+            .replace(
+                "<!-- TODO: summarize the delivered outcome for the planner. -->",
+                "Delivered every planned task."
+            )
+            .replace(
+                "<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->",
+                "| task | outcome | verification |\n| --- | --- | --- |\n| T01 | approved | passed |\n| T02 | approved | passed |\n| T03 | waived | blocked (external outage) |"
+            )
+            .replace(
+                "<!-- TODO: summarize the task-local changes the planner should review. -->",
+                "Updated `src/a.py`, `src/b.py`; T03 is waived."
+            )
+            .replace(
+                "<!-- TODO: exact integrated command and real output. -->",
+                "Command: `printf ok`\n\nOutput: `ok`"
+            )
+        )
+        self.cli("submit", "demo", "orch", "--skip-verify")
+        first_agg, _ = self.aggregate()
+        first_digest = first_agg["digest"]
+
+        # Now reopen T03 via --reopen.
+        reopen_result = self.cli(
+            "decide", "demo", "T03", "--reopen",
+            "--reason", "external service is back up",
+            ok=True,
+        )
+        self.assertIn("waiver reopened", reopen_result.stdout)
+
+        # Check T03 has a round 2 report, and the prior round is preserved.
+        self.assertTrue((run / "T03-report-02.mdx").is_file())
+        self.assertIn("waived", (run / "T03-report-01.mdx").read_text())
+        self.assertIn("external outage", (run / "T03-decision-01.mdx").read_text())
+
+        # The aggregate is now stale.
+        stale_status = self.cli("status", "demo").stdout
+        self.assertIn("aggregate bundle staleness", stale_status)
+        self.assertIn("T03", stale_status)
+        self.assertIn("reopened from waiver", stale_status)
+
+        # Aggregate list shows DAMAGED.
+        agg_list = self.cli("bundle", "demo", "orch", "--list")
+        self.assertIn("DAMAGED", agg_list.stdout)
+
+        # Decision on the stale aggregate is blocked.
+        dec_result = self.cli("decide", "demo", "orch", "--approve", ok=False)
+        self.assertNotEqual(0, dec_result.returncode)
+        self.assertIn("damaged aggregate", dec_result.stderr)
+
+        # Reopening the orch itself is refused.
+        reopen_denied = self.cli("decide", "demo", "orch", "--reopen", ok=False)
+        self.assertNotEqual(0, reopen_denied.returncode)
+
+    def test_reopen_requires_waived_status(self) -> None:
+        """Only a waived task can be reopened with --reopen."""
+        self.setup_aggregate_run()
+        result = self.cli("decide", "demo", "T01", "--reopen", "--reason", "test", ok=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("not waived", result.stderr)
+
+    def test_reopen_requires_reason(self) -> None:
+        """Reopen requires a stated reason, just like a new waiver."""
+        run = self.setup_aggregate_run()
+        # A waived task needs a fresh owner: approved T01/T02 cannot be waived.
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_task_report(run / "T03-report-01.mdx", blocked=True,
+                              files="- `src/c.py:1` - blocked change.")
+        self.cli("submit", "demo", "T03", "--blocked")
+        self.cli("decide", "demo", "T03", "--waive", "--reason", "external outage")
+        result = self.cli("decide", "demo", "T03", "--reopen", ok=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("requires --reason", result.stderr)
+
+    def test_reopen_collision_refused(self) -> None:
+        """Reopen with scope collision is refused rather than partially applied."""
+        run = self.setup_aggregate_run()
+        # Waive T03 on a disjoint scope; approved T01/T02 cannot be waived.
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_task_report(run / "T03-report-01.mdx", blocked=True,
+                              files="- `src/c.py:1` - blocked change.")
+        self.cli("submit", "demo", "T03", "--blocked")
+        self.cli("decide", "demo", "T03", "--waive", "--reason", "external outage")
+        # Create active work on the same scope. Waived T03 is terminal so the
+        # new assignment itself does not collide.
+        self.cli(
+            "assign", "demo", "T04", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/c.py",
+            "--verify", 'printf "T04 ok\\n"',
+        )
+        self.fill_task(run / "T04-task.mdx")
+        self.fill_scope(run / "T04-scope.mdx")
+        self.cli("scope", "demo", "T04", "--submit")
+
+        # Reopening T03 must now collide with active T04.
+        result = self.cli(
+            "decide", "demo", "T03", "--reopen",
+            "--reason", "service is back up",
+            ok=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("now overlaps active work", result.stderr)
+
+    def test_reopen_interrupted_at_every_boundary_recovers(self) -> None:
+        """Interrupted reopen recovery: every material-write boundary is finishable.
+
+        A waived task can begin `--reopen`, create its next-round draft, and
+        crash at the `transition:next-round` boundary. The old code then
+        selected the new draft as the latest report and refused because it is
+        not waived, leaving the reopen journal permanently in progress. The
+        retry must instead finish the journalled transition without opening
+        another round, without rewriting prior evidence, and without requiring
+        the reason to be restated.
+        """
+        self.init("split", evidence_mode="documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        faults = [
+            "transition:begin",
+            "publish:T0-REPORT",
+            "transition:next-round",
+            "transition:complete",
+        ]
+        for idx, fault_template in enumerate(faults):
+            owner = f"T0{idx + 1}"
+            fname = f"src/{owner.lower()}.py"
+            with self.subTest(fault=fault_template, owner=owner):
+                self.cli(
+                    "assign", "demo", owner, "--complexity", "high", "--executor", "implementor",
+                    "--harness", "opencode", "--file", fname,
+                    "--verify", f'printf "{owner} ok\\n"',
+                )
+                self.fill_task(run / f"{owner}-task.mdx")
+                self.fill_scope(run / f"{owner}-scope.mdx")
+                self.cli("scope", "demo", owner, "--submit")
+                self.fill_task_report(
+                    run / f"{owner}-report-01.mdx", blocked=True,
+                    files=f"- `{fname}:1` - blocked change.",
+                )
+                self.cli("submit", "demo", owner, "--blocked")
+                self.cli("decide", "demo", owner, "--waive", "--reason", "external outage")
+                rep1_before = (run / f"{owner}-report-01.mdx").read_bytes()
+                dec1_before = (run / f"{owner}-decision-01.mdx").read_bytes()
+                fault = fault_template.replace(
+                    "T0-REPORT", f"{owner}-report-02.mdx",
+                )
+                crash = self.cli(
+                    "decide", "demo", owner, "--reopen",
+                    "--reason", "service is back up",
+                    ok=False, fault=fault,
+                )
+                self.assertEqual(70, crash.returncode)
+                journal_path = run / ".transitions" / f"{owner}.json"
+                self.assertTrue(journal_path.is_file())
+                # Restart in a new process and repeat without restating the reason.
+                recovered = self.cli("decide", "demo", owner, "--reopen")
+                self.assertIn("waiver reopened", recovered.stdout)
+                self.assertEqual(
+                    [f"{owner}-report-01.mdx", f"{owner}-report-02.mdx"],
+                    sorted(p.name for p in run.glob(f"{owner}-report-*.mdx")),
+                )
+                journal = json.loads(journal_path.read_text())
+                self.assertEqual("complete", journal["state"])
+                self.assertEqual("reopen-waived", journal["verdict"])
+                self.assertEqual(1, journal["round"])
+                self.assertEqual("service is back up", journal["reopen_reason"])
+                self.assertTrue(str(journal["transition"]).startswith("txn:"))
+                self.assertEqual(rep1_before, (run / f"{owner}-report-01.mdx").read_bytes())
+                self.assertEqual(dec1_before, (run / f"{owner}-decision-01.mdx").read_bytes())
+                self.assertIn("waived", (run / f"{owner}-report-01.mdx").read_text())
+                # Repeating the completed reopen never opens a third round.
+                again = self.cli("decide", "demo", owner, "--reopen")
+                self.assertIn("waiver reopened", again.stdout)
+                self.assertEqual(
+                    2, len(list(run.glob(f"{owner}-report-*.mdx"))),
+                )
+                self.assertEqual(journal["transition"], json.loads(journal_path.read_text())["transition"])
+                # The recorded reason is immutable.
+                wrong = self.cli(
+                    "decide", "demo", owner, "--reopen",
+                    "--reason", "a different reason",
+                    ok=False,
+                )
+                self.assertNotEqual(0, wrong.returncode)
+                self.assertIn("already recorded the reason", wrong.stderr)
+
+    def test_reopen_recovery_preserves_evidence_reclaims_scope_and_breaks_aggregate(self) -> None:
+        """Crash recovery keeps prior evidence, reclaims scope, and stales the aggregate."""
+        run = self.setup_aggregate_run()
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_task_report(run / "T03-report-01.mdx", blocked=True,
+                              files="- `src/c.py:1` - blocked change.")
+        self.cli("submit", "demo", "T03", "--blocked")
+        self.cli("decide", "demo", "T03", "--waive", "--reason", "external outage")
+        self.assign("orch", executor="orchestrator")
+        agg_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(agg_report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+        first_agg, _ = self.aggregate()
+        first_digest = first_agg["digest"]
+        rep1_before = (run / "T03-report-01.mdx").read_bytes()
+        dec1_before = (run / "T03-decision-01.mdx").read_bytes()
+
+        prior_bin = os.environ.get("DOCKET_BIN_PRIOR")
+        if prior_bin:
+            prior_crash = subprocess.run(
+                [sys.executable, prior_bin, "decide", "demo", "T03", "--reopen",
+                 "--reason", "service is back up"],
+                cwd=str(self.root), text=True, capture_output=True,
+                env={**dict(os.environ), "DOCKET_FAULT": "transition:next-round"},
+            )
+            self.assertEqual(70, prior_crash.returncode)
+            prior_retry = subprocess.run(
+                [sys.executable, prior_bin, "decide", "demo", "T03", "--reopen"],
+                cwd=str(self.root), text=True, capture_output=True,
+            )
+            self.assertNotEqual(0, prior_retry.returncode)
+            self.assertIn("not waived", prior_retry.stderr)
+            # Remove the prior binary's draft and journal so the fixed binary
+            # proves recovery from the same boundary on the same run.
+            (run / "T03-report-02.mdx").unlink(missing_ok=True)
+            (run / ".transitions" / "T03.json").unlink(missing_ok=True)
+
+        crash = self.cli(
+            "decide", "demo", "T03", "--reopen",
+            "--reason", "service is back up",
+            ok=False, fault="transition:next-round",
+        )
+        self.assertEqual(70, crash.returncode)
+        self.assertTrue((run / "T03-report-02.mdx").is_file())
+        self.assertIn("unfinished decision transitions", self.cli("status", "demo").stdout)
+        # New process, no restated reason.
+        recovered = self.cli("decide", "demo", "T03", "--reopen")
+        self.assertIn("waiver reopened", recovered.stdout)
+        self.assertEqual(rep1_before, (run / "T03-report-01.mdx").read_bytes())
+        self.assertEqual(dec1_before, (run / "T03-decision-01.mdx").read_bytes())
+        journal = json.loads((run / ".transitions" / "T03.json").read_text())
+        self.assertEqual("complete", journal["state"])
+        self.assertEqual("service is back up", journal["reopen_reason"])
+        # Scope is reclaimed: overlapping active work now collides.
+        self.cli(
+            "assign", "demo", "T04", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/c.py",
+            "--verify", 'printf "T04 ok\\n"',
+        )
+        self.fill_task(run / "T04-task.mdx")
+        self.fill_scope(run / "T04-scope.mdx")
+        collision = self.cli("scope", "demo", "T04", "--submit", ok=False)
+        self.assertNotEqual(0, collision.returncode)
+        self.assertIn("COLLISION", (collision.stdout + collision.stderr).upper())
+        # The aggregate that pinned the waiver is stale and names both sides.
+        status = self.cli("status", "demo").stdout
+        self.assertIn("aggregate bundle staleness", status)
+        self.assertIn("reopened from waiver", status)
+        self.assertIn("T03", status)
+        events = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertIn("T03:reopened", events)
+        agg_list = self.cli("bundle", "demo", "orch", "--list").stdout
+        self.assertIn("DAMAGED", agg_list)
+        self.assertIn(first_digest, agg_list)
+        # Two concurrent retries settle as one reopen, not a third round.
+        import concurrent.futures as futures
+
+        def retry() -> subprocess.CompletedProcess[str]:
+            env = dict(os.environ)
+            env.pop("DOCKET_FAULT", None)
+            env.pop("DOCKET_PERTURB", None)
+            return subprocess.run(
+                [sys.executable, str(DOCKET), "decide", "demo", "T03", "--reopen"],
+                cwd=str(self.root), text=True, capture_output=True, env=env,
+            )
+
+        with futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = list(pool.map(lambda _: retry(), range(2)))
+        self.assertEqual(0, first.returncode)
+        self.assertEqual(0, second.returncode)
+        self.assertEqual(
+            ["T03-report-01.mdx", "T03-report-02.mdx"],
+            sorted(p.name for p in run.glob("T03-report-*.mdx")),
+        )
+        self.assertEqual(
+            journal["transition"],
+            json.loads((run / ".transitions" / "T03.json").read_text())["transition"],
+        )
+
+    # --------------------------------------- leased delivery and reconciliation
+
+    def submit_simple(self, run: Path, owner: str) -> None:
+        """Assign, scope, and submit one task in a documents-only run."""
+        self.assign_simple(run, owner)
+        self.fill_task_report(run / f"{owner}-report-01.mdx",
+                              files=f"- `src/{owner.lower()}.py:1` - implemented {owner}.")
+        self.cli("submit", "demo", owner)
+
+    def assign_simple(self, run: Path, owner: str) -> None:
+        """Assign and scope one task without submitting it."""
+        fname = f"src/{owner.lower()}.py"
+        self.cli(
+            "assign", "demo", owner, "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", fname,
+            "--verify", f'printf "{owner} ok\\n"',
+        )
+        self.fill_task(run / f"{owner}-task.mdx")
+        self.fill_scope(run / f"{owner}-scope.mdx")
+        self.cli("scope", "demo", owner, "--submit")
+
+    @staticmethod
+    def delivery_snapshot(run: Path) -> dict[str, bytes]:
+        """Every delivery file's bytes, to prove read-only commands change nothing."""
+        out: dict[str, bytes] = {}
+        for path in sorted((run / ".delivery").rglob("*")):
+            if path.is_file():
+                out[str(path.relative_to(run))] = path.read_bytes()
+        return out
+
+    def test_m5_derivation_and_reconcile_recovery(self) -> None:
+        """Deterministic events: reconcile restores a deleted record exactly once."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        reconciled = self.cli("reconcile", "demo")
+        self.assertIn("1 derived event(s), 0 retired", reconciled.stdout)
+        pending = list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
+        record = json.loads(pending[0].read_text())
+        self.assertEqual("orchestrator", record["role"])
+        self.assertEqual("legacy", record["workflow"])
+        self.assertEqual(1, record["generation"])
+        self.assertTrue(str(record["revision"]).startswith("sha256:"))
+        self.assertTrue(str(record["key"]).startswith("review-batch:"))
+        # Delete only the derived record; the submitted report survives.
+        pending[0].unlink()
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+        restored = self.cli("reconcile", "demo")
+        self.assertIn("1 derived event(s), 0 retired", restored.stdout)
+        again = list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))
+        self.assertEqual(1, len(again))
+        self.assertEqual(record["key"], json.loads(again[0].read_text())["key"])
+        # Repeated and concurrent reconciliation never duplicates the identity.
+        self.cli("reconcile", "demo")
+        import concurrent.futures as futures
+        with futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: self.cli("reconcile", "demo"), range(4)))
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))))
+        # Peek, status, and doctor leave event and lease files byte-for-byte.
+        before = self.delivery_snapshot(run)
+        self.assertTrue(before)
+        self.cli("events", "demo", "--role", "orchestrator", "--peek")
+        self.cli("status", "demo")
+        self.cli("doctor")
+        self.assertEqual(before, self.delivery_snapshot(run))
+
+    def test_m5_claim_lease_receipt_retry_and_completion(self) -> None:
+        """One lease per event; ack is receipt; resolution retires; duplicates harmless."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("reconcile", "demo")
+        key = json.loads(next(
+            (run / ".delivery" / "orchestrator" / "pending").glob("*.json")).read_text())["key"]
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-main", "--role", "orchestrator")
+        first = self.cli("inbox", "demo", "--role", "orchestrator",
+                         "--claim", "--session", "s1")
+        self.assertIn(f"claimed {key}", first.stdout)
+        self.assertIn("attempt 1", first.stdout)
+        # The same session re-claiming is idempotent; a competitor is refused.
+        self.assertIn("already held by this session",
+                      self.cli("inbox", "demo", "--role", "orchestrator",
+                               "--claim", "--session", "s1").stdout)
+        self.cli("session", "demo", "--register", "--session", "s2",
+                 "--name", "orch-other", "--role", "orchestrator")
+        rival = self.cli("inbox", "demo", "--role", "orchestrator",
+                         "--claim", "--session", "s2", ok=False)
+        self.assertNotEqual(0, rival.returncode)
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "leases").glob("*.json"))))
+        # Acknowledgement is receipt, not completion; duplicates are harmless.
+        self.assertIn("received",
+                      self.cli("events", "demo", "--role", "orchestrator",
+                               "--ack", key, "--session", "s1").stdout)
+        self.assertIn("already received",
+                      self.cli("events", "demo", "--role", "orchestrator",
+                               "--ack", key, "--session", "s1").stdout)
+        self.assertTrue((run / ".delivery" / "orchestrator" / "pending" /
+                         next((run / ".delivery" / "orchestrator" / "pending").glob("*.json")).name).is_file())
+        # A retry with a reason releases the lease; the next claim continues it.
+        self.assertIn("attempted again",
+                      self.cli("events", "demo", "--role", "orchestrator",
+                               "--retry", key, "--reason", "lost wake").stdout)
+        self.assertIn("attempt 2", self.cli(
+            "inbox", "demo", "--role", "orchestrator",
+            "--claim", "--session", "s1").stdout)
+        # Lease expiry makes the event claimable again for another session.
+        lease_file = next((run / ".delivery" / "orchestrator" / "leases").glob("*.json"))
+        until = json.loads(lease_file.read_text())["lease_until"]
+        os.environ["DOCKET_NOW"] = str(float(until) + 1)
+        self.addCleanup(os.environ.pop, "DOCKET_NOW", None)
+        redelivered = self.cli("inbox", "demo", "--role", "orchestrator",
+                               "--claim", "--session", "s2")
+        self.assertIn(f"claimed {key}", redelivered.stdout)
+        os.environ.pop("DOCKET_NOW", None)
+        # A durable resolution retires the claimed event; the next actionable
+        # step (completing the aggregate) is derived in its place.
+        self.cli("decide", "demo", "T01", "--approve")
+        swept = self.cli("reconcile", "demo")
+        self.assertIn("1 retired", swept.stdout)
+        remaining = [json.loads(p.read_text())["key"] for p in
+                     (run / ".delivery" / "orchestrator" / "pending").glob("*.json")]
+        self.assertNotIn(key, remaining)
+        self.assertTrue(any(k.startswith("all:decided:") for k in remaining))
+        # Duplicate handling after completion is harmless, not a second decision.
+        self.assertIn("already retired", self.cli(
+            "events", "demo", "--role", "orchestrator",
+            "--ack", key, "--session", "s2").stdout)
+        self.assertEqual(1, len(list(run.glob("T01-decision-*.mdx"))))
+
+    def test_m5_session_registration_identity(self) -> None:
+        """Stale generations and wrong roles, runs, or workspaces cannot inherit work."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("reconcile", "demo")
+        key = json.loads(next(
+            (run / ".delivery" / "orchestrator" / "pending").glob("*.json")).read_text())["key"]
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-main", "--role", "orchestrator")
+        self.cli("inbox", "demo", "--role", "orchestrator", "--claim", "--session", "s1")
+        # Wrong role: a planner session cannot claim the orchestrator inbox.
+        self.cli("session", "demo", "--register", "--session", "sp",
+                 "--name", "planner-main", "--role", "planner")
+        wrong_role = self.cli("inbox", "demo", "--role", "orchestrator",
+                              "--claim", "--session", "sp", ok=False)
+        self.assertNotEqual(0, wrong_role.returncode)
+        self.assertIn("role", wrong_role.stderr)
+        # Restart reuses the id with a new generation; the old lease must fail.
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-restarted", "--role", "orchestrator")
+        reg = json.loads((self.root / ".docket" / "sessions" / "s1.json").read_text())
+        self.assertEqual(2, reg["generation"])
+        self.assertEqual("orch-main", reg["previous_name"])
+        stale_ack = self.cli("events", "demo", "--role", "orchestrator",
+                             "--ack", key, "--session", "s1", ok=False)
+        self.assertNotEqual(0, stale_ack.returncode)
+        self.assertIn("generation", stale_ack.stderr)
+        # A restarted session cannot steal the active lease before expiry.
+        steal = self.cli("inbox", "demo", "--role", "orchestrator",
+                         "--claim", "--session", "s1", ok=False)
+        self.assertNotEqual(0, steal.returncode)
+        # Wrong workspace registration cannot claim here.
+        reg_path = self.root / ".docket" / "sessions" / "s1.json"
+        tampered = json.loads(reg_path.read_text())
+        tampered["workspace"] = "/elsewhere"
+        reg_path.write_text(json.dumps(tampered))
+        wrong_ws = self.cli("inbox", "demo", "--role", "orchestrator",
+                            "--claim", "--session", "s1", ok=False)
+        self.assertNotEqual(0, wrong_ws.returncode)
+        self.assertIn("workspace", wrong_ws.stderr)
+        # Racing consumers still yield exactly one lease.
+        tampered["workspace"] = str(self.root.resolve())
+        reg_path.write_text(json.dumps(tampered))
+        (run / ".delivery" / "orchestrator" / "leases" /
+         next((run / ".delivery" / "orchestrator" / "leases").glob("*.json")).name).unlink()
+        self.cli("session", "demo", "--register", "--session", "s3",
+                 "--name", "third", "--role", "orchestrator")
+        import concurrent.futures as futures
+        with futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda sid: self.cli("inbox", "demo", "--role", "orchestrator",
+                                     "--claim", "--session", sid, ok=False),
+                ["s1", "s3"]))
+        self.assertEqual(1, sum(1 for r in results if r.returncode == 0))
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "leases").glob("*.json"))))
+
+    def test_m5_crash_restart_matrix(self) -> None:
+        """Crash before send, after receipt, and before resolution all recover."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("reconcile", "demo")
+        key = json.loads(next(
+            (run / ".delivery" / "orchestrator" / "pending").glob("*.json")).read_text())["key"]
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-main", "--role", "orchestrator")
+        # Crash after the lease write but before the claim response.
+        crash = self.cli("inbox", "demo", "--role", "orchestrator",
+                         "--claim", "--session", "s1",
+                         ok=False, fault="delivery:before-send")
+        self.assertEqual(70, crash.returncode)
+        held = self.cli("inbox", "demo", "--role", "orchestrator",
+                        "--claim", "--session", "s1")
+        self.assertIn("already held by this session", held.stdout)
+        # Crash after the receipt write but before its response.
+        crash_ack = self.cli("events", "demo", "--role", "orchestrator",
+                             "--ack", key, "--session", "s1",
+                             ok=False, fault="delivery:receipt")
+        self.assertEqual(70, crash_ack.returncode)
+        self.assertIn("already received", self.cli(
+            "events", "demo", "--role", "orchestrator",
+            "--ack", key, "--session", "s1").stdout)
+        # The event is still pending (receipt is not completion) until resolved.
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))))
+        self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("1 retired", self.cli("reconcile", "demo").stdout)
+        remaining = [json.loads(p.read_text())["key"] for p in
+                     (run / ".delivery" / "orchestrator" / "pending").glob("*.json")]
+        self.assertNotIn(key, remaining)
+        self.assertTrue(any(k.startswith("all:decided:") for k in remaining))
+
+    # -------------------------------- explicit batches and health and delivery
+
+    def test_m6_explicit_batches_and_generations(self) -> None:
+        """Closed membership is stable; reopen moves exactly one new generation."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("batch", "demo", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo", "--close", "B1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        # The batch is not ready while a member is still a draft, and the
+        # legacy review-batch no longer fires once closed batches exist.
+        self.assertEqual([], [e for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if "batch:B1" in e or "review-batch:" in e])
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02")
+        ready = [e.strip() for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if "batch:B1:ready:" in e]
+        self.assertEqual(1, len(ready))
+        key = ready[0].split()[-1]
+        # A task added after closure cannot join or change the emitted event,
+        # and a dependency chain outside the closed batch does not deadlock it.
+        self.submit_simple(run, "T03")
+        self.assertIn("B1  closed", self.cli("batch", "demo", "--list").stdout)
+        self.assertEqual(key, [e.strip().split()[-1] for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if "batch:B1:ready:" in e][0])
+        # Reopen of a constituent invalidates the old generation exactly once.
+        fname = "src/t04.py"
+        self.cli("assign", "demo", "T04", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", fname,
+                 "--verify", 'printf "T04 ok\\n"')
+        self.fill_task(run / "T04-task.mdx")
+        self.fill_scope(run / "T04-scope.mdx")
+        self.cli("scope", "demo", "T04", "--submit")
+        self.fill_task_report(run / "T04-report-01.mdx", blocked=True,
+                              files="- `src/t04.py:1` - blocked change.")
+        self.cli("submit", "demo", "T04", "--blocked")
+        self.cli("decide", "demo", "T04", "--waive", "--reason", "external outage")
+        self.cli("batch", "demo", "--create", "B2", "--members", "T03,T04")
+        self.cli("batch", "demo", "--close", "B2")
+        old_ready = [e.strip().split()[-1] for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if "batch:B2:ready:" in e]
+        self.assertEqual(1, len(old_ready))
+        self.assertIn(":ready:1", old_ready[0])
+        self.cli("reconcile", "demo")
+        self.cli("decide", "demo", "T04", "--reopen", "--reason", "service is back")
+        listed = self.cli("batch", "demo", "--list").stdout
+        self.assertIn("B2", listed)
+        self.assertIn("generation=2", listed)
+        swept = self.cli("reconcile", "demo")
+        self.assertIn("1 retired", swept.stdout)
+        now = [e.strip().split()[-1] for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if "batch:B2:ready:" in e]
+        self.assertEqual([], now)
+        self.assertNotIn("batch:B2:ready:3", swept.stdout + self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout)
+
+    def test_m6_execution_health_separate_from_report(self) -> None:
+        """Quiet work is healthy; rate limits are hints; one stall is one incident."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        healthy = self.cli("health", "demo").stdout
+        self.assertIn("report=submitted", healthy)
+        self.assertIn("execution=awaiting-review", healthy)
+        self.assertNotIn("open stall incidents", healthy)
+        # Long verification and unchanged worktrees are not stalls by themselves.
+        self.submit_simple(run, "T02")
+        quiet = self.cli("health", "demo", "--owner", "T02").stdout
+        self.assertIn("execution=awaiting-review", quiet)
+        self.assertEqual([], list((run / ".incidents").glob("*.json"))
+                         if (run / ".incidents").is_dir() else [])
+        # Rate-limit text is a best-effort hint, never authoritative state.
+        fname = "src/t03.py"
+        self.cli("assign", "demo", "T03", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", fname,
+                 "--verify", 'printf "Rate limit 429 retrying\\n"; printf "T03 ok\\n"')
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_scope(run / "T03-scope.mdx")
+        self.cli("scope", "demo", "T03", "--submit")
+        self.fill_task_report(run / "T03-report-01.mdx",
+                              files="- `src/t03.py:1` - implemented T03.")
+        self.cli("submit", "demo", "T03")
+        hinted = self.cli("health", "demo", "--owner", "T03").stdout
+        self.assertIn("[hint]", hinted)
+        self.assertIn("execution=awaiting-review", hinted)
+        # One stall yields one incident and one recovery event, deduplicated.
+        self.cli("health", "demo", "--flag-stall", "T01", "--cause", "provider hung")
+        self.cli("health", "demo", "--flag-stall", "T01", "--cause", "provider hung")
+        incidents = list((run / ".incidents").glob("*.json"))
+        self.assertEqual(1, len(incidents))
+        stalled = [e.strip().split()[-1] for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if ":stalled:" in e]
+        self.assertEqual(1, len(stalled))
+        self.assertIn("T01:stalled:1", stalled[0])
+        status_out = self.cli("status", "demo").stdout
+        self.assertIn("exec", status_out)
+        self.assertIn("awaiting-review", status_out)
+        self.cli("health", "demo", "--resolve-stall", "T01-1")
+        self.cli("reconcile", "demo")
+        self.assertEqual([], [e for e in self.cli(
+            "events", "demo", "--role", "orchestrator", "--peek").stdout.splitlines()
+            if ":stalled:" in e])
+
+    def test_m6_pause_resume_probe_and_queued(self) -> None:
+        """Paused delivery queues visibly without consuming events or work."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("delivery", "demo", "--role", "orchestrator", "--pause")
+        watched = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "2"],
+            cwd=str(self.root), text=True, capture_output=True)
+        self.assertEqual(0, watched.returncode)
+        peek = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertIn("1 pending", peek)
+        queued = self.cli("delivery", "demo", "--role", "orchestrator", "--queued").stdout
+        self.assertIn("paused", queued)
+        self.assertIn("1 queued", queued)
+        # Pausing delivery neither consumes events nor pauses implementation.
+        self.assertEqual([], list((run / ".delivery" / "orchestrator" / "leases").glob("*.json"))
+                         if (run / ".delivery" / "orchestrator" / "leases").is_dir() else [])
+        self.submit_simple(run, "T02")
+        probe = self.cli("delivery", "demo", "--role", "orchestrator", "--probe").stdout
+        self.assertIn("boundary:", probe)
+        self.assertIn("mode:", probe)
+        self.assertIn("doctor", self.cli("doctor").stdout.lower())
+        self.assertIn("Delivery", self.cli("doctor").stdout)
+        self.cli("delivery", "demo", "--role", "orchestrator", "--resume")
+        fired = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "5"],
+            cwd=str(self.root), text=True, capture_output=True)
+        self.assertEqual(2, fired.returncode)
+
+    def test_m6_safe_boundary_delivery_matrix(self) -> None:
+        """Unsafe delivery stays queued; qualified delivery is fixed-format."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        peek = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        key = [l.strip().split()[-1] for l in peek.splitlines() if "review-batch:" in l][0]
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-main", "--role", "orchestrator")
+        body_before = self.body_of(run / "T01-report-01.mdx")
+        # The user typing while delivery is eligible: nothing enters the buffer.
+        (run / ".delivery" / "orchestrator" / "input-active").parent.mkdir(
+            parents=True, exist_ok=True)
+        (run / ".delivery" / "orchestrator" / "input-active").write_text("typing\n")
+        held_back = self.cli("delivery", "demo", "--role", "orchestrator",
+                             "--send", key, "--session", "s1").stdout
+        self.assertIn("queued", held_back)
+        self.assertEqual(
+            [], list((run / ".delivery" / "orchestrator" / "outbox").glob("*.txt")))
+        # Explicit inbox pickup still succeeds through the qualified boundary.
+        self.assertIn(f"claimed {key}", self.cli(
+            "inbox", "demo", "--role", "orchestrator",
+            "--claim", "--session", "s1").stdout)
+        (run / ".delivery" / "orchestrator" / "input-active").unlink()
+        (run / ".delivery" / "orchestrator" / "leases" /
+         next((run / ".delivery" / "orchestrator" / "leases").glob("*.json")).name).unlink()
+        sent = self.cli("delivery", "demo", "--role", "orchestrator",
+                        "--send", key, "--session", "s1")
+        self.assertEqual(0, sent.returncode)
+        outbox = list((run / ".delivery" / "orchestrator" / "outbox").glob("*.txt"))
+        self.assertEqual(1, len(outbox))
+        notice = outbox[0].read_text()
+        self.assertEqual(
+            ["run: demo", "role: orchestrator", f"event: {key}", "session: s1",
+             "inbox: docket inbox demo --role orchestrator --claim --session s1"],
+            notice.strip().splitlines())
+        self.assertNotIn(body_before.strip().splitlines()[0], notice)
+        # A restarted session reusing the pane cannot inherit the delivery.
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-reused-pane", "--role", "orchestrator")
+        stale_send = self.cli("delivery", "demo", "--role", "orchestrator",
+                              "--send", key, "--session", "s1", ok=False)
+        self.assertNotEqual(0, stale_send.returncode)
+        # A transport failure never rolls back the valid report submission.
+        leases = list((run / ".delivery" / "orchestrator" / "leases").glob("*.json"))
+        self.assertEqual(1, len(leases))
+        import json as _json
+        until = _json.loads(leases[0].read_text())["lease_until"]
+        os.environ["DOCKET_NOW"] = str(float(until) + 1)
+        self.addCleanup(os.environ.pop, "DOCKET_NOW", None)
+        crashed = self.cli("delivery", "demo", "--role", "orchestrator",
+                           "--send", key, "--session", "s1",
+                           ok=False, fault="delivery:send")
+        self.assertEqual(70, crashed.returncode)
+        os.environ.pop("DOCKET_NOW", None)
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+        retried = self.cli("delivery", "demo", "--role", "orchestrator",
+                           "--send", key, "--session", "s1")
+        self.assertEqual(0, retried.returncode)
+        self.assertEqual(1, len(list((run / ".delivery" / "orchestrator" / "outbox").glob("*.txt"))))
+        # Killing the hook leaves the durable event recoverable for the next
+        # hook or reconciliation pass: the pending record survives and stays
+        # claimable, even though the announcement ledger already holds the key.
+        proc = subprocess.Popen(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "30"],
+            cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        import time as _time
+        _time.sleep(1)
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))))
+        self.assertIn("1 derived event(s)", self.cli("reconcile", "demo").stdout)
+        held = self.cli("inbox", "demo", "--role", "orchestrator",
+                        "--claim", "--session", "s1")
+        self.assertTrue("already held" in held.stdout or f"claimed {key}" in held.stdout)
+
+    # -------------------------------- captured verification and acceptance
+
+    def test_m7_verification_artifact_is_complete(self) -> None:
+        """Frozen verification captures command, timing, outputs, env, and model."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "2 passed, 1 skipped in 0.1s\\n"',
+                 "--model", "req-m", "--env", "FOO=1", "--env", "BAR=2")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.cli("set-model", "demo", "T01", "--actual", "obs-m")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        verifying = self.cli("bundle", "demo", "T01").stdout
+        self.assertIn("passed", verifying)
+        manifest, where = self.frozen("T01")
+        verification = manifest["verification"]
+        self.assertTrue(verification["command"].startswith("printf"))
+        self.assertEqual(str(self.root.resolve()), verification["cwd"])
+        self.assertEqual(900, verification["timeout_seconds"])
+        self.assertEqual(0, verification["returncode"])
+        self.assertEqual("passed", verification["status"])
+        self.assertIn("started_at", verification)
+        self.assertIn("ended_at", verification)
+        self.assertIn("duration_seconds", verification)
+        self.assertEqual(["BAR=2", "FOO=1"], verification["declared_env"])
+        self.assertEqual("req-m", verification["model_requested"])
+        self.assertEqual("obs-m", verification["model_observed"])
+        self.assertEqual("observed", verification["model_source"])
+        self.assertEqual("pytest", verification["framework"]["parser"])
+        self.assertEqual(2, verification["framework"]["passed"])
+        self.assertEqual(1, verification["framework"]["skipped"])
+        self.assertIn("2 passed", (where / "verify.stdout").read_text())
+        # Unknown models and unparsable output stay unknown, never guessed.
+        self.cli("assign", "demo", "T02", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/b.py",
+                 "--verify", 'printf hello')
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.fill_task_report(run / "T02-report-01.mdx", files="- `src/b.py:1` - change.")
+        self.cli("submit", "demo", "T02")
+        manifest, _ = self.frozen("T02")
+        self.assertEqual("unknown", manifest["verification"]["model_observed"])
+        self.assertEqual("unknown", manifest["verification"]["model_source"])
+        self.assertEqual("unknown", manifest["verification"]["framework"]["parser"])
+        # A timeout is captured as a timeout, not a pass or a failure.
+        self.cli("assign", "demo", "T03", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/c.py",
+                 "--verify", "sleep 5; printf ok", "--verify-timeout", "1")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_scope(run / "T03-scope.mdx")
+        self.cli("scope", "demo", "T03", "--submit")
+        self.fill_task_report(run / "T03-report-01.mdx", files="- `src/c.py:1` - change.")
+        refused = self.cli("submit", "demo", "T03", ok=False)
+        self.assertIn("timed out", refused.stderr)
+
+    def test_m7_verification_reruns_on_every_identity_change(self) -> None:
+        """No frozen result is ever reused across a changed command, env, or source."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", "cat counter.txt 2>/dev/null; printf x >> counter.txt; printf ok",
+                 "--env", "FOO=1")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        first, _ = self.frozen("T01")
+        self.assertEqual(["FOO=1"], first["verification"]["declared_env"])
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        self.cli("decide", "demo", "T01", "--changes")
+        # Change the command and the declared env between rounds.
+        task_text = (run / "T01-task.mdx").read_text()
+        task_text = task_text.replace(
+            "cat counter.txt 2>/dev/null; printf x >> counter.txt; printf ok",
+            "cat counter.txt 2>/dev/null; printf y >> counter.txt; printf ok2")
+        task_text = task_text.replace("env: FOO=1", "env: FOO=2")
+        (run / "T01-task.mdx").write_text(task_text)
+        self.fill_task_report(run / "T01-report-02.mdx")
+        self.cli("submit", "demo", "T01")
+        second, _ = self.frozen("T01", index=1)
+        self.assertNotEqual(first["verification"]["command"],
+                            second["verification"]["command"])
+        self.assertIn("ok2", second["verification"]["command"])
+        self.assertEqual(["FOO=2"], second["verification"]["declared_env"])
+        self.assertNotEqual(first["report"]["body_digest"], second["report"]["body_digest"])
+        # The counter proves both rounds really executed instead of reusing.
+        self.assertEqual("xy", (self.root / "counter.txt").read_text())
+
+    def test_m7_source_modifying_verify_is_refused(self) -> None:
+        """A green result that no longer describes the frozen source is refused."""
+        self.repo()
+        self.init("split", evidence_mode="git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "\\ndirty\\n" >> src/a.py; printf ok')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        refused = self.cli("submit", "demo", "T01", ok=False)
+        self.assertIn("changed while the verification ran", refused.stderr)
+
+    def test_m7_evidence_table_states_and_prose(self) -> None:
+        """Stable IDs map to evidence; prose is never keyword-policed."""
+        run = self.init("split", evidence_mode="documents-only")
+        table = ("| id | state | artifacts | gaps |\n"
+                 "| --- | --- | --- | --- |\n"
+                 "| A1 | met | verify.stdout | none |\n"
+                 "| A2 | met | verify.stdout | none |\n")
+
+        def two_criteria(owner: str, table_text: str = "", blocked: bool = False,
+                         extra: str = "") -> "subprocess.CompletedProcess[str]":
+            fname = f"src/{owner.lower()}.py"
+            self.cli("assign", "demo", owner, "--complexity", "high",
+                     "--executor", "implementor", "--harness", "opencode",
+                     "--file", fname, "--verify", 'printf ok')
+            task_text = (run / f"{owner}-task.mdx").read_text()
+            task_text = task_text.replace("# Task T01: <title>", f"# Task {owner}: Feature")
+            task_text = task_text.replace(
+                "<!-- TODO: one paragraph. What must be true when this is done. -->",
+                "Implement the feature.")
+            task_text = task_text.replace(
+                "- [ ] <!-- TODO -->", "- [ ] First works.\n- [ ] Second works.")
+            (run / f"{owner}-task.mdx").write_text(task_text)
+            self.fill_scope(run / f"{owner}-scope.mdx")
+            self.cli("scope", "demo", owner, "--submit")
+            report = run / f"{owner}-report-01.mdx"
+            text = report.read_text()
+            text = text.replace(
+                "<!-- TODO: what you actually did, 2-4 sentences. No plans, only past tense. -->",
+                "Implemented the feature and verified its behavior.")
+            text = text.replace(
+                '<!-- TODO: one bullet per change as `path/to/file.py:120` plus a short note. Write "none" if nothing changed. -->',
+                f"- `{fname}:1` - implemented the feature.")
+            text = text.replace("- [ ] <!-- TODO -->",
+                                f"- [{' ' if blocked else 'x'}] First works.\n"
+                                f"- [{' ' if blocked else 'x'}] Second works.")
+            text = text.replace(
+                "<!-- TODO: the exact command you ran and its real output. Never claim a result you did not see. -->",
+                "Command: `printf ok`\n\nOutput: `ok`")
+            if blocked:
+                text = text.replace("none\n\n## Notes",
+                                    "The reviewer must decide whether to waive.\n\n## Notes")
+            if table_text:
+                text = text.rstrip("\n") + "\n\n## Evidence\n\n" + table_text
+            if extra:
+                text = text.rstrip("\n") + "\n\n" + extra
+            report.write_text(text)
+            return self.cli("submit", "demo", owner, *(["--blocked"] if blocked else []),
+                            ok=False)
+
+        # Every required ID met with artifacts and no gaps submits.
+        self.assertEqual(0, two_criteria("T01", table).returncode)
+        # Duplicate, absent, unknown IDs, unknown states, gaps on met,
+        # missing artifacts, and stale links are hard failures.
+        cases = {
+            "T02": table.replace("| A2 | met", "| A1 | met"),
+            "T03": "| id | state | artifacts | gaps |\n| --- | --- | --- | --- |\n"
+                   "| A1 | met | verify.stdout | none |\n",
+            "T04": table.replace("| A2 | met", "| A9 | met"),
+            "T05": table.replace("| A2 | met | verify.stdout | none |",
+                                 "| A2 | done | verify.stdout | none |"),
+            "T06": table.replace("| A2 | met | verify.stdout | none |",
+                                 "| A2 | met | verify.stdout | slow path untested |"),
+            "T07": table.replace("| A2 | met | verify.stdout | none |",
+                                 "| A2 | met | none | none |"),
+            "T08": table.replace("| A2 | met | verify.stdout | none |",
+                                 "| A2 | met | src/nope-missing.py | none |"),
+        }
+        for owner, broken in cases.items():
+            with self.subTest(owner=owner):
+                result = two_criteria(owner, broken)
+                self.assertNotEqual(0, result.returncode, owner)
+        self.assertIn("duplicate evidence id A1", two_criteria("T09", cases["T02"]).stderr)
+        self.assertIn("missing evidence for required criterion A2",
+                      two_criteria("T10", cases["T03"]).stderr)
+        self.assertIn("not a task acceptance criterion", two_criteria("T11", cases["T04"]).stderr)
+        self.assertIn("unknown state", two_criteria("T12", cases["T05"]).stderr)
+        self.assertIn("explicit gap attached to met criterion A2",
+                      two_criteria("T13", cases["T06"]).stderr)
+        self.assertIn("names no artifacts", two_criteria("T14", cases["T07"]).stderr)
+        self.assertIn("missing evidence artifact", two_criteria("T15", cases["T08"]).stderr)
+        # Prose counterexamples are not keyword-policed.
+        prose = ("## Notes\n\nNo limitations.\n\nThe edge is not covered by this unit "
+                 "test but covered by integration run nightly-42.\n")
+        self.assertEqual(0, two_criteria("T16", table, extra=prose).returncode)
+        # Blocked work stays lightweight: partial evidence never blocks a block.
+        partial = table.replace("| A2 | met | verify.stdout | none |",
+                                "| A2 | partial | verify.stdout | waiting on data |")
+        self.assertEqual(0, two_criteria("T17", partial, blocked=True).returncode)
+
+    def test_m7_adversarial_diff_and_oracle(self) -> None:
+        """Byte changes count, and a changed oracle cannot inherit verification."""
+        # A byte change with an unchanged status shape is still a change.
+        self.repo()
+        self.init("split", evidence_mode="git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/a.py", "--verify", 'printf ok')
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        diff = self.cli("diff", "demo", "T01")
+        self.assertEqual(0, diff.returncode)
+        self.assertIn("src/a.py", diff.stdout)
+        self.assertNotIn("no worktree changes", diff.stdout)
+
+    def test_m7_changed_oracle_needs_reverification(self) -> None:
+        """A changed oracle (edited task) cannot inherit the frozen verification."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(
+            task_text.replace("- [ ] The feature works.", "- [ ] The feature works quickly."))
+        stale = self.cli("decide", "demo", "T01", "--approve", ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("task contract changed", stale.stderr)
+        # A fresh changes round against the new oracle decides cleanly.
+        self.cli("decide", "demo", "T01", "--changes")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT,
+        ))
+        self.cli("decide", "demo", "T01", "--changes")
+        report = run / "T01-report-02.mdx"
+        self.fill_task_report(report, criterion="The feature works quickly.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--approve")
+
+
+    def init5(self) -> Path:
+        """A five-role-v1 run; legacy behavior is never the default here."""
+        self.cli("init", "demo", "--harness", "claude", "--topology", "split",
+                 "--evidence-mode", "documents-only", "--workflow", "five-role-v1")
+        return self.root / ".docket" / "runs" / "demo"
+
+    def submit5(self, run: Path, owner: str) -> None:
+        """Assign, scope, and submit one task as its implementor."""
+        self.assign_simple(run, owner)
+        self.fill_task_report(run / f"{owner}-report-01.mdx",
+                              files=f"- `src/{owner.lower()}.py:1` - implemented {owner}.")
+        self.cli("submit", "demo", owner, "--as", "implementor")
+
+    def test_m8_authority_enforcement(self) -> None:
+        """Every forbidden cross-role operation is refused before mutation."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        refused = self.cli("submit", "demo", "T01", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("requires --as implementor", refused.stderr)
+        self.assertFalse((run / ".bundles" / "T01" / "rounds.json").exists())
+        self.assertIn("draft", (run / "T01-report-01.mdx").read_text())
+        wrong = self.cli("submit", "demo", "T01", "--as", "orchestrator", ok=False)
+        self.assertNotEqual(0, wrong.returncode)
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        bad_verify = self.cli("verify", "demo", "T01", "--result", "pass",
+                              "--as", "implementor", ok=False)
+        self.assertNotEqual(0, bad_verify.returncode)
+        self.assertIn("requires --as verifier", bad_verify.stderr)
+        bad_approve = self.cli("decide", "demo", "T01", "--approve",
+                               "--as", "verifier", ok=False)
+        self.assertNotEqual(0, bad_approve.returncode)
+        self.assertIn("requires --as reviewer", bad_approve.stderr)
+        bad_waive = self.cli("decide", "demo", "T01", "--waive", "--reason", "x",
+                             "--as", "orchestrator", ok=False)
+        self.assertNotEqual(0, bad_waive.returncode)
+        self.assertIn("requires --as reviewer", bad_waive.stderr)
+        no_proof = self.cli("decide", "demo", "T01", "--approve",
+                            "--as", "reviewer", ok=False)
+        self.assertNotEqual(0, no_proof.returncode)
+        self.assertIn("no passing verification", no_proof.stderr)
+        self.assertEqual([], list(run.glob("T01-decision-*.mdx")))
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+        # Reopen is a reviewer transition too. Waive T02 first as reviewer.
+        self.assign_simple(run, "T02")
+        self.fill_task_report(run / "T02-report-01.mdx", blocked=True,
+                              files="- `src/t02.py:1` - blocked change.")
+        self.cli("submit", "demo", "T02", "--blocked", "--as", "implementor")
+        self.cli("decide", "demo", "T02", "--waive", "--reason", "outage",
+                 "--as", "reviewer")
+        bad_reopen = self.cli("decide", "demo", "T02", "--reopen",
+                              "--reason", "back", "--as", "implementor", ok=False)
+        self.assertNotEqual(0, bad_reopen.returncode)
+        self.assertIn("requires --as reviewer", bad_reopen.stderr)
+        self.assertFalse((run / "T02-report-02.mdx").exists())
+
+    def test_m8_verifier_pass_cannot_complete(self) -> None:
+        """A verifier pass leaves the task submitted; approval binds revisions."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "outputs match the oracle")
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run, "T01"))
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        attempts = sorted(p.name for p in run.glob("T01-verification-*.mdx"))
+        self.assertEqual(["T01-verification-01.mdx", "T01-verification-02.mdx"], attempts)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("verdict: approved", decision)
+        self.assertIn("verification: T01-verification-02.mdx", decision)
+        self.assertIn("task_revision: sha256:", decision)
+        self.assertIn("bundle_digest: sha256:", decision)
+
+    def test_m8_routing_corrections_and_escalation(self) -> None:
+        """Every routing row resolves; exhausted corrections escalate once."""
+        run = self.init5()
+        expected = {
+            "scope-change": "implementor", "collision": "orchestrator",
+            "verification-defect": "implementor", "rate-limit-crash": "orchestrator",
+            "requirement-conflict": "planner", "dependency-invalidated": "orchestrator",
+            "dependency-plan-change": "planner", "dispute": "reviewer",
+            "budget-exhausted": "reviewer", "review-defect": "implementor",
+            "plan-gap": "planner", "waiver-request": "reviewer",
+            "spending-request": "user",
+        }
+        for kind, dest in expected.items():
+            with self.subTest(kind=kind):
+                out = self.cli("route", "demo", "--kind", kind).stdout
+                self.assertIn(f"destination: {dest}", out)
+        out = self.cli("route", "demo", "--kind", "dispute", "--owner", "T01").stdout
+        self.assertIn("destination: reviewer", out)
+        # Correction rounds and the durable escalation on a five-role run.
+        # A failed gate submission counts as a repair attempt without stranding
+        # the draft: the correction still submits afterwards.
+        self.assign_simple(run, "T09")
+        (run / "T09-report-01.mdx").write_text(
+            (run / "T09-report-01.mdx").read_text() + "\nTODO: finish\n")
+        gated_submit = self.cli("submit", "demo", "T09", "--as", "implementor",
+                                ok=False)
+        self.assertNotEqual(0, gated_submit.returncode)
+        self.assertEqual(1, json.loads(
+            (run / ".corrections" / "T09.json").read_text())["gate_repairs"])
+        (run / "T09-report-01.mdx").write_text(
+            (run / "T09-report-01.mdx").read_text().replace("\nTODO: finish\n", "\n"))
+        self.fill_task_report(run / "T09-report-01.mdx",
+                              files="- `src/t09.py:1` - implemented T09.")
+        self.cli("submit", "demo", "T09", "--as", "implementor")
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch")
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run, "T01"))
+        gated = self.cli("verify", "demo", "T01", "--result", "fail",
+                         "--open-correction", "--as", "verifier", ok=False)
+        self.assertNotEqual(0, gated.returncode)
+        self.assertIn("verifier_correction: allowed", gated.stderr)
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: allowed"))
+        self.cli("verify", "demo", "T01", "--result", "fail", "--open-correction",
+                 "--detail", "oracle mismatch at src/t01.py:1",
+                 "--as", "verifier")
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run, "T01"))
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("triggered_by: verifier", decision)
+        self.assertIn("verification: T01-verification-03.mdx", decision)
+        vmeta = parse_meta(run / "T01-verification-03.mdx")
+        self.assertEqual("yes", vmeta["opened_correction"])
+        # A separate chain: two reviewer corrections open; the third escalates.
+        self.submit5(run, "T02")
+        for rnd in (1, 2):
+            self.cli("decide", "demo", "T02", "--changes", "--as", "reviewer")
+            dec = run / f"T02-decision-{rnd:02d}.mdx"
+            dec.write_text(dec.read_text().replace(
+                "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+                self.REQUIREMENT))
+            self.cli("decide", "demo", "T02", "--changes", "--as", "reviewer")
+            self.fill_task_report(run / f"T02-report-{rnd + 1:02d}.mdx",
+                                  files="- `src/t02.py:1` - implemented T02.")
+            self.cli("submit", "demo", "T02", "--as", "implementor")
+        self.cli("decide", "demo", "T02", "--changes", "--as", "reviewer")
+        dec = run / "T02-decision-03.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        exhausted = self.cli("decide", "demo", "T02", "--changes", "--as", "reviewer",
+                             ok=False)
+        self.assertNotEqual(0, exhausted.returncode)
+        self.assertIn("escalation T02-r01 is open", exhausted.stderr)
+        self.assertTrue((run / ".escalations" / "T02-r01.json").is_file())
+        self.assertEqual(["T02-report-01.mdx", "T02-report-02.mdx", "T02-report-03.mdx"],
+                         self.rounds(run, "T02"))
+        again = self.cli("decide", "demo", "T02", "--changes", "--as", "reviewer",
+                         ok=False)
+        self.assertNotEqual(0, again.returncode)
+        self.assertEqual(1, len(list((run / ".escalations").glob("*.json"))))
+        self.assertIn("submitted", (run / "T02-report-03.mdx").read_text())
+
+    def test_m8_stale_revision_blocks_verdict(self) -> None:
+        """A verdict never falls back to whatever the workspace holds now."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(
+            task_text.replace("- [ ] The feature works.", "- [ ] The feature works fast."))
+        stale = self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer",
+                         ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("re-verify after the amendment", stale.stderr)
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_m8_legacy_preserved_and_migrated(self) -> None:
+        """Legacy runs keep their semantics until an explicit migration."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("approved", (run / "T01-report-01.mdx").read_text())
+        legacy_verify = self.cli("verify", "demo", "T01", "--result", "pass",
+                                 "--as", "verifier", ok=False)
+        self.assertNotEqual(0, legacy_verify.returncode)
+        self.assertIn("migrate explicitly", legacy_verify.stderr)
+        self.assertIn("no derived events",
+                      self.cli("events", "demo", "--role", "verifier", "--peek").stdout)
+        rep_before = (run / "T01-report-01.mdx").read_bytes()
+        dec_before = (run / "T01-decision-01.mdx").read_bytes()
+        # An interrupted migration resumes without rewriting legacy evidence.
+        # The plan write is atomic, so the crash lands after it: the rerun
+        # finishes the pending sweep instead of starting over.
+        crash = self.cli("migrate", "demo", "--to", "five-role-v1",
+                         ok=False, fault="migrate:plan")
+        self.assertEqual(70, crash.returncode)
+        self.assertIn("workflow: five-role-v1", (run / "plan.mdx").read_text())
+        resumed = self.cli("migrate", "demo", "--to", "five-role-v1")
+        self.assertIn("already five-role-v1", resumed.stdout)
+        plan = (run / "plan.mdx").read_text()
+        self.assertIn("workflow: five-role-v1", plan)
+        self.assertIn("migrated_from: legacy", plan)
+        self.assertEqual(rep_before, (run / "T01-report-01.mdx").read_bytes())
+        self.assertEqual(dec_before, (run / "T01-decision-01.mdx").read_bytes())
+        # The new workflow is enforced from here on.
+        self.assign_simple(run, "T02")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        bare = self.cli("submit", "demo", "T02", ok=False)
+        self.assertNotEqual(0, bare.returncode)
+        self.assertIn("requires --as implementor", bare.stderr)
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        self.assertIn("already five-role-v1",
+                      self.cli("migrate", "demo", "--to", "five-role-v1").stdout)
+
+    def test_m8_verifier_reviewer_routing(self) -> None:
+        """Submissions reach verifiers promptly; milestones reach the reviewer."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        verifier_keys = [l.strip().split()[-1] for l in self.cli(
+            "events", "demo", "--role", "verifier", "--peek").stdout.splitlines()
+            if ":submitted" in l]
+        self.assertEqual({"T01:1:submitted", "T02:1:submitted"}, set(verifier_keys))
+        self.assertNotIn("review-batch",
+                         self.cli("events", "demo", "--role", "verifier", "--peek").stdout)
+        self.assertIn("no derived events",
+                      self.cli("events", "demo", "--role", "reviewer", "--peek").stdout)
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02",
+                 "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        self.assertNotIn("batch:M1:ready:",
+                         self.cli("events", "demo", "--role", "reviewer", "--peek").stdout)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        reviewer_keys = [l.strip().split()[-1] for l in self.cli(
+            "events", "demo", "--role", "reviewer", "--peek").stdout.splitlines()
+            if "batch:M1:ready:" in l]
+        self.assertEqual(1, len(reviewer_keys))
+        # Exhausting corrections routes a durable escalation to the reviewer.
+        # The verifier failure already spent one of the two local attempts, so
+        # one reviewer correction opens and the next one escalates.
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        self.fill_task_report(run / "T01-report-02.mdx")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        dec = run / "T01-decision-02.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        self.assertNotEqual(0, self.cli(
+            "decide", "demo", "T01", "--changes", "--as", "reviewer", ok=False).returncode)
+        escalated = [l.strip().split()[-1] for l in self.cli(
+            "events", "demo", "--role", "reviewer", "--peek").stdout.splitlines()
+            if ":escalated:" in l]
+        self.assertEqual(["T01:escalated:T01-r01"], escalated)
+
+    # --------------------------------- prompts, feedback, improvements
+
+    def prompt_text(self, run: Path, owner: str, role: str, **kwargs: str) -> str:
+        result = self.cli("prompt", "demo", owner, "--role", role,
+                          *[item for pair in kwargs.items() for item in
+                            (f"--{pair[0].replace('_', '-')}", pair[1])])
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout
+
+    def test_m9_prompt_is_deterministic_bounded_and_role_correct(self) -> None:
+        """Same inputs render byte-identical prompts with digests and no filler."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        first = self.prompt_text(run, "T01", "implementor", model="unknown-model-9")
+        second = self.prompt_text(run, "T01", "implementor", model="unknown-model-9")
+        self.assertEqual(first, second)
+        self.assertIn("Implement the assigned task", first)
+        self.assertIn("task revision: sha256:", first)
+        self.assertNotIn("you are", first.lower())
+        self.assertNotIn("unknown-model-9 implementor", first)
+        # Unknown models get no model profile, only task-relevant cards (none trigger here).
+        self.assertNotIn("[muse]", first)
+        self.assertNotIn("[fixture-changes]", first)
+        # Relevant task text selects task cards in budget; one-run model defaults are gone.
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Fix the flaky fixture oracle under concurrency."))
+        guided = self.prompt_text(run, "T01", "implementor", model="claude-opus-9")
+        self.assertNotIn("[muse]", guided)
+        self.assertIn("[fixture-changes]", guided)
+        self.assertIn("[concurrency]", guided)
+        self.assertNotIn("[deployment-config]", guided)
+        self.assertNotEqual(first, guided)
+        digest_line = self.cli("prompt", "demo", "T01", "--role", "implementor",
+                               "--model", "claude-opus-9").stderr
+        self.assertIn("prompt digest: sha256:", digest_line)
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        self.assertTrue(records)
+        record = json.loads(records[-1].read_text())
+        self.assertTrue(record["digest"].startswith("sha256:"))
+        self.assertTrue(any(r.startswith("fixture-changes:") for r in record["profile_revisions"]))
+        self.assertLessEqual(record["guidance_tokens"], 600)
+        # Orchestrator prompts carry routing rules and prohibitions.
+        orch = self.prompt_text(run, "T01", "orchestrator")
+        self.assertIn("never invent technical fixes", orch.lower())
+        self.assertIn("dispute", orch.lower())
+
+    def test_m9_feedback_is_optional_and_isolated(self) -> None:
+        """Absent or failed feedback never blocks the primary workflow."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("decide", "demo", "T01", "--approve")
+        listed = self.cli("feedback", "demo", "--list").stdout
+        self.assertIn("no recorded observations", listed)
+        self.cli("feedback", "demo", "--add", "--role", "verifier",
+                 "--category", "verification", "--body", "oracle derived twice",
+                 "--task", "T01", "--round", "1", "--confidence", "high")
+        self.assertIn("F01", self.cli("feedback", "demo", "--list").stdout)
+        # Break the feedback sink: lifecycle work still succeeds.
+        import shutil
+        shutil.rmtree(run / "feedback")
+        (run / "feedback").write_text("not a directory")
+        broken = self.cli("feedback", "demo", "--add", "--role", "implementor",
+                          "--category", "other", "--body", "lost", ok=False)
+        self.assertNotEqual(0, broken.returncode)
+        self.submit_simple(run, "T02")
+        self.cli("decide", "demo", "T02", "--approve")
+        self.assertIn("approved", (run / "T02-report-01.mdx").read_text())
+
+    def test_m9_backlog_dedups_incidents_and_filters(self) -> None:
+        """Corroborating roles count once; backlog filters slice the backlog."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("feedback", "demo", "--add", "--role", "implementor",
+                 "--category", "verification", "--body", "oracle unclear",
+                 "--task", "T01", "--round", "1")
+        self.cli("feedback", "demo", "--add", "--role", "verifier",
+                 "--category", "verification", "--body", "oracle unclear too",
+                 "--task", "T01", "--round", "1")
+        self.cli("improvements", "--add", "--title", "unclear oracle",
+                 "--category", "verification", "--evidence", "demo/T01, demo/T01")
+        out = self.cli("improvements").stdout
+        self.assertIn("incidents=1 runs=1", out)
+        filtered = self.cli("improvements", "--category", "verification").stdout
+        self.assertIn("unclear oracle", filtered)
+        self.assertIn("no findings match",
+                      self.cli("improvements", "--category", "delivery").stdout)
+        self.assertIn("no findings match",
+                      self.cli("improvements", "--status", "adopted").stdout)
+        # Operational records reconcile into machine observations without dups.
+        self.cli("reconcile", "demo")
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "o", "--role", "orchestrator")
+        self.cli("inbox", "demo", "--role", "orchestrator", "--claim", "--session", "s1")
+        self.cli("events", "demo", "--role", "orchestrator", "--retry",
+                 [json.loads(p.read_text())["key"] for p in
+                  (run / ".delivery" / "orchestrator" / "pending").glob("*.json")][0],
+                 "--reason", "lost wake")
+        self.assertIn("1 operational", self.cli("feedback", "demo", "--import-ops").stdout)
+        self.assertIn("0 operational", self.cli("feedback", "demo", "--import-ops").stdout)
+
+    def test_m9_retrospective_needs_no_model(self) -> None:
+        """Retrospective output is mechanical and premium use stays unknown."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("decide", "demo", "T01", "--approve")
+        out = self.cli("retrospective", "demo").stdout
+        self.assertIn("mechanical summary, no model calls", out)
+        self.assertIn("decisions recorded: 1", out)
+        self.assertIn("premium tokens: unknown", out)
+        self.assertIn("proxy", out)
+
+    def test_m9_promotion_requires_evidence_and_never_autoedits(self) -> None:
+        """Adoption links authorization, revision, and trial; nothing self-edits."""
+        import hashlib
+        refs = Path(__file__).parents[1] / "references"
+        before = {str(p.relative_to(refs)): hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in sorted(refs.rglob("*")) if p.is_file()}
+        self.cli("improvements", "--add", "--title", "slow gate",
+                 "--category", "verification")
+        refused = self.cli("improvements", "--propose", "I01", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.cli("improvements", "--propose", "I01", "--expected", "faster review",
+                 "--change", "cache the gate", "--eval", "pilot task 3")
+        early = self.cli("improvements", "--adopt", "I01", ok=False)
+        self.assertNotEqual(0, early.returncode)
+        self.cli("improvements", "--trial", "I01", "--note", "trying on one run")
+        no_rev = self.cli("improvements", "--adopt", "I01", "--trial-result", "helped",
+                          ok=False)
+        self.assertNotEqual(0, no_rev.returncode)
+        self.cli("improvements", "--adopt", "I01", "--change-rev", "abc123",
+                 "--trial-result", "helped")
+        self.assertIn("[adopted]", self.cli("improvements").stdout)
+        self.cli("improvements", "--add", "--title", "dead end", "--category", "other")
+        self.cli("improvements", "--reject", "I02", "--rationale", "no supporting incident")
+        self.assertIn("[rejected]", self.cli("improvements", "--status", "rejected").stdout)
+        after = {str(p.relative_to(refs)): hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in sorted(refs.rglob("*")) if p.is_file()}
+        self.assertEqual(before, after)
+
+    # ----------------------------------- dispatch, budgets, amendments
+
+    def init_policy(self, **fields: str) -> Path:
+        """A documents-only run with flat budget and policy fields on its plan."""
+        run = self.init("split", evidence_mode="documents-only")
+        plan = run / "plan.mdx"
+        lines = plan.read_text().splitlines()
+        for i, line in enumerate(lines):
+            key = line.split(":", 1)[0].strip()
+            if key in fields:
+                lines[i] = f"{key}: {fields.pop(key)}"
+        if fields:
+            insert_at = next(i for i, line in enumerate(lines) if line.startswith("run:"))
+            for key, value in fields.items():
+                insert_at += 1
+                lines.insert(insert_at, f"{key}: {value}")
+        plan.write_text("\n".join(lines) + "\n")
+        return run
+
+    def test_m10_dispatch_is_idempotent_and_guarded(self) -> None:
+        """One writer per round and session; refusals name the exact condition."""
+        run = self.init_policy(primary_model="m1", fallback_models="m2, m3",
+                               max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.cli("assign", "demo", "T02", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t02.py",
+                 "--verify", 'printf "T02 ok\\n"', "--depends-on", "T01")
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        unmet = self.cli("dispatch", "demo", "T02", "--session", "w1", ok=False)
+        self.assertNotEqual(0, unmet.returncode)
+        self.assertIn("T01", unmet.stderr)
+        # A crash after the record write still adopts the same single writer.
+        crash = self.cli("dispatch", "demo", "T01", "--session", "w1",
+                         ok=False, fault="dispatch:launch")
+        self.assertEqual(70, crash.returncode)
+        first = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("already dispatched: T01 round 1 -> session w1 (dsp:", first.stdout)
+        txn = re.search(r"dsp:[0-9a-f]+", first.stdout).group(0)
+        again = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("already dispatched", again.stdout)
+        self.assertIn(txn, again.stdout)
+        rival = self.cli("dispatch", "demo", "T01", "--session", "w2", ok=False)
+        self.assertNotEqual(0, rival.returncode)
+        self.assertIn("already dispatched to session 'w1'", rival.stderr)
+        self.assertEqual(1, len(list((run / ".dispatch").glob("*.json"))))
+        # Provider concurrency is enforced with its exact utilization.
+        self.assign_simple(run, "T03")
+        capped = self.cli("dispatch", "demo", "T03", "--session", "w2", ok=False)
+        self.assertNotEqual(0, capped.returncode)
+        self.assertIn("concurrency 1/1", capped.stderr)
+
+    def test_t31_approved_releases_capacity(self) -> None:
+        """An approved round stops counting as live execution capacity."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        blocked = self.cli("dispatch", "demo", "T02", "--session", "w2", ok=False)
+        self.assertNotEqual(0, blocked.returncode)
+        self.assertIn("concurrency 1/1", blocked.stderr)
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--approve", "--reason", "Correct.")
+        freed = self.cli("dispatch", "demo", "T02", "--session", "w2")
+        self.assertIn("dispatched T02 round 1", freed.stdout)
+        self.cli("reconcile", "demo")
+        t01 = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertNotEqual("dispatched", t01.get("state"))
+        t02 = json.loads((run / ".dispatch" / "T02.json").read_text())
+        self.assertEqual("dispatched", t02.get("state"))
+
+    def test_t31_superseded_round_releases_capacity(self) -> None:
+        """A round superseded by a later round no longer holds a slot."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--changes")
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/t01.py:1` and add a regression.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", "Needs a guard.")
+        self.assertTrue((run / "T01-report-02.mdx").is_file())
+        second = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("dispatched T01 round 2", second.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(2, int(record.get("round", 0)))
+        self.assertEqual("dispatched", record.get("state"))
+
+    def test_t31_handoff_releases_capacity_and_preserves_scope(self) -> None:
+        """A ready handoff frees execution capacity but keeps scope owned."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-01.mdx")
+        ready = self.cli("handoff", "demo", "T01", "--submit")
+        self.assertIn("ready for a replacement", ready.stdout)
+        freed = self.cli("dispatch", "demo", "T02", "--session", "w2")
+        self.assertIn("dispatched T02 round 1", freed.stdout)
+        self.cli("assign", "demo", "T03", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t01.py",
+                 "--verify", 'printf "T03 ok\\n"')
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_scope(run / "T03-scope.mdx")
+        collision = self.cli("scope", "demo", "T03", "--submit", ok=False)
+        self.assertNotEqual(0, collision.returncode)
+        self.assertIn("T01", collision.stderr)
+
+    def test_t31_reconcile_reconciles_stale_dispatch(self) -> None:
+        """Reconcile derives liveness from documents and names stale records."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--approve", "--reason", "Correct.")
+        before = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("dispatched", before.get("state"))
+        out = self.cli("reconcile", "demo").stdout
+        self.assertIn("T01", out)
+        self.assertIn("dispatch", out.lower())
+        after = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertNotEqual("dispatched", after.get("state"))
+        self.assertEqual(before.get("model_requested"), after.get("model_requested"))
+
+    def test_t31_serialized_cap_claim_across_owners(self) -> None:
+        """Two concurrent dispatches under a cap of one cannot both succeed."""
+        import concurrent.futures as futures
+        import threading
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.assign_simple(run, "T03")
+        for sid in ("w1", "w2", "w3"):
+            self.cli("session", "demo", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        barrier = threading.Barrier(3)
+        root = self.root
+
+        def one(owner: str, session: str) -> subprocess.CompletedProcess[str]:
+            barrier.wait(timeout=10)
+            return subprocess.run(
+                [sys.executable, str(DOCKET), "dispatch", "demo", owner,
+                 "--session", session],
+                cwd=str(root), text=True, capture_output=True,
+            )
+
+        with futures.ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(one, ("T01", "T02", "T03"), ("w1", "w2", "w3")))
+        ok = [r for r in results if r.returncode == 0]
+        refused = [r for r in results if r.returncode != 0]
+        self.assertEqual(1, len(ok))
+        self.assertEqual(2, len(refused))
+        for r in refused:
+            self.assertIn("concurrency", r.stderr)
+            self.assertIn("1/1", r.stderr)
+        text = Path(DOCKET).read_text()
+        self.assertIn("capacity_lock", text)
+        self.assertIn("read-check-write", text)
+        self.assertIn("run-wide capacity", text)
+
+    def test_t31_retry_generation_binding(self) -> None:
+        """Same session plus newer generation is a different writer needing resume."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        same = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("already dispatched", same.stdout)
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1-restarted", "--role", "implementor")
+        rival = self.cli("dispatch", "demo", "T01", "--session", "w1", ok=False)
+        self.assertNotEqual(0, rival.returncode)
+        self.assertIn("docket resume", rival.stderr)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("w1", record.get("session"))
+        self.assertEqual(1, int(record.get("session_generation", 1)))
+
+    def test_t31_resume_holds_single_live_record(self) -> None:
+        """Handoff frees the slot and resume re-acquires exactly one live record."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.cli("set-model", "demo", "T01", "--actual", "live-m")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-01.mdx")
+        self.cli("handoff", "demo", "T01", "--submit")
+        handed = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertNotEqual("dispatched", handed.get("state"))
+        resumed = self.cli("resume", "demo", "T01", "--session", "w2",
+                           "--reason", "process killed")
+        self.assertIn("resumed T01 round 1 -> session w2", resumed.stdout)
+        files = list((run / ".dispatch").glob("*.json"))
+        self.assertEqual(1, len(files))
+        record = json.loads(files[0].read_text())
+        self.assertEqual("dispatched", record.get("state"))
+        self.assertEqual("w2", record.get("session"))
+        self.assertIn("live-m", [h.get("model") for h in record.get("model_history", [])])
+
+    def test_t31_status_and_health_show_live_capacity(self) -> None:
+        """Status and health report live execution capacity matching live records."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        status_one = self.cli("status", "demo").stdout
+        self.assertIn("1 live", status_one)
+        health_one = self.cli("health", "demo").stdout
+        self.assertIn("1 live", health_one)
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--approve", "--reason", "Correct.")
+        self.cli("reconcile", "demo")
+        status_zero = self.cli("status", "demo").stdout
+        self.assertIn("0 live", status_zero)
+        health_zero = self.cli("health", "demo").stdout
+        self.assertIn("0 live", health_zero)
+        self.cli("dispatch", "demo", "T02", "--session", "w2")
+        status_back = self.cli("status", "demo").stdout
+        self.assertIn("1 live", status_back)
+
+    def test_m10_resume_recovers_without_handoff(self) -> None:
+        """Abrupt loss without a semantic handoff is recoverable and honest."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.cli("set-model", "demo", "T01", "--actual", "live-m")
+        resumed = self.cli("resume", "demo", "T01", "--session", "w2",
+                           "--reason", "process killed")
+        self.assertIn("resumed T01 round 1 -> session w2", resumed.stdout)
+        checkpoint = json.loads((run / ".checkpoints" / "T01-01.json").read_text())
+        self.assertEqual("no", checkpoint["semantic_handoff"])
+        self.assertEqual("T01-task.mdx", checkpoint["task_pointer"])
+        self.assertTrue(checkpoint["task_revision"].startswith("sha256:"))
+        dispatch = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("w2", dispatch["session"])
+        self.assertIn("observed", [h.get("kind") for h in dispatch["model_history"]])
+        self.assertIn("live-m", [h.get("model") for h in dispatch["model_history"]])
+        self.assertEqual("live-m", dispatch["model_observed"])
+        # A crash during the rebind still settles on one writer on retry.
+        crash = self.cli("resume", "demo", "T01", "--session", "w2", ok=False,
+                         fault="resume:rebind")
+        self.assertEqual(70, crash.returncode)
+        retried = self.cli("resume", "demo", "T01", "--session", "w2")
+        self.assertEqual(0, retried.returncode)
+        self.assertEqual("w2", json.loads(
+            (run / ".dispatch" / "T01.json").read_text())["session"])
+
+    def test_m10_budgets_fallbacks_sizing_and_unknown_telemetry(self) -> None:
+        """Flat policy bounds spend; breadth warns; missing telemetry is unknown."""
+        run = self.init_policy(primary_model="m1", fallback_models="m2, m3")
+        plan = (run / "plan.mdx").read_text()
+        self.assertIn("correction_limit: 2", plan)
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        dispatched = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertNotIn("unknown", dispatched.stdout)
+        dispatch = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("m1", dispatch["model_requested"])
+        self.assertEqual("unobserved", dispatch["model_observed"])
+        self.cli("switch-model", "demo", "T01", "--model", "m2")
+        repeat = self.cli("switch-model", "demo", "T01", "--model", "m2", ok=False)
+        self.assertNotEqual(0, repeat.returncode)
+        self.assertIn("already tried", repeat.stderr)
+        outside = self.cli("switch-model", "demo", "T01", "--model", "mx", ok=False)
+        self.assertNotEqual(0, outside.returncode)
+        self.assertIn("higher spending tier", outside.stderr)
+        entry = json.loads((run / ".exceptions" / "T01.json").read_text())
+        self.assertEqual("open", entry["state"])
+        self.assertIn("higher spending tier", entry["detail"])
+        again = self.cli("switch-model", "demo", "T01", "--model", "mx", ok=False)
+        self.assertNotEqual(0, again.returncode)
+        self.assertEqual(entry, json.loads((run / ".exceptions" / "T01.json").read_text()))
+        retrospective = self.cli("retrospective", "demo").stdout
+        self.assertIn("premium tokens: unknown", retrospective)
+        # Task sizing warns on guessed breadth and never rejects on file count.
+        many = self.cli("assign", "demo", "T09", "--complexity", "high", "--executor",
+                        "implementor", "--harness", "opencode",
+                        *sum((["--file", f"src/p{i}.py"] for i in range(10)), []),
+                        "--verify", 'printf ok')
+        self.assertEqual(0, many.returncode)
+        self.assertIn("guessed breadth", many.stdout)
+
+    def test_t32_initial_dispatch_outside_policy_refused(self) -> None:
+        """An initial model outside the approved policy needs the exception."""
+        run = self.init_policy(primary_model="m1", fallback_models="m2, m3")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        refused = self.cli("dispatch", "demo", "T01", "--session", "w1",
+                           "--model", "mx", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("exception", refused.stderr)
+        self.assertIn("is open", refused.stderr)
+        self.assertIn("higher spending tier", refused.stderr)
+        entry = json.loads((run / ".exceptions" / "T01.json").read_text())
+        self.assertEqual("T01", entry.get("owner"))
+        self.assertEqual("open", entry.get("state"))
+        self.assertIn("mx", entry.get("detail", ""))
+        self.assertFalse((run / ".dispatch" / "T01.json").is_file())
+
+    def test_t32_empty_fallback_is_single_model(self) -> None:
+        """Primary with empty fallbacks allows exactly one model."""
+        run = self.init_policy(primary_model="m1", fallback_models="")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        ok_dispatch = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("dispatched T01 round 1", ok_dispatch.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("m1", record.get("model_requested"))
+        refused = self.cli("switch-model", "demo", "T01", "--model", "mx", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("exception", refused.stderr)
+        self.assertIn("is open", refused.stderr)
+        entry = json.loads((run / ".exceptions" / "T01.json").read_text())
+        self.assertEqual("open", entry.get("state"))
+        self.assertIn("[m1]", entry.get("detail", ""))
+
+    def test_t32_absent_policy_usable_with_plain_message(self) -> None:
+        """No policy at all stays usable and says so plainly once."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        out = self.cli("dispatch", "demo", "T01", "--session", "w1",
+                       "--model", "any-m")
+        self.assertIn("dispatched T01 round 1", out.stdout)
+        combined = out.stdout + out.stderr
+        self.assertIn("no approved model policy", combined)
+        self.assertIn("nothing is being enforced", combined)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("any-m", record.get("model_requested"))
+
+    def test_t32_absent_and_empty_distinguishable(self) -> None:
+        """Absent and single-model runs produce different messages."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        absent_out = self.cli("dispatch", "demo", "T01", "--session", "w1",
+                              "--model", "any-m")
+        self.assertIn("no approved model policy", absent_out.stdout + absent_out.stderr)
+        plan = run / "plan.mdx"
+        text = plan.read_text().replace("run: demo", "run: demo\nprimary_model: m1")
+        plan.write_text(text)
+        self.assign_simple(run, "T02")
+        single_out = self.cli("dispatch", "demo", "T02", "--session", "w1")
+        self.assertNotIn("no approved model policy", single_out.stdout + single_out.stderr)
+        refused = self.cli("switch-model", "demo", "T02", "--model", "mx", ok=False)
+        self.assertIn("[m1]", refused.stderr)
+
+    def test_t32_model_history_and_open_exception(self) -> None:
+        """Approved and exceptional transitions keep history with an open owner."""
+        run = self.init_policy(primary_model="m1", fallback_models="")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        refused = self.cli("switch-model", "demo", "T01", "--model", "mx", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        entry = json.loads((run / ".exceptions" / "T01.json").read_text())
+        self.assertEqual("T01", entry.get("owner"))
+        self.assertEqual("open", entry.get("state"))
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        tried = [h.get("model", "") for h in record.get("model_history", [])]
+        self.assertIn("m1", tried)
+        self.assertNotIn("mx", tried)
+        again = self.cli("switch-model", "demo", "T01", "--model", "mx", ok=False)
+        self.assertNotEqual(0, again.returncode)
+        entry2 = json.loads((run / ".exceptions" / "T01.json").read_text())
+        self.assertEqual(entry, entry2)
+        self.assertEqual("open", entry2.get("state"))
+
+    def test_t32_dispatch_binds_prompt_digest(self) -> None:
+        """The dispatch record carries a digest recomputable from the prompt."""
+        run = self.init_policy(primary_model="m1", fallback_models="m2, m3")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        digest = record.get("prompt_digest", "")
+        self.assertTrue(str(digest).startswith("sha256:"))
+        rendered = self.cli("prompt", "demo", "T01", "--role", "implementor",
+                            "--model", "m1")
+        recomputed = sha(rendered.stdout.encode())
+        self.assertEqual(digest, recomputed)
+
+    def test_t32_binding_not_delivery(self) -> None:
+        """Dispatch records a binding with unobserved fields, not a delivery."""
+        run = self.init_policy(primary_model="m1", fallback_models="m2, m3")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        out = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertIn("recorded binding", out.stdout)
+        self.assertIn("prompt digest", out.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("unobserved", record.get("model_observed"))
+
+    def test_t32_premium_budget_removed(self) -> None:
+        """No product document still names the unimplemented knob."""
+        repo = Path(DOCKET).resolve().parents[3]
+        for relative in ("ARCHITECTURE.md", "docs/docket-current-system.mdx",
+                         "docs/docket-architecture.html"):
+            text = (repo / relative).read_text()
+            self.assertNotIn("premium_budget", text)
+
+    def test_m10_amendment_selectively_invalidates(self) -> None:
+        """An amendment pauses only affected work; delayed old events cannot act."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("assign", "demo", "T02", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t02.py",
+                 "--verify", 'printf "T02 ok\\n"', "--depends-on", "T01")
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02")
+        self.submit_simple(run, "T03")
+        thin = self.cli("propose-amendment", "demo", "T01", "--need", "decide X",
+                        ok=False)
+        self.assertNotEqual(0, thin.returncode)
+        self.assertIn("is required", thin.stderr)
+        self.cli("propose-amendment", "demo", "T01", "--need", "decide the cache scope",
+                 "--conflicts", "task says memory, repo uses disk",
+                 "--evidence", "src/cache.py:40",
+                 "--alternative", "allow either backend",
+                 "--impact", "T01 acceptance and T02 schedule")
+        planner = self.cli("events", "demo", "--role", "planner", "--peek").stdout
+        self.assertIn("T01:amendment:T01-01", planner)
+        self.cli("reconcile", "demo")
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch", "--role", "orchestrator")
+        self.cli("health", "demo", "--flag-stall", "T02", "--cause", "waiting")
+        self.cli("reconcile", "demo")
+        old_keys = [json.loads(p.read_text())["key"] for p in
+                    (run / ".delivery" / "orchestrator" / "pending").glob("*.json")
+                    if json.loads(p.read_text()).get("owner") == "T02"]
+        self.assertEqual(1, len(old_keys))
+        # The planner edits the contract, then accepts: only T02 invalidates.
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Implement the feature with either backend."))
+        accepted = self.cli("amendment", "demo", "--accept", "T01-01", "--by", "planner")
+        self.assertIn("invalidated 1 dependent(s): T02", accepted.stdout)
+        self.cli("health", "demo", "--resolve-stall", "T02-1")
+        swept = self.cli("reconcile", "demo").stdout
+        self.assertIn("retired", swept)
+        blocked_t02 = self.cli("decide", "demo", "T02", "--approve", ok=False)
+        self.assertNotEqual(0, blocked_t02.returncode)
+        self.assertIn("amendment T01-01", blocked_t02.stderr)
+        self.cli("decide", "demo", "T03", "--approve")
+        self.assertIn("approved", (run / "T03-report-01.mdx").read_text())
+        # A delayed event for the old revision cannot act after retirement.
+        self.assertIn("already retired", self.cli(
+            "events", "demo", "--role", "orchestrator",
+            "--ack", old_keys[0], "--session", "s1").stdout)
+        # The affected task reverifies in a fresh round and decides cleanly.
+        self.cli("decide", "demo", "T02", "--changes")
+        dec = run / "T02-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        self.cli("decide", "demo", "T02", "--changes")
+        self.fill_task_report(run / "T02-report-02.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02")
+        self.cli("decide", "demo", "T02", "--approve")
+        self.assertIn("approved", (run / "T02-report-02.mdx").read_text())
+
+    # --------------------------------- packets and qualification
+
+    @staticmethod
+    def report_body_digest(report: Path) -> str:
+        """The evidence digest form, computed the way the CLI computes it."""
+        text = report.read_text()
+        body = text[text.find("\n---", 3) + 4:].lstrip("\n")
+        return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+
+    @staticmethod
+    def packet_tokens(packet: str) -> int:
+        return max(1, len(packet) // 4)
+
+    def test_m11_review_packet_pinned_and_bounded(self) -> None:
+        """Packets bind exact revisions, bound tokens, and preserve risks."""
+        run = self.init5()
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace(
+            "## Risks", "## Risks\n\nCache stampede on cold start."))
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.assign_simple(run, "T02")
+        self.fill_task_report(run / "T02-report-01.mdx", blocked=True,
+                              files="- `src/t02.py:1` - blocked change.")
+        self.cli("submit", "demo", "T02", "--blocked", "--as", "implementor")
+        self.cli("decide", "demo", "T02", "--waive", "--reason", "disk is full",
+                 "--as", "reviewer")
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        manifest, _ = self.frozen("T01")
+        self.assertIn(manifest["digest"], packet)
+        self.assertIn("T01-verification-01.mdx: pass", packet)
+        self.assertIn("disk is full", packet)
+        self.assertIn("Cache stampede", packet)
+        tokens = int(re.search(r"packet: (\d+) estimated tokens",
+                               self.cli("review-packet", "demo",
+                                        "--role", "reviewer").stderr).group(1))
+        self.assertLessEqual(tokens, 2000)
+        # A correction packet carries findings, the delta, and fresh evidence.
+        self.submit5(run, "T03")
+        self.cli("verify", "demo", "T03", "--result", "fail", "--as", "verifier",
+                 "--detail", "F1: oracle mismatch")
+        self.cli("decide", "demo", "T03", "--changes", "--as", "reviewer")
+        dec = run / "T03-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        self.cli("decide", "demo", "T03", "--changes", "--as", "reviewer")
+        self.fill_task_report(run / "T03-report-02.mdx",
+                              files="- `src/t03.py:1` - implemented T03.")
+        self.cli("submit", "demo", "T03", "--as", "implementor")
+        self.cli("verify", "demo", "T03", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T03", "--approve", "--as", "reviewer")
+        correction = self.cli("review-packet", "demo", "--role", "reviewer",
+                              "--correction", "T03").stdout
+        self.assertIn("T03-verification-01.mdx: fail", correction)
+        self.assertIn("T03-verification-02.mdx: pass", correction)
+        self.assertNotIn("- T01 round", correction)
+        self.assertIn("T03-decision-01.mdx", correction)
+
+    def docket_mod(self):  # type: ignore[no-untyped-def]
+        """The CLI binary as an importable module, cached per test."""
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        if getattr(self, "_docket_mod", None) is None:
+            _loader = _SFL("docket_test_mod", str(DOCKET))
+            _spec = _ilu.spec_from_loader("docket_test_mod", _loader)
+            assert _spec is not None
+            _mod = _ilu.module_from_spec(_spec)
+            _loader.exec_module(_mod)
+            self._docket_mod = _mod
+        return self._docket_mod
+
+    def test_aggregate_retry_safety(self) -> None:
+        """Interrupted aggregate freeze and decision transitions are retry-safe."""
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+
+        self.cli(
+            "submit", "demo", "orch", "--skip-verify",
+            fault="bundle:publish",
+            ok=False,
+        )
+        # The freeze was interrupted; re-submitting should succeed.
+        result = self.cli("submit", "demo", "orch", "--skip-verify")
+        self.assertIn("frozen aggregate bundle", result.stdout)
+        self.assertIn("intact", self.cli("bundle", "demo", "orch", "--list").stdout)
+
+        # Interrupt a decision transition.
+        self.cli(
+            "decide", "demo", "orch", "--approve",
+            fault="transition:report",
+            ok=False,
+        )
+        # Retry finishes it without a second round: either it resumes the
+        # journalled transition or it observes the already-applied verdict.
+        result = self.cli("decide", "demo", "orch", "--approve", ok=True)
+        self.assertTrue(
+            "resumed interrupted" in result.stdout or "already approved" in result.stdout,
+            f"unexpected retry output: {result.stdout}",
+        )
+        self.assertIn("approved", (run / "orch-decision-01.mdx").read_text())
+        self.assertEqual(1, len(list(run.glob("orch-decision-*.mdx"))))
+
+    def test_aggregate_invalidation_on_constituent_reopen(self) -> None:
+        """Reopening a constituent visibly invalidates dependent aggregate readiness."""
+        run = self.setup_aggregate_run()
+
+        # Waive a fresh T03, then build the aggregate pinning it.
+        self.assign("T03", file="src/c.py")
+        self.fill_task(run / "T03-task.mdx")
+        self.fill_task_report(run / "T03-report-01.mdx", blocked=True,
+                              files="- `src/c.py:1` - blocked change.")
+        self.cli("submit", "demo", "T03", "--blocked")
+        self.cli("decide", "demo", "T03", "--waive", "--reason", "external outage")
+
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        self.cli("submit", "demo", "orch", "--skip-verify")
+
+        # Reopen T03.
+        self.cli(
+            "decide", "demo", "T03", "--reopen",
+            "--reason", "service is back up",
+            ok=True,
+        )
+
+        # Status names the invalidated aggregate and the reopened task.
+        status = self.cli("status", "demo").stdout
+        self.assertIn("aggregate bundle staleness", status)
+        self.assertIn("reopened from waiver", status)
+        self.assertIn("T03", status)
+
+        # Events now include the aggregate-stale and reopened notifications.
+        events = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertIn("T03:reopened", events)
+        self.assertIn("any aggregate bundle that pinned it is stale", events)
+
+    # ------------------------------------------------------- before/after evidence
+
+    def test_aggregate_submission_previously_froze_nothing(self) -> None:
+        """Before aggregate support, orch submissions had no bundle at all."""
+        # This test always verifies the current behavior: orch submit freezes
+        # an aggregate bundle. When DOCKET_BIN_PRIOR points at a prior build,
+        # it first demonstrates the regression (prior froze nothing) on the
+        # same run, then shows the fix. It never skips, so it is real evidence.
+        run = self.setup_aggregate_run()
+        self.assign("orch", executor="orchestrator")
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+
+        prior_bin = os.environ.get("DOCKET_BIN_PRIOR")
+        if prior_bin:
+            prior_result = subprocess.run(
+                [sys.executable, prior_bin, "submit", "demo", "orch", "--skip-verify"],
+                cwd=str(self.root), text=True, capture_output=True,
+            )
+            self.assertEqual(0, prior_result.returncode)
+            # Before: no bundle digest in the report frontmatter.
+            self.assertNotIn("bundle_digest:", report.read_text())
+            # Reset to draft so the current binary can submit the same round.
+            text = report.read_text()
+            for old_status in ("status: submitted", "status: completed", "status: blocked"):
+                text = text.replace(old_status, "status: draft")
+            report.write_text(text)
+        # With the fix, submitting now freezes the aggregate.
+        self.cli("submit", "demo", "orch", "--skip-verify")
+        self.assertIn("bundle_digest:", report.read_text())
+        manifest, _ = self.aggregate()
+        self.assertEqual("aggregate", manifest["kind"])
+
+    # ---------------- blocking findings from the independent review
+
+    def test_watch_announce_lease_recovers_after_crash(self) -> None:
+        """A crash after ledger write but before harness accept re-announces after expiry."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        first = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "2"],
+            cwd=str(self.root), text=True, capture_output=True)
+        self.assertEqual(2, first.returncode)
+        led = run / ".woke-orchestrator"
+        self.assertTrue(led.is_file())
+        pending = list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
+        key = json.loads(pending[0].read_text())["key"]
+        announce = list((run / ".delivery" / "orchestrator" / "announce").glob("*.json"))
+        self.assertEqual(1, len(announce))
+        # Crash exactly at the announcement boundary: ledger and durable
+        # announce state are written, but the notice never reaches the harness.
+        crashed = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "2"],
+            cwd=str(self.root), text=True, capture_output=True,
+            env=dict(os.environ, DOCKET_FAULT="watch:announce"))
+        # The fault fires only when there is something fresh to announce.
+        # After the first clean wake the lease is still active, so the second
+        # watcher has nothing fresh and exits 0 without faulting. Expire the
+        # lease first so the boundary is actually exercised.
+        if crashed.returncode == 0:
+            record = json.loads(announce[0].read_text())
+            until = float(record.get("lease_until", 0) or 0)
+            env = dict(os.environ, DOCKET_FAULT="watch:announce",
+                       DOCKET_NOW=str(until + 1))
+            crashed = subprocess.run(
+                [sys.executable, str(DOCKET), "watch", "demo",
+                 "--role", "orchestrator", "--timeout", "2"],
+                cwd=str(self.root), text=True, capture_output=True, env=env)
+        self.assertEqual(70, crashed.returncode)
+        self.assertIn("watch:announce", crashed.stderr)
+        # The durable pending event survives the crash.
+        self.assertEqual(
+            1, len(list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))))
+        # Immediate restart sees the active announcement lease and stays quiet:
+        # concurrent hooks converge on one wake and create no lifecycle change.
+        rounds_before = self.rounds(run, "T01")
+        quiet = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "1"],
+            cwd=str(self.root), text=True, capture_output=True)
+        self.assertEqual(0, quiet.returncode)
+        self.assertEqual(rounds_before, self.rounds(run, "T01"))
+        # After lease expiry the same actionable event is announced again, and
+        # stays claimable throughout via explicit inbox pickup.
+        record = json.loads(list(
+            (run / ".delivery" / "orchestrator" / "announce").glob("*.json"))[0].read_text())
+        until = float(record.get("lease_until", 0) or 0)
+        env = dict(os.environ, DOCKET_NOW=str(until + 1))
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "orch-main", "--role", "orchestrator")
+        claimable = subprocess.run(
+            [sys.executable, str(DOCKET), "inbox", "demo", "--role", "orchestrator",
+             "--claim", "--session", "s1"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+        self.assertEqual(0, claimable.returncode)
+        self.assertTrue("already held" in claimable.stdout or f"claimed {key}" in claimable.stdout)
+        # Release the inbox lease so the watch re-announcement is observable.
+        for path in (run / ".delivery" / "orchestrator" / "leases").glob("*.json"):
+            path.unlink()
+        revived = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "2"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+        self.assertEqual(2, revived.returncode)
+        self.assertIn("review batch ready", revived.stderr)
+
+    def test_hook_routes_verifier_and_reviewer_isolated(self) -> None:
+        """Every five-role session receives only its own events through the hook."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("arm", "demo", "--role", "verifier")
+        self.cli("arm", "demo", "--role", "reviewer")
+        self.cli("arm", "demo", "--role", "orchestrator")
+        base = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root),
+                    DOCKET_WATCH_TIMEOUT="0")
+        verifier = subprocess.run([str(HOOK)], cwd=str(self.root),
+                                  env=dict(base, DOCKET_ROLE="verifier"),
+                                  capture_output=True, text=True)
+        self.assertEqual(2, verifier.returncode)
+        self.assertIn("T01 round 1 submitted", verifier.stderr)
+        reviewer_idle = subprocess.run([str(HOOK)], cwd=str(self.root),
+                                       env=dict(base, DOCKET_ROLE="reviewer"),
+                                       capture_output=True, text=True)
+        self.assertEqual(0, reviewer_idle.returncode)
+        # Wrong-role isolation: a verifier submission cannot act as reviewer.
+        peek_verifier = self.cli("events", "demo", "--role", "verifier", "--peek").stdout
+        peek_reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("T01:1:submitted", peek_verifier)
+        self.assertNotIn("T01:1:submitted", peek_reviewer)
+        # A real verifier submission followed by milestone readiness wakes reviewer.
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.submit5(run, "T02")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02", "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        reviewer = subprocess.run([str(HOOK)], cwd=str(self.root),
+                                  env=dict(base, DOCKET_ROLE="reviewer"),
+                                  capture_output=True, text=True)
+        self.assertEqual(2, reviewer.returncode)
+        self.assertIn("milestone batch M1 ready", reviewer.stderr)
+        reviewer_peek = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("batch:M1:ready:1", reviewer_peek)
+        # The hook script itself routes all four roles.
+        hook_text = HOOK.read_text()
+        for role in ("planner", "orchestrator", "verifier", "reviewer"):
+            self.assertIn(role, hook_text)
+
+    def test_probe_rejects_negative_and_requires_positive(self) -> None:
+        """Only a positively verified queue reports unattended; everything else stays manual."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+
+        def fake_herdr(help_body: str, probe_rc: int = 0, help_rc: int = 0) -> Path:
+            d = Path(tempfile.mkdtemp())
+            script = d / "herdr"
+            script.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--version\" ]; then echo \"herdr 9.9.9-fake\"; exit 0; fi\n"
+                f"if [ \"$*\" = \"agent prompt --send-if-idle --help\" ]; then "
+                f"echo \"fake probe rc={probe_rc}\"; "
+                f"{'echo --send-if-idle; exit 0' if probe_rc == 0 else 'exit 1'}; fi\n"
+                f"if [ \"$*\" = \"agent prompt --help\" ]; then cat <<'EOF'\n{help_body}\nEOF\n"
+                f"exit {help_rc}; fi\n"
+                "exit 1\n")
+            script.chmod(0o755)
+            return d
+
+        def probe_with(fake: Path) -> subprocess.CompletedProcess[str]:
+            env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+            return subprocess.run(
+                [sys.executable, str(DOCKET), "delivery", "demo",
+                 "--role", "orchestrator", "--probe"],
+                cwd=str(self.root), text=True, capture_output=True, env=env)
+
+        positive_help = "Usage: herdr agent prompt\nOptions:\n  --send-if-idle\n  --queue\n  capability: queue\n"
+        fake = fake_herdr(positive_help, probe_rc=0)
+        good = probe_with(fake)
+        self.assertIn("boundary: verified-queue", good.stdout)
+        self.assertIn("mode: unattended", good.stdout)
+        self.assertIn("probed herdr agent prompt --help", good.stdout)
+        self.assertIn("version", good.stdout)
+        shutil.rmtree(fake, ignore_errors=True)
+
+        negative_help = "does not support queue or atomic send-if-idle turn-boundary"
+        fake = fake_herdr(negative_help, probe_rc=0)
+        bad = probe_with(fake)
+        self.assertIn("mode: manual", bad.stdout)
+        self.assertNotIn("mode: unattended", bad.stdout)
+        shutil.rmtree(fake, ignore_errors=True)
+
+        unknown_help = "Submit a prompt to an agent\nUsage: herdr agent prompt <TARGET>"
+        fake = fake_herdr(unknown_help, probe_rc=0)
+        unknown = probe_with(fake)
+        self.assertIn("mode: manual", unknown.stdout)
+        shutil.rmtree(fake, ignore_errors=True)
+
+        fake = fake_herdr(positive_help, probe_rc=0, help_rc=3)
+        nonzero = probe_with(fake)
+        self.assertIn("mode: manual", nonzero.stdout)
+        shutil.rmtree(fake, ignore_errors=True)
+
+        fake = fake_herdr(positive_help, probe_rc=1)
+        advertised = probe_with(fake)
+        self.assertIn("mode: manual", advertised.stdout)
+        self.assertIn("executable", advertised.stdout)
+        shutil.rmtree(fake, ignore_errors=True)
+
+        # No herdr at all stays manual without claiming unattended reliability.
+        empty = Path(tempfile.mkdtemp())
+        env = dict(os.environ, PATH=str(empty))
+        missing = subprocess.run(
+            [sys.executable, str(DOCKET), "delivery", "demo",
+             "--role", "orchestrator", "--probe"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+        self.assertIn("mode: manual", missing.stdout)
+        shutil.rmtree(empty, ignore_errors=True)
+
+        # A hanging help command times out into manual mode.
+        slow = Path(tempfile.mkdtemp())
+        (slow / "herdr").write_text("#!/bin/sh\nsleep 5\necho slow\n")
+        (slow / "herdr").chmod(0o755)
+        env = dict(os.environ, PATH=f"{slow}{os.pathsep}{os.environ.get('PATH', '')}",
+                   DOCKET_PROBE_TIMEOUT="1")
+        timed_out = subprocess.run(
+            [sys.executable, str(DOCKET), "delivery", "demo",
+             "--role", "orchestrator", "--probe"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+        self.assertIn("mode: manual", timed_out.stdout)
+        self.assertIn("timeout", timed_out.stdout.lower())
+        shutil.rmtree(slow, ignore_errors=True)
+
+    def test_real_harness_qualification_or_honest_limitation(self) -> None:
+        """Disposable real-process qualification with captured evidence, staying manual."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        result = self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
+        self.assertEqual(0, result.returncode)
+        artifact = run / ".delivery" / "qualification-orchestrator.json"
+        self.assertTrue(artifact.is_file())
+        record = json.loads(artifact.read_text())
+        self.assertIn(record["status"], ("passed", "blocked"))
+        # The installed herdr tracks no turn boundary, so manual is honest.
+        self.assertEqual("manual", record["mode"])
+        self.assertEqual("manual", record["production_mode"])
+        self.assertNotIn("unattended", json.dumps(record["probe"]))
+        checks = {c["check"]: c for c in record["checks"]}
+        for name in ("hook-announce", "hook-kill-restart", "claim", "send", "ack",
+                     "generation-reuse", "retry-release", "active-input"):
+            self.assertIn(name, checks, f"missing qualification check {name}")
+            self.assertEqual("passed", checks[name]["status"],
+                             f"check {name}: {checks[name]['detail']}")
+        self.assertIn("pid", checks["hook-announce"])
+        self.assertIn("exit", checks["hook-kill-restart"])
+        self.assertIn("key", record["event"])
+        # Lease history survives in the append-only log; the disposable outbox
+        # notice was cleaned up; the submission was never rolled back.
+        log_text = "".join(
+            p.read_text() for p in (run / ".delivery" / "orchestrator").glob("log.jsonl"))
+        for kind in ("claimed", "receipt", "retry"):
+            self.assertIn(kind, log_text)
+        self.assertEqual([], list((run / ".delivery" / "orchestrator" / "outbox").glob("*.txt")))
+        self.assertIn("submitted", (run / "T01-report-01.mdx").read_text())
+        # Honest limitation: no unattended reliability is claimed here.
+        self.assertIn("manual", result.stdout)
+        doctor = self.cli("doctor").stdout
+        self.assertIn("mode: manual", doctor)
+
+    def test_qualify_blocks_without_actionable_events(self) -> None:
+        """Qualification with nothing to deliver blocks instead of inventing success."""
+        run = self.init("split", evidence_mode="documents-only")
+        result = self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
+        self.assertEqual(0, result.returncode)
+        record = json.loads((run / ".delivery" / "qualification-orchestrator.json").read_text())
+        self.assertEqual("blocked", record["status"])
+        self.assertEqual("no-actionable-event", record["blocked_capability"])
+
+    def test_qualify_blocks_when_pane_lifecycle_unavailable(self) -> None:
+        """Without herdr panes, qualification names the unavailable capability."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        empty = Path(tempfile.mkdtemp())
+        env = dict(os.environ, PATH=str(empty))
+        for var in ("HERDR_ENV",):
+            env.pop(var, None)
+        result = subprocess.run(
+            [sys.executable, str(DOCKET), "delivery", "demo",
+             "--role", "orchestrator", "--qualify"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+        shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(0, result.returncode)
+        record = json.loads((run / ".delivery" / "qualification-orchestrator.json").read_text())
+        self.assertEqual("blocked", record["status"])
+        self.assertEqual("herdr-disposable-pane", record["blocked_capability"])
+        checks = {c["check"]: c for c in record["checks"]}
+        self.assertEqual("blocked", checks["disposable-pane"]["status"])
+        self.assertEqual("passed", checks["hook-announce"]["status"])
+
+    def test_worktree_identity_preserves_paths_and_types(self) -> None:
+        """Untracked renames, modes, symlinks, and odd names all move the identity."""
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        _loader = _SFL("docket_mod3", str(DOCKET))
+        _spec = _ilu.spec_from_loader("docket_mod3", _loader)
+        assert _spec is not None
+        mod = _ilu.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        repo = self.repo(self.root / "idrepo")
+        ident = lambda: mod.worktree_identity(cwd=repo)
+        base = ident()
+        self.assertTrue(base.startswith("sha256:"))
+        (repo / "alpha.txt").write_text("same bytes\n")
+        added = ident()
+        self.assertNotEqual(base, added)
+        (repo / "alpha.txt").rename(repo / "beta.txt")
+        self.assertNotEqual(added, ident(),
+                            "renaming without touching bytes must move the identity")
+        (repo / "gamma.txt").write_text("same bytes\n")
+        two_paths = ident()
+        (repo / "beta.txt").write_text("other bytes\n")
+        (repo / "gamma.txt").write_text("same bytes\n")
+        swapped = ident()
+        self.assertNotEqual(two_paths, swapped,
+                            "swapped contents must move the identity")
+        os.chmod(repo / "gamma.txt", 0o755)
+        self.assertNotEqual(swapped, ident(),
+                            "an executable bit must move the identity")
+        os.chmod(repo / "gamma.txt", 0o644)
+        (repo / "link.py").symlink_to("beta.txt")
+        linked = ident()
+        (repo / "link.py").unlink()
+        (repo / "link.py").write_text("beta.txt\n")
+        self.assertNotEqual(linked, ident(),
+                            "a symlink must differ from a file holding its target")
+        (repo / "link.py").unlink()
+        (repo / "link.py").symlink_to("gamma.txt")
+        self.assertNotEqual(linked, ident(), "retargeting must move the identity")
+        (repo / "link.py").unlink()
+        settled = ident()
+        for name in ("with space.txt", "ünïcodé.txt", 'quote"q.txt', "new\nline.txt"):
+            (repo / name).write_text("odd\n")
+            self.assertNotEqual(settled, ident(), f"odd name {name!r} must move the identity")
+            odd = ident()
+            self.assertTrue(odd.startswith("sha256:"), f"odd name {name!r} must hash")
+            (repo / name).unlink()
+        self.assertEqual(settled, ident(), "removing odd names must restore the identity")
+        (repo / "src" / "a.py").write_text("allowed = 2\n")
+        self.git("add", "src/a.py", cwd=repo)
+        self.assertNotEqual(settled, ident(), "a staged change must move the identity")
+        self.git("commit", "-qm", "second", cwd=repo)
+        committed = ident()
+        (repo / "src" / "a.py").write_text("allowed = 3\n")
+        self.assertNotEqual(committed, ident(), "an unstaged change must move the identity")
+        if os.geteuid() != 0:
+            secret = repo / "secret.txt"
+            secret.write_text("hidden\n")
+            os.chmod(secret, 0)
+            try:
+                self.assertTrue(ident().startswith("unknown"))
+            finally:
+                os.chmod(secret, 0o644)
+        else:
+            self.skipTest("unreadable-file case needs a non-root user")
+
+    def test_review_packet_validates_and_preserves(self) -> None:
+        """Packets refuse damaged/stale evidence, keep full risks, and pin aggregates."""
+        run = self.init5()
+        marker = "UNIQUE-RISK-MARKER-987654321-after-char-300-" + "x" * 400
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("## Risks", f"## Risks\n\n{marker}"))
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertIn(marker, packet)
+        manifest, _ = self.frozen("T01")
+        self.assertIn(manifest["digest"], packet)
+        self.assertIn("A1", packet)
+        self.assertLessEqual(self.packet_tokens(packet), 2000)
+        # Damaged artifact blocks the packet with a specific error.
+        where = run / ".bundles" / "T01" / manifest["digest"].split(":")[1][:12]
+        # Find the actual bundle dir via ledger instead of guessing the prefix.
+        entries = json.loads((run / ".bundles" / "T01" / "rounds.json").read_text())["entries"]
+        bdir = run / ".bundles" / "T01" / entries[-1]["dir"]
+        artifact = bdir / "report.mdx"
+        saved = artifact.read_bytes()
+        artifact.write_bytes(saved + b"tamper")
+        damaged = self.cli("review-packet", "demo", "--role", "reviewer", ok=False)
+        self.assertNotEqual(0, damaged.returncode)
+        self.assertIn("damaged", damaged.stderr)
+        artifact.write_bytes(saved)
+        # Stale bundle (report edited after freeze) blocks with a stale error.
+        rep = run / "T01-report-01.mdx"
+        rep.write_text(rep.read_text() + "\nStale edit.\n")
+        stale = self.cli("review-packet", "demo", "--role", "reviewer", ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("stale", stale.stderr.lower())
+        rep.write_text(rep.read_text().replace("\nStale edit.\n", ""))
+        # Aggregate digest and root-qualified patch appear once orch submits.
+        self.submit5(run, "T02")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T02", "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text()
+        orch_text = orch_text.replace("| T01 | approved | passed |",
+                                      "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--skip-verify", "--skip-verify-reason",
+                 "covered by task evidence", "--as", "orchestrator")
+        full = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        self.assertIn(orch_entries[-1]["digest"], full)
+        for entry in entries:
+            self.assertIn(entry["digest"], full)
+
+    def submit_orch_verified(self, run: Path, *, verify: str = 'printf "orch ok\\n"',
+                             blocked: bool = False, skip_verify: bool = False) -> None:
+        """Approve T01/T02, then submit the aggregate with real verification."""
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.submit5(run, "T02")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T02", "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", verify)
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text()
+        orch_text = orch_text.replace("| T01 | approved | passed |",
+                                      "| T01 | approved | passed |\n| T02 | approved | passed |")
+        if blocked:
+            orch_text = orch_text.replace("## Decisions needed\n\nnone",
+                                          "## Decisions needed\n\nWaive the slow integration job?")
+        orch_report.write_text(orch_text)
+        args = ["submit", "demo", "orch", "--as", "orchestrator"]
+        if blocked:
+            args.append("--blocked")
+        if skip_verify:
+            args += ["--skip-verify", "--skip-verify-reason", "none needed"]
+        self.cli(*args)
+
+    def qualify_suite(self, run: Path, passed: int = 164, failed: int = 0,
+                      exit_code: int = 0) -> Path:
+        """Capture a trivial suite execution; returns the artifact path.
+
+        The command only needs to print a unittest summary; the machinery
+        under test is the capture, binding, and validation, not the suite.
+        """
+        total = passed + failed
+        body = f"Ran {total} tests in 1s\\n\\n"
+        body += "OK\\n" if failed == 0 else f"FAILED (failures={failed})\\n"
+        command = f"printf '{body}'"
+        if exit_code != 0:
+            command += f"; exit {exit_code}"
+        result = self.cli("suite", "demo", "--qualify", "--command", command)
+        self.assertEqual(0, result.returncode)
+        arts = sorted((run / ".suite").glob("qual-*.json"))
+        self.assertTrue(arts)
+        return arts[-1]
+
+    def freeze_release(self, run: Path, agg_digest: str = "", **over: object) -> object:
+        """Freeze a release against the run's single suite artifact."""
+        args: list[str] = ["release", "demo", "--freeze"]
+        if "suite_artifact" in over:
+            args += ["--suite-artifact", str(over["suite_artifact"])]
+        for spec in over.get("milestones", [f"M11={agg_digest}"] if agg_digest else []):
+            args += ["--milestone", spec]
+        return self.cli(*args, ok=bool(over.get("ok", True)))
+
+    def release_setup(self, run: Path) -> None:
+        """Pane qualification and a green suite artifact."""
+        qualified = self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
+        self.assertEqual(0, qualified.returncode)
+        self.qualify_suite(run)
+
+    def release_ready_run(self) -> tuple[Path, str]:
+        """A five-role run fully set up for one release freeze.
+
+        Returns (run, aggregate digest). Delivery is qualified, the suite is green,
+        and the aggregate bundle is verified, but no release is frozen yet.
+        """
+        self.repo()
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
+            self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+            self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text().replace(
+            "| T01 | approved | passed |",
+            "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--as", "orchestrator")
+        orch_entries = json.loads(
+            (run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        return run, str(orch_entries[-1]["digest"])
+
+    def build_frozen_release(self) -> tuple[Path, Path, str]:
+        """A ready run plus one frozen release; returns (run, rel_dir, digest)."""
+        run, agg = self.release_ready_run()
+        frozen = self.freeze_release(run, agg)
+        rel_digest = frozen.stdout.split("froze release ")[1].split()[0]
+        rel_dir = run / ".release" / rel_digest.split(":")[-1][:12]
+        self.assertTrue(rel_dir.is_dir())
+        return run, rel_dir, rel_digest
+
+    def test_final_packet_binds_integration_verification(self) -> None:
+        """A standard packet names the aggregate verification, command, and outputs."""
+        run = self.init5()
+        self.submit_orch_verified(run)
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertIn("packet: standard", packet)
+        self.assertIn("## Integration verification", packet)
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        self.assertIn(orch_entries[-1]["digest"], packet)
+        self.assertIn("verification: passed", packet)
+        self.assertIn('printf "orch ok', packet)
+        self.assertIn("verify.stdout", packet)
+        # A correction packet is never final qualification.
+        conflict = self.cli("review-packet", "demo", "--role", "reviewer",
+                            "--correction", "T01", "--final", ok=False)
+        self.assertNotEqual(0, conflict.returncode)
+
+    def test_final_packet_needs_frozen_release(self) -> None:
+        """Task and aggregate evidence alone cannot pass as final qualification."""
+        run = self.init5()
+        self.submit_orch_verified(run)
+        missing = self.cli("review-packet", "demo", "--role", "reviewer",
+                           "--final", ok=False)
+        self.assertNotEqual(0, missing.returncode)
+        self.assertIn("no frozen release", missing.stderr)
+
+    def test_freeze_refuses_skipped_or_blocked_integration(self) -> None:
+        """Skipped or blocked integration evidence cannot anchor a release."""
+        self.repo()
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
+            self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+            self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text().replace("| T01 | approved | passed |",
+                                                    "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--skip-verify", "--skip-verify-reason",
+                 "covered by task evidence", "--as", "orchestrator")
+        skipped = self.freeze_release(run, ok=False)
+        self.assertNotEqual(0, skipped.returncode)
+        self.assertIn("not passed", skipped.stderr)
+        self.assertIn("skipped", skipped.stderr)
+
+    def test_freeze_refuses_blocked_integration(self) -> None:
+        """Blocked integration evidence cannot anchor a release."""
+        self.repo()
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
+            self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+            self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text().replace("| T01 | approved | passed |",
+                                                    "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_text = orch_text.replace("## Decisions needed\n\nnone",
+                                      "## Decisions needed\n\nWaive the slow integration job?")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--blocked", "--as", "orchestrator")
+        blocked = self.freeze_release(run, ok=False)
+        self.assertNotEqual(0, blocked.returncode)
+        self.assertIn("not passed", blocked.stderr)
+        self.assertIn("blocked", blocked.stderr)
+
+    def test_suite_qualify_captures_green(self) -> None:
+        """A green run freezes command bytes, times, outputs, and one source tree."""
+        run = self.init("split", evidence_mode="documents-only")
+        artifact = self.qualify_suite(run)
+        record = json.loads(artifact.read_text())
+        self.assertTrue(record["digest"].startswith("sha256:"))
+        self.assertEqual("demo", record["run"])
+        self.assertIn("printf", record["command"])
+        self.assertTrue(record["cwd"])
+        self.assertLessEqual(record["started_at"], record["ended_at"])
+        self.assertEqual(0, record["exit"])
+        self.assertEqual(164, record["tests"])
+        self.assertEqual(0, record["failures"])
+        self.assertTrue(record["ok"])
+        self.assertEqual(record["source_before"], record["source_after"])
+        out = run / ".suite" / record["stdout_file"]
+        self.assertEqual(sha(out.read_bytes()), record["stdout_digest"])
+        self.assertIn("Ran 164 tests", out.read_text())
+
+    def test_suite_qualify_refuses_drift_and_unmeasurable(self) -> None:
+        """Drift during the run and summary-less output freeze no artifact."""
+        self.repo()
+        run = self.init("split", evidence_mode="documents-only")
+        dude = self.cli("suite", "demo", "--qualify", "--command", "echo hello", ok=False)
+        self.assertNotEqual(0, dude.returncode)
+        self.assertIn("no supported summary", dude.stderr)
+        drifted = self.cli("suite", "demo", "--qualify", "--command",
+                           "printf 'Ran 1 tests in 1s\\n\\nOK\\n' >> drift.txt "
+                           "&& printf 'Ran 1 tests in 1s\\n\\nOK\\n'", ok=False)
+        self.assertNotEqual(0, drifted.returncode)
+        self.assertIn("drifted", drifted.stderr)
+        self.assertEqual([], list((run / ".suite").glob("qual-*.json")))
+
+    def test_suite_qualify_records_red(self) -> None:
+        """A failing run still freezes an honest artifact for release to refuse."""
+        run = self.init("split", evidence_mode="documents-only")
+        artifact = self.qualify_suite(run, passed=1, failed=2, exit_code=1)
+        record = json.loads(artifact.read_text())
+        self.assertEqual(1, record["exit"])
+        self.assertEqual(3, record["tests"])
+        self.assertEqual(2, record["failures"])
+        self.assertFalse(record["ok"])
+
+    def test_suite_problems_rejects_tampering(self) -> None:
+        """Edited commands, times, trees, and outputs fail validation with reasons."""
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        _loader = _SFL("docket_suite_mod", str(DOCKET))
+        _spec = _ilu.spec_from_loader("docket_suite_mod", _loader)
+        assert _spec is not None
+        mod = _ilu.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        run = self.init("split", evidence_mode="documents-only")
+        artifact = self.qualify_suite(run)
+        base = json.loads(artifact.read_text())
+
+        def check(mutated: dict, needle: str) -> None:
+            payload = {k: v for k, v in mutated.items() if k != "digest"}
+            mutated["digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            path = artifact.parent / "case.json"
+            path.write_text(json.dumps(mutated, indent=2, sort_keys=True))
+            try:
+                problems = mod.suite_problems(path, "demo")
+            finally:
+                path.unlink(missing_ok=True)
+            self.assertTrue(problems, f"expected a problem containing {needle!r}")
+            self.assertTrue(any(needle in problem for problem in problems),
+                            f"{needle!r} not in {problems}")
+
+        red = dict(base, exit=1)
+        check(red, "contradicts")
+        backwards = dict(base, started_at="2026-09-08T00:02:00Z",
+                             ended_at="2026-09-08T00:01:00Z")
+        check(backwards, "backwards")
+        moved = dict(base, source_before="sha256:" + "0" * 64)
+        check(moved, "drifted")
+        no_cwd = dict(base, cwd="")
+        check(no_cwd, "working directory")
+        foreign = mod.suite_problems(artifact, "other")
+        self.assertTrue(any("belongs to run" in problem for problem in foreign))
+        out_path = artifact.parent / base["stdout_file"]
+        saved = out_path.read_bytes()
+        out_path.write_bytes(saved + b"tamper")
+        try:
+            damaged = mod.suite_problems(artifact, "demo")
+        finally:
+            out_path.write_bytes(saved)
+        self.assertTrue(any("damaged" in problem for problem in damaged))
+
+    def test_suite_qualify_captures_stderr_and_refuses_ambiguous_streams(self) -> None:
+        """A unittest summary on stderr qualifies; both-stream summaries refuse."""
+        run = self.init("split", evidence_mode="documents-only")
+        # Summary on stderr only (the real unittest location) qualifies.
+        err_only = self.cli("suite", "demo", "--qualify", "--command",
+                            "printf 'Ran 1 tests in 1s\\n\\nOK\\n' >&2")
+        self.assertEqual(0, err_only.returncode)
+        arts = sorted((run / ".suite").glob("qual-*.json"))
+        self.assertTrue(arts)
+        record = json.loads(arts[-1].read_text())
+        self.assertEqual(1, record["tests"])
+        self.assertEqual(0, record["failures"])
+        self.assertTrue(record["ok"])
+        # A real unittest runner writes its summary to stderr.
+        real = self.cli(
+            "suite", "demo", "--qualify", "--command",
+            "python3 -c \"import unittest; "
+            "exec('class T(unittest.TestCase):\\n def test_x(self): assert True\\n'); "
+            "unittest.main(argv=['x', '-v'])\"")
+        self.assertEqual(0, real.returncode)
+        # Summaries in both streams are ambiguous and refuse.
+        both = self.cli("suite", "demo", "--qualify", "--command",
+                        "printf 'Ran 1 tests in 1s\\n\\nOK\\n'; "
+                        "printf 'Ran 1 tests in 1s\\n\\nOK\\n' >&2", ok=False)
+        self.assertNotEqual(0, both.returncode)
+        self.assertIn("ambiguous", both.stderr)
+        # Contradictory summaries refuse as well.
+        contra = self.cli("suite", "demo", "--qualify", "--command",
+                          "printf 'Ran 2 tests in 1s\\n\\nOK\\n'; "
+                          "printf 'Ran 1 tests in 1s\\n\\nOK\\n' >&2", ok=False)
+        self.assertNotEqual(0, contra.returncode)
+        self.assertIn("contradictory", contra.stderr)
+        # Tampered stderr is damaged, not silently trusted.
+        import importlib.util as _ilu2
+        from importlib.machinery import SourceFileLoader as _SFL2
+        _loader = _SFL2("docket_suite_stderr_mod", str(DOCKET))
+        _spec = _ilu2.spec_from_loader("docket_suite_stderr_mod", _loader)
+        assert _spec is not None
+        mod = _ilu2.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        err_path = arts[-1].parent / record["stderr_file"]
+        saved = err_path.read_bytes()
+        err_path.write_bytes(saved + b"tamper")
+        try:
+            damaged = mod.suite_problems(arts[-1], "demo")
+        finally:
+            err_path.write_bytes(saved)
+        self.assertTrue(any("damaged" in problem for problem in damaged))
+
+    def test_suite_parser_requires_complete_terminal_verdict(self) -> None:
+        """Bare counts, trailing noise, and doubled summaries never qualify."""
+        run = self.init("split", evidence_mode="documents-only")
+        before = sorted((run / ".suite").glob("qual-*.json"))
+        bare = self.cli("suite", "demo", "--qualify", "--command",
+                        "printf 'Ran 1 test in 0.001s\\n'", ok=False)
+        self.assertNotEqual(0, bare.returncode)
+        self.assertIn("without a terminal verdict", bare.stderr)
+        noisy = self.cli("suite", "demo", "--qualify", "--command",
+                         "printf 'Ran 1 tests in 1s\\n\\nOK\\nEXTRA NOISE\\n'", ok=False)
+        self.assertNotEqual(0, noisy.returncode)
+        self.assertIn("after the terminal unittest status", noisy.stderr)
+        doubled = self.cli("suite", "demo", "--qualify", "--command",
+                           "printf 'Ran 1 tests in 1s\\n\\nOK\\nRan 1 tests in 1s\\n\\nOK\\n'",
+                           ok=False)
+        self.assertNotEqual(0, doubled.returncode)
+        self.assertIn("terminal unittest status", doubled.stderr)
+        self.assertEqual(before, sorted((run / ".suite").glob("qual-*.json")))
+        self.assertNotIn("qualified suite", bare.stdout + noisy.stdout + doubled.stdout)
+        # A real unittest discovery run qualifies from its stderr summary.
+        tiny = self.root / "tiny-suite"
+        (tiny / "test_tiny.py").parent.mkdir(parents=True, exist_ok=True)
+        (tiny / "test_tiny.py").write_text(
+            "import unittest\n"
+            "class Tiny(unittest.TestCase):\n"
+            "    def test_holds(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n")
+        real = self.cli("suite", "demo", "--qualify", "--command",
+                        f"python3 -m unittest discover -s {tiny} -v")
+        self.assertEqual(0, real.returncode)
+        self.assertIn("qualified suite", real.stdout)
+        arts = sorted((run / ".suite").glob("qual-*.json"))
+        record = json.loads(arts[-1].read_text())
+        self.assertEqual(1, record["tests"])
+        self.assertEqual(0, record["failures"])
+        self.assertTrue(record["ok"])
+        stderr_text = (arts[-1].parent / record["stderr_file"]).read_text()
+        self.assertIn("Ran 1 test", stderr_text)
+        self.assertIn("OK", stderr_text.split("Ran 1 test")[-1])
+        # One real test from this repository's own suite qualifies as well.
+        # (A full tests/test.sh run nests the whole suite including this very
+        # test, so the regression scopes the real runner to one test instead.)
+        repo = Path(DOCKET).parents[3]
+        single = self.cli(
+            "suite", "demo", "--qualify", "--command",
+            "PYTHONPATH=" + str(repo) + " python3 -m unittest "
+            "skills.docket.tests.test_docket.DocketCLI."
+            "test_supported_harnesses_and_topology_are_recorded -v")
+        self.assertEqual(0, single.returncode)
+        self.assertIn("qualified suite", single.stdout)
+
+    def test_suite_parser_refuses_summary_tokens_in_either_stream(self) -> None:
+        """Summary-shaped output beside a valid summary refuses the capture.
+
+        A green stream cannot excuse a count or verdict in the other stream
+        that forms no summary of its own: the two streams then disagree about
+        what the run did, and choosing the greener one is guessing.
+        """
+        run = self.init("split", evidence_mode="documents-only")
+        before = sorted((run / ".suite").glob("qual-*.json"))
+        valid_err = "printf 'Ran 1 test in 0.001s\\n\\nOK\\n' >&2"
+        cases = {
+            "FAILED (failures=99)": "contradictory verdict",
+            "Ran 999 tests": "bare count",
+            "OK": "stray terminal status",
+            "FAILED": "bare failing verdict",
+        }
+        for stray, label in cases.items():
+            with self.subTest(stray=label):
+                refused = self.cli(
+                    "suite", "demo", "--qualify", "--command",
+                    f"printf '{stray}\\n'; {valid_err}", ok=False)
+                self.assertNotEqual(0, refused.returncode)
+                self.assertIn("summary material that forms no complete terminal "
+                              "summary", refused.stderr)
+                self.assertNotIn("qualified suite", refused.stdout)
+        # Ordinary progress output beside the valid summary still qualifies.
+        allowed = self.cli("suite", "demo", "--qualify", "--command",
+                           "printf 'building index\\nrunning checks\\n'; " + valid_err)
+        self.assertEqual(0, allowed.returncode)
+        self.assertIn("qualified suite", allowed.stdout)
+        # Nothing was frozen for any refused capture.
+        self.assertEqual(len(before) + 1,
+                         len(sorted((run / ".suite").glob("qual-*.json"))))
+
+    def test_suite_green_needs_the_verdict_and_the_exit_status(self) -> None:
+        """A complete FAILED summary never turns green because a wrapper exits 0."""
+        run = self.init("split", evidence_mode="documents-only")
+        mod = self.docket_mod()
+        # A failing verdict whose counted failures are zero still is not green.
+        zero_count = self.cli(
+            "suite", "demo", "--qualify", "--command",
+            "printf 'Ran 3 tests in 1s\\n\\nFAILED (unexpected successes=1)\\n' >&2; "
+            "exit 0")
+        self.assertEqual(0, zero_count.returncode)
+        artifact = sorted((run / ".suite").glob("qual-*.json"))[-1]
+        record = json.loads(artifact.read_text())
+        self.assertEqual(0, record["exit"])
+        self.assertEqual(0, record["failures"])
+        self.assertFalse(record["ok"])
+        self.assertFalse([item for item in mod.suite_problems(artifact, "demo")
+                          if "ok flag" in item or "refusing" in item])
+        # A counted failure with a zero exit is honest evidence and still red.
+        counted = self.cli(
+            "suite", "demo", "--qualify", "--command",
+            "printf 'Ran 3 tests in 1s\\n\\nFAILED (failures=2)\\n' >&2; exit 0")
+        self.assertEqual(0, counted.returncode)
+        artifact2 = sorted((run / ".suite").glob("qual-*.json"))[-1]
+        record2 = json.loads(artifact2.read_text())
+        self.assertEqual(2, record2["failures"])
+        self.assertFalse(record2["ok"])
+        self.assertFalse([item for item in mod.suite_problems(artifact2, "demo")
+                          if "ok flag" in item or "refusing" in item])
+        # A hand-flipped ok flag contradicts the frozen output and refuses.
+        forged = dict(record2, ok=True)
+        payload = {k: v for k, v in forged.items() if k != "digest"}
+        forged["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path = artifact2.parent / "qual-forged.json"
+        path.write_text(json.dumps(forged, indent=2, sort_keys=True) + "\n")
+        self.assertTrue([item for item in mod.suite_problems(path, "demo")
+                         if "ok flag" in item or "refusing" in item])
+
+    def test_unknown_source_identities_are_unqualified_and_block_release(self) -> None:
+        """Equal-unknown and SHA-versus-unknown sources never support release."""
+        import importlib.util as _ilu3
+        from importlib.machinery import SourceFileLoader as _SFL3
+        _loader = _SFL3("docket_unknown_mod", str(DOCKET))
+        _spec = _ilu3.spec_from_loader("docket_unknown_mod", _loader)
+        assert _spec is not None
+        mod = _ilu3.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        # Suite artifacts frozen outside git bind equal unknown trees and are
+        # honest diagnostics, but they are unqualified release evidence.
+        run = self.init("split", evidence_mode="documents-only")
+        artifact = self.qualify_suite(run)
+        base = json.loads(artifact.read_text())
+        self.assertTrue(str(base.get("source_before", "")).startswith("unknown "))
+        self.assertEqual(base["source_before"], base["source_after"])
+        equal_unknown = mod.suite_problems(artifact, "demo")
+        self.assertTrue(any("unknown" in problem for problem in equal_unknown),
+                        f"equal-unknown suite must be unqualified, got {equal_unknown}")
+        # A SHA-versus-unknown mismatch is drift, never a match.
+        mutated = dict(base, source_after="sha256:" + "0" * 64)
+        payload = {k: v for k, v in mutated.items() if k != "digest"}
+        mutated["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path = artifact.parent / "unknown-case.json"
+        path.write_text(json.dumps(mutated, indent=2, sort_keys=True))
+        try:
+            mixed = mod.suite_problems(path, "demo")
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertTrue(mixed)
+        # Delivery qualification with an unknown tree is unqualified as well.
+        qual = {"run": "demo", "role": "orchestrator", "status": "passed",
+                "mode": "manual", "started_at": "2026-09-08T00:00:00Z",
+                "finished_at": "2026-09-08T00:00:01Z",
+                "checks": [{"check": name, "status": "passed",
+                            "detail": "test detail", "pid": 1, "exit": 0,
+                            "argv": ["test"], "pane_id": "pane-1"}
+                           for name in ("hook-announce", "hook-kill-restart",
+                                        "claim", "send", "ack", "generation-reuse",
+                                        "retry-release", "active-input",
+                                        "disposable-pane")],
+                "event": {"key": "k", "message": "m"},
+                "session": {"id": "s", "generation": "1"},
+                "probe": {"herdr_version": "test"},
+                "repo_head": "abc", "source_tree": "unknown (not a git checkout)"}
+        frozen_qual = mod.freeze_record(dict(qual))
+        qual_path = run / ".delivery" / "qualification-orchestrator.json"
+        qual_path.parent.mkdir(parents=True, exist_ok=True)
+        qual_path.write_text(json.dumps(frozen_qual, indent=2, sort_keys=True))
+        try:
+            qual_problems = mod.qualification_problems(run, "demo", "orchestrator")
+        finally:
+            qual_path.unlink(missing_ok=True)
+        self.assertTrue(any("unknown" in problem for problem in qual_problems),
+                        f"unknown delivery source must be unqualified, got {qual_problems}")
+        # Frozen-release validation reports unknown sources even when live is
+        # also unknown (the equal-unknown bypass is closed).
+        self.assertTrue(str(mod.worktree_identity()).startswith("unknown ")
+                        or str(mod.worktree_identity()).startswith("sha256:"))
+        fake_manifest = {"run": "demo", "digest": "sha256:" + "0" * 64,
+                         "suite": {"source": "unknown (not a git checkout)"}}
+        fake_dir = run / ".release" / "unknown-probe"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        (fake_dir / "manifest.json").write_text(json.dumps(
+            mod.freeze_record(dict(fake_manifest)), indent=2, sort_keys=True))
+        try:
+            frozen_problems = mod.validate_frozen_release(
+                run, "demo", fake_dir,
+                json.loads((fake_dir / "manifest.json").read_text()))
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(fake_dir, ignore_errors=True)
+        self.assertTrue(frozen_problems)
+
+    def test_resolve_suite_artifact_missing_and_multiple(self) -> None:
+        """Resolution names absence and ambiguity instead of guessing."""
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        _loader = _SFL("docket_suite_mod2", str(DOCKET))
+        _spec = _ilu.spec_from_loader("docket_suite_mod2", _loader)
+        assert _spec is not None
+        mod = _ilu.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        run = self.init("split", evidence_mode="documents-only")
+        missing, problems = mod.resolve_suite_artifact(run, "")
+        self.assertIsNone(missing)
+        self.assertTrue(any("no suite qualification artifact" in problem for problem in problems))
+        artifact = self.qualify_suite(run)
+        (run / ".suite" / "qual-copy.json").write_bytes(artifact.read_bytes())
+        try:
+            dup, problems = mod.resolve_suite_artifact(run, "")
+            self.assertIsNone(dup)
+            self.assertTrue(any("multiple" in problem for problem in problems))
+        finally:
+            (run / ".suite" / "qual-copy.json").unlink(missing_ok=True)
+
+    def test_integration_validator_refuses_failing_status(self) -> None:
+        """A failing status can never be frozen, so the validator is probed directly."""
+        run = self.init5()
+        self.submit_orch_verified(run)
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        bdir = run / ".bundles" / "orch" / orch_entries[-1]["dir"]
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        _loader = _SFL("docket_mod", str(DOCKET))
+        _spec = _ilu.spec_from_loader("docket_mod", _loader)
+        assert _spec is not None
+        mod = _ilu.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        manifest = json.loads((bdir / "bundle.json").read_text())
+        manifest["verification"] = dict(manifest["verification"], status="failed")
+        failing = mod.integration_verification_problems(run, orch_entries[-1], manifest)
+        self.assertTrue(failing)
+        self.assertIn("failed", failing[0])
+
+    def test_release_freeze_and_final_packet_full(self) -> None:
+        """Freeze refuses red inputs, then a pinned packet renders every handoff field."""
+        self.repo()
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
+            self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+            self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text().replace("| T01 | approved | passed |",
+                                                    "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--as", "orchestrator")
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        agg_digest = orch_entries[-1]["digest"]
+        shutil.rmtree(run / ".suite")
+        self.qualify_suite(run, passed=1, failed=2, exit_code=1)
+        red = self.freeze_release(run, agg_digest, ok=False)
+        self.assertNotEqual(0, red.returncode)
+        self.assertIn("red suite", red.stderr)
+        shutil.rmtree(run / ".suite")
+        self.qualify_suite(run)
+        bogus = self.freeze_release(run, "sha256:" + "f" * 64, ok=False)
+        self.assertNotEqual(0, bogus.returncode)
+        self.assertIn("never invent", bogus.stderr)
+        frozen = self.freeze_release(run, agg_digest)
+        self.assertIn("froze release sha256:", frozen.stdout)
+        rel_digest = frozen.stdout.split("froze release ")[1].split()[0]
+        packet = self.cli("review-packet", "demo", "--role", "reviewer",
+                          "--final").stdout
+        self.assertIn("Final review packet", packet)
+        self.assertIn("packet: final", packet)
+        self.assertIn(f"release: {rel_digest}", packet)
+        self.assertIn("## Milestone inventory (M4-M11)", packet)
+        self.assertIn(f"- M11: bundle {agg_digest}", packet)
+        self.assertIn("- M4: unavailable (historical", packet)
+        self.assertIn("## Full-suite result (frozen)", packet)
+        self.assertIn("printf 'Ran 164 tests", packet)
+        self.assertIn("164", packet)
+        self.assertIn("log digest:", packet)
+        self.assertIn("## Real-adapter result (frozen qualifications)", packet)
+        self.assertIn("orchestrator", packet)
+        self.assertIn("## Installation state (live check)", packet)
+        self.assertIn(agg_digest, packet)
+        self.assertIn("verification: passed", packet)
+        # A damaged frozen file refuses the packet it would have supported.
+        rel_dirs = [p for p in (run / ".release").glob("*/manifest.json")]
+        self.assertEqual(1, len(rel_dirs))
+        frozen_stdout = rel_dirs[0].parent / "suite" / "stdout.txt"
+        saved = frozen_stdout.read_bytes()
+        frozen_stdout.write_bytes(saved + b"tamper")
+        try:
+            damaged = self.cli("review-packet", "demo", "--role", "reviewer",
+                               "--final", ok=False)
+            self.assertNotEqual(0, damaged.returncode)
+            self.assertIn("DAMAGED", damaged.stderr)
+        finally:
+            frozen_stdout.write_bytes(saved)
+        # A red suite smuggled past freezing with a recomputed digest still refuses.
+        manifest_path = rel_dirs[0].parent / "manifest.json"
+        release_parent = manifest_path.parent
+        saved_manifest = manifest_path.read_bytes()
+        manifest = json.loads(saved_manifest.decode())
+        manifest["suite"] = dict(manifest["suite"], exit=1, failures=2)
+        payload = {k: v for k, v in manifest.items() if k != "digest"}
+        manifest["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        # Rename the directory to the recomputed address so only the suite
+        # content can be what refuses it, never the address binding.
+        smuggled_dir = release_parent.parent / manifest["digest"].split(":")[-1][:12]
+        os.rename(release_parent, smuggled_dir)
+        try:
+            smuggled = self.cli("review-packet", "demo", "--role", "reviewer",
+                                "--final", ok=False)
+            self.assertNotEqual(0, smuggled.returncode)
+            self.assertIn("red", smuggled.stderr)
+        finally:
+            os.rename(smuggled_dir, release_parent)
+            manifest_path.write_bytes(saved_manifest)
+        # A commit after freezing makes the recorded source revisions stale.
+        self.git("add", "-A", cwd=self.root)
+        self.git("commit", "-qm", "post-freeze edit", cwd=self.root)
+        stale = self.cli("review-packet", "demo", "--role", "reviewer",
+                         "--final", ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("stale", stale.stderr)
+
+    def test_evaluation_subsystem_is_retired(self) -> None:
+        """The pilot, fixtures, dashboard, and pilot plans are gone, not stubbed."""
+        repo_eval = Path(__file__).parents[1] / "eval"
+        self.assertFalse(repo_eval.exists(), f"{repo_eval} still exists")
+        for rel in ("tests/test_evaluation_dashboard.py",):
+            self.assertFalse((Path(__file__).parents[1] / rel).exists())
+        root = Path(__file__).parents[3]
+        for rel in ("docs/evaluation-dashboard.md",
+                    "improvements/evaluation_dashboard.py",
+                    "improvements/model-combination-evaluation-plan.md",
+                    "improvements/model-role-combination-pilot-plan.md"):
+            self.assertFalse((root / rel).exists(), f"{rel} still exists")
+        self.assertFalse((root / "improvements" / "review-artifacts").exists())
+        top = self.cli("--help").stdout
+        self.assertNotIn("pilot", top)
+        refused = self.cli("pilot", "demo", "--list-fixtures", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        metrics_help = self.cli("metrics", "--help").stdout
+        self.assertNotIn("--release", metrics_help)
+        self.assertNotIn("pilot", metrics_help.lower())
+
+    def test_metrics_reports_operational_usage_without_evaluation(self) -> None:
+        """Metrics keeps ordinary accounting and never reads evaluation artifacts."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        out = self.cli("metrics", "demo").stdout
+        self.assertIn("tasks decided:", out)
+        self.assertIn("prompt renders:", out)
+        self.assertIn("wall time:", out)
+        self.assertIn("delivery qualification:", out)
+        lowered = out.lower()
+        self.assertNotIn("pilot", lowered)
+        self.assertNotIn("adjudication", lowered)
+        self.assertNotIn("comparison", lowered)
+        self.assertNotIn("seeded", lowered)
+
+    def test_final_packet_ignores_live_doc_edits(self) -> None:
+        """Later live edits never silently change a packet under the old digest."""
+        self.repo()
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.submit5(run, "T02")
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
+            self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+            self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_text = orch_report.read_text().replace("| T01 | approved | passed |",
+                                                    "| T01 | approved | passed |\n| T02 | approved | passed |")
+        orch_report.write_text(orch_text)
+        self.cli("submit", "demo", "orch", "--as", "orchestrator")
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        self.freeze_release(run, orch_entries[-1]["digest"])
+        before = self.cli("review-packet", "demo", "--role", "reviewer", "--final").stdout
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("## Risks", "## Risks\n\nAFTER-FREEZE-RISK"))
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace("The feature works.", "The feature works well."))
+        finding = run / "T01-verification-01.mdx"
+        finding.write_text(finding.read_text() + "\nAfter-freeze annotation.\n")
+        after = self.cli("review-packet", "demo", "--role", "reviewer", "--final").stdout
+        self.assertEqual(before, after)
+        self.assertNotIn("AFTER-FREEZE-RISK", after)
+
+    def test_release_source_drift_freeze_and_packet(self) -> None:
+        """A moved source tree refuses freezing and, later, the packet itself."""
+        self.repo()
+        self.init("split", evidence_mode="git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "T01 ok\\n"')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
+        self.qualify_suite(run)
+        self.cli("decide", "demo", "T01", "--approve")
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        self.cli("submit", "demo", "orch")
+        (self.root / "src" / "a.py").write_text("allowed = 999\n")
+        drifted = self.freeze_release(run, ok=False)
+        self.assertNotEqual(0, drifted.returncode)
+        self.assertIn("re-qualify", drifted.stderr)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
+        self.freeze_release(run, orch_entries[-1]["digest"])
+        good = self.cli("review-packet", "demo", "--role", "reviewer", "--final")
+        self.assertEqual(0, good.returncode)
+        (self.root / "src" / "a.py").write_text("allowed = 999\n")
+        moved = self.cli("review-packet", "demo", "--role", "reviewer",
+                         "--final", ok=False)
+        self.assertNotEqual(0, moved.returncode)
+        self.assertIn("moved", moved.stderr)
+        self.assertIn("suite (frozen", moved.stderr)
+
+    def test_freeze_refuses_stale_suite_source(self) -> None:
+        """A suite artifact newer than the reviewed tree cannot anchor a release."""
+        self.repo()
+        run = self.init("split", evidence_mode="documents-only")
+        self.submit_simple(run, "T01")
+        self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
+        self.qualify_suite(run)
+        (self.root / "src" / "a.py").write_text("allowed = 999\n")
+        newer = self.qualify_suite(run)
+        (self.root / "src" / "a.py").write_text("allowed = 1\n")
+        stale = self.freeze_release(run, suite_artifact=str(newer), ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("stale", stale.stderr)
+        self.assertIn("rerun it", stale.stderr)
+
+    def test_final_packet_refuses_fabricated_release(self) -> None:
+        """A hand-written release manifest never passes as pinned evidence."""
+        run = self.init5()
+        self.submit_orch_verified(run)
+        rel = run / ".release" / "deadbeefcafe"
+        rel.mkdir(parents=True)
+        manifest: dict[str, object] = {
+            "run": "demo", "frozen_at": "2026-09-08T00:00:00Z",
+            "aggregate": {"owner": "orch", "round": 1,
+                          "digest": "sha256:" + "f" * 64},
+            "constituents": [], "qualifications": {}, "suite": {},
+            "milestones": {}, "repo_head": "unknown", "files": {},
+        }
+        payload = {k: v for k, v in manifest.items() if k != "digest"}
+        manifest["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        (rel / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        fabricated = self.cli("review-packet", "demo", "--role", "reviewer",
+                              "--final", "--release", "deadbeefcafe", ok=False)
+        self.assertNotEqual(0, fabricated.returncode)
+
+    def test_frozen_release_damage_refuses_each_dependency_class(self) -> None:
+        """Every frozen dependency class is bound; damaging one refuses DAMAGED.
+
+        One representative of each class the release carries - suite,
+        qualifications, documents, and every frozen bundle class (manifest, report, patch,
+        baseline, verification output, ledger, and object store) - is altered
+        in place and the final packet must refuse.
+        """
+        run, rel_dir, _ = self.build_frozen_release()
+        bundles = rel_dir / "bundles"
+        aggregate_dir = sorted((bundles / "orch").glob("*/*/bundle.json"))[0].parent
+        constituent_dirs = [p.parent for p in
+                            sorted(bundles.glob("*/*/*/bundle.json"))
+                            if p.parent != aggregate_dir]
+        constituent = constituent_dirs[0]
+        cases: list[tuple[str, Path]] = [
+            ("suite artifact", rel_dir / "suite" / "artifact.json"),
+            ("suite stdout", rel_dir / "suite" / "stdout.txt"),
+            ("qualification", sorted((rel_dir / "qualifications").glob("*.json"))[0]),
+            ("release plan", rel_dir / "documents" / "plan.mdx"),
+            ("aggregate bundle manifest", aggregate_dir / "bundle.json"),
+            ("constituent report", constituent / "report.mdx"),
+            ("bundle baseline",
+             next(p for p in sorted(constituent.rglob("snapshot.json"))
+                  if "baseline" in p.parts)),
+            ("integration verification output",
+             next(p for p in sorted(aggregate_dir.glob("verify.*")))),
+            ("bundle ledger", bundles / "orch" / "rounds.json"),
+        ]
+        object_files = [p for p in sorted((bundles / "objects").rglob("*"))
+                        if p.is_file() and p.parent.name not in ("info", "pack")]
+        if object_files:
+            cases.append(("bundle object store", object_files[0]))
+        patch_files = sorted(constituent.glob("*.patch"))
+        if patch_files:
+            cases.append(("constituent patch", patch_files[0]))
+        for label, path in cases:
+            with self.subTest(dependency=label):
+                self.assert_disposable(path)
+                saved = path.read_bytes()
+                path.write_bytes(saved + b"tamper")
+                try:
+                    refused = self.cli("review-packet", "demo", "--role", "reviewer",
+                                       "--final", ok=False)
+                finally:
+                    path.write_bytes(saved)
+                self.assertNotEqual(0, refused.returncode)
+                self.assertIn("DAMAGED", refused.stderr)
+        # The untouched release still renders after every probe is restored.
+        good = self.cli("review-packet", "demo", "--role", "reviewer", "--final")
+        self.assertEqual(0, good.returncode)
+
+    def test_frozen_release_inventory_refuses_added_removed_and_mode(self) -> None:
+        """The release inventory binds additions, removals, and modes.
+
+        An undeclared frozen file, a removed manifest entry, and a changed mode
+        each move the complete inventory and refuse
+        with DAMAGED rather than being silently accepted.
+        Retargeted-link inventory stays covered by baseline symlink capture;
+        the frozen release tree holds only regular files after pilot retirement.
+        """
+        run, rel_dir, _ = self.build_frozen_release()
+        # An undeclared file inside the frozen release.
+        undeclared = rel_dir / "undeclared.txt"
+        undeclared.write_text("not in any manifest\n")
+        try:
+            added = self.cli("review-packet", "demo", "--role", "reviewer",
+                             "--final", ok=False)
+            self.assertNotEqual(0, added.returncode)
+            self.assertIn("DAMAGED", added.stderr)
+        finally:
+            undeclared.unlink()
+        # A removed manifest entry: delete a frozen file the manifest lists.
+        card = rel_dir / "suite" / "artifact.json"
+        self.assert_disposable(card)
+        saved_card = card.read_bytes()
+        card.unlink()
+        try:
+            removed = self.cli("review-packet", "demo", "--role", "reviewer",
+                               "--final", ok=False)
+            self.assertNotEqual(0, removed.returncode)
+            self.assertIn("DAMAGED", removed.stderr)
+        finally:
+            card.write_bytes(saved_card)
+        # A mode-only change on a frozen tree file.
+        task_file = rel_dir / "suite" / "stdout.txt"
+        self.assert_disposable(task_file)
+        saved_mode = stat.S_IMODE(task_file.stat().st_mode)
+        os.chmod(task_file, saved_mode ^ 0o100)
+        try:
+            changed = self.cli("review-packet", "demo", "--role", "reviewer",
+                               "--final", ok=False)
+            self.assertNotEqual(0, changed.returncode)
+            self.assertIn("DAMAGED", changed.stderr)
+        finally:
+            os.chmod(task_file, saved_mode)
+        good = self.cli("review-packet", "demo", "--role", "reviewer", "--final")
+        self.assertEqual(0, good.returncode)
+
+    def test_frozen_release_atomic_faults_and_retries(self) -> None:
+        """One rename commits a complete release; retries converge or refuse.
+
+        Faults before the rename leave no final address at all; a fault after
+        it leaves a complete unit. Re-freezing identical content converges on
+        the existing address only after full validation, and conflicting
+        content at that address refuses.
+        """
+        run, agg = self.release_ready_run()
+        release_base = run / ".release"
+
+        def finals() -> list[Path]:
+            if not release_base.is_dir():
+                return []
+            return [p for p in release_base.glob("*/manifest.json")
+                    if not p.parent.name.startswith(".")]
+
+        for point in ("release:stage", "release:write:suite/artifact.json",
+                      "release:write:manifest.json", "release:rename"):
+            with self.subTest(fault=point):
+                interrupted = self.cli("release", "demo", "--freeze",
+                                       "--milestone", f"M11={agg}",
+                                       fault=point, ok=False)
+                self.assertNotEqual(0, interrupted.returncode)
+                self.assertIn("injected fault", interrupted.stderr)
+                self.assertEqual([], finals(),
+                                 f"a fault at {point} left a final release")
+        frozen = self.freeze_release(run, agg)
+        rel_digest = frozen.stdout.split("froze release ")[1].split()[0]
+        rel_dir = release_base / rel_digest.split(":")[-1][:12]
+        self.assertTrue((rel_dir / "manifest.json").is_file())
+        # An identical retry converges on the same address after validation.
+        again = self.freeze_release(run, agg)
+        self.assertIn("already frozen", again.stdout)
+        self.assertIn(rel_digest, again.stdout)
+        self.assertEqual(1, len(finals()))
+        # Conflicting content at the address refuses rather than overwriting.
+        manifest_path = rel_dir / "manifest.json"
+        saved_manifest = manifest_path.read_bytes()
+        conflicting = json.loads(saved_manifest.decode())
+        conflicting["repo_head"] = "unknown (conflicting rewrite)"
+        payload = {k: v for k, v in conflicting.items() if k != "digest"}
+        conflicting["digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        manifest_path.write_text(json.dumps(conflicting, indent=2, sort_keys=True))
+        try:
+            conflict = self.freeze_release(run, agg, ok=False)
+            self.assertNotEqual(0, conflict.returncode)
+            self.assertIn("different content", conflict.stderr)
+        finally:
+            manifest_path.write_bytes(saved_manifest)
+        # A damaged published unit refuses a retry instead of being trusted.
+        card = rel_dir / "suite" / "artifact.json"
+        saved_card = card.read_bytes()
+        card.write_bytes(saved_card + b"tamper")
+        try:
+            damaged = self.freeze_release(run, agg, ok=False)
+            self.assertNotEqual(0, damaged.returncode)
+            self.assertIn("unusable", damaged.stderr)
+        finally:
+            card.write_bytes(saved_card)
+        # A fault after the rename leaves the complete unit, not a partial one.
+        self.assert_disposable(rel_dir)
+        shutil.rmtree(rel_dir)
+        interrupted = self.cli("release", "demo", "--freeze",
+                               "--milestone", f"M11={agg}",
+                               fault="release:renamed", ok=False)
+        self.assertNotEqual(0, interrupted.returncode)
+        self.assertIn("injected fault", interrupted.stderr)
+        self.assertTrue(rel_dir.is_dir())
+        manifest = json.loads((rel_dir / "manifest.json").read_text())
+        self.assertEqual(rel_digest, manifest["digest"])
+        self.assertEqual(1, len(finals()))
+
+    def test_installation_state_reports_not_installed(self) -> None:
+        """The installation check names absence instead of assuming setup."""
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+        _loader = _SFL("docket_mod2", str(DOCKET))
+        _spec = _ilu.spec_from_loader("docket_mod2", _loader)
+        assert _spec is not None
+        mod = _ilu.module_from_spec(_spec)
+        _loader.exec_module(mod)
+        saved_home = os.environ.get("HOME", "")
+        os.environ["HOME"] = str(self.root / "nohome")
+        try:
+            self.assertIn("not installed", mod.installation_state())
+        finally:
+            os.environ["HOME"] = saved_home
+
+    def write_qualification(self, rundir: Path, role: str, **over: object) -> Path:
+        """Hand-craft a fully valid qualification artifact, then freeze it."""
+        import hashlib as _hashlib
+        checks = []
+        for name in ("probe", "hook-announce", "hook-kill-restart", "claim", "send",
+                     "ack", "generation-reuse", "retry-release", "active-input",
+                     "disposable-pane"):
+            entry: dict[str, object] = {"check": name, "status": "passed",
+                                        "detail": f"{name} evidence"}
+            if name in ("hook-announce", "hook-kill-restart"):
+                entry.update({"pid": 4242, "exit": 2 if name == "hook-announce" else -9,
+                              "argv": ["watch", "demo", "--role", role]})
+            elif name == "disposable-pane":
+                entry.update({"pane_id": "w9:p1",
+                              "argv": ["pane", "split"]})
+            else:
+                entry.update({"argv": ["docket", name], "exit": 0})
+            checks.append(entry)
+        record: dict[str, object] = {
+            "run": "demo", "role": role, "status": "passed", "mode": "manual",
+            "started_at": "2026-09-08T00:00:00Z",
+            "finished_at": "2026-09-08T00:01:00Z", "checks": checks,
+            "source_tree": "sha256:" + "0" * 64,
+            "probe": {"command": "herdr agent prompt --help", "boundary": "none",
+                      "mode": "manual", "detail": "manual", "herdr_version": "9.9.9"},
+            "production_mode": "manual",
+            "event": {"key": "review-batch:abc", "message": "ready"},
+            "session": {"id": "dqd-1", "generation": 1},
+            "repo_head": "unknown (not a git checkout)",
+        }
+        record.update(over)
+        payload = {k: v for k, v in record.items() if k != "digest"}
+        record["digest"] = "sha256:" + _hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        path = rundir / ".delivery" / f"qualification-{role}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2, sort_keys=True))
+        return path
+
+    def init5_topology(self, topology: str, run_id: str = "demo") -> Path:
+        """A five-role-v1 run with an explicit topology for submission tests."""
+        self.cli("init", run_id, "--harness", "claude", "--topology", topology,
+                 "--evidence-mode", "documents-only", "--workflow", "five-role-v1")
+        return self.root / ".docket" / "runs" / run_id
+
+    def assign_orchestrator_task(self, run: Path, owner: str, run_id: str = "demo") -> None:
+        """Assign an executor orchestrator task and fill its contract."""
+        fname = f"src/{owner.lower()}.py"
+        self.cli(
+            "assign", run_id, owner, "--complexity", "high", "--executor", "orchestrator",
+            "--harness", "opencode", "--file", fname,
+            "--verify", f'printf "{owner} ok\\n"',
+        )
+        self.fill_task(run / f"{owner}-task.mdx")
+
+    def submit_orchestrator_task(self, run: Path, owner: str, run_id: str = "demo"):
+        """Fill and submit an executor orchestrator task as orchestrator."""
+        self.fill_task_report(run / f"{owner}-report-01.mdx",
+                              files=f"- `src/{owner.lower()}.py:1` - implemented {owner}.")
+        return self.cli("submit", run_id, owner, "--as", "orchestrator")
+
+    def submit_aggregate(self, run: Path, run_id: str = "demo"):
+        """Assign and submit the aggregate report as orchestrator."""
+        self.cli(
+            "assign", run_id, "orch", "--complexity", "high", "--executor",
+            "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+            "--verify", 'printf "orch ok\\n"',
+        )
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        return self.cli("submit", run_id, "orch", "--as", "orchestrator")
+
+    def submit5_in(self, run: Path, run_id: str, owner: str) -> None:
+        """Assign, scope, and submit one task as implementor in the named run."""
+        fname = f"src/{owner.lower()}.py"
+        self.cli(
+            "assign", run_id, owner, "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", fname,
+            "--verify", f'printf "{owner} ok\\n"',
+        )
+        self.fill_task(run / f"{owner}-task.mdx")
+        self.fill_scope(run / f"{owner}-scope.mdx")
+        self.cli("scope", run_id, owner, "--submit")
+        self.fill_task_report(run / f"{owner}-report-01.mdx",
+                              files=f"- `src/{owner.lower()}.py:1` - implemented {owner}.")
+        self.cli("submit", run_id, owner, "--as", "implementor")
+
+    def assign_simple_in(self, run: Path, run_id: str, owner: str) -> None:
+        """Assign and scope one task without submitting it, in the named run."""
+        fname = f"src/{owner.lower()}.py"
+        self.cli(
+            "assign", run_id, owner, "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", fname,
+            "--verify", f'printf "{owner} ok\\n"',
+        )
+        self.fill_task(run / f"{owner}-task.mdx")
+        self.fill_scope(run / f"{owner}-scope.mdx")
+        self.cli("scope", run_id, owner, "--submit")
+
+    def test_p1_five_role_submission_never_completes(self) -> None:
+        """Five-role submission records submitted; legacy still records completed."""
+        run = self.init5()
+        self.assign_orchestrator_task(run, "T01", "demo")
+        out = self.submit_orchestrator_task(run, "T01", "demo")
+        self.assertIn("submitted for review", out.stdout)
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+        self.assertNotIn("status: completed", (run / "T01-report-01.mdx").read_text())
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.assertIn("status: approved", (run / "T01-report-01.mdx").read_text())
+
+        combined = self.init5_topology("combined", "demo2")
+        self.submit5_in(combined, "demo2", "T01")
+        self.cli("verify", "demo2", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo2", "T01", "--approve", "--as", "reviewer")
+        self.submit5_in(combined, "demo2", "T02")
+        self.cli("verify", "demo2", "T02", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo2", "T02", "--approve", "--as", "reviewer")
+        agg_out = self.submit_aggregate(combined, "demo2")
+        self.assertIn("submitted for review", agg_out.stdout)
+        self.assertIn("status: submitted", (combined / "orch-report-01.mdx").read_text())
+        self.assertNotIn("status: completed", (combined / "orch-report-01.mdx").read_text())
+        self.cli("decide", "demo2", "orch", "--approve", "--as", "reviewer")
+        self.assertIn("status: approved", (combined / "orch-report-01.mdx").read_text())
+
+        legacy = self.init_legacy_as("demo3", "combined", evidence_mode="documents-only")
+        self.cli(
+            "assign", "demo3", "T01", "--complexity", "high", "--executor", "orchestrator",
+            "--harness", "opencode", "--file", "src/t01.py",
+            "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_task(legacy / "T01-task.mdx")
+        self.fill_task_report(legacy / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        legacy_out = self.cli("submit", "demo3", "T01")
+        self.assertIn("completed; recorded without a redundant handoff", legacy_out.stdout)
+        self.assertIn("status: completed", (legacy / "T01-report-01.mdx").read_text())
+        self.cli("assign", "demo3", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py")
+        self.fill_orch_report(legacy / "orch-report-01.mdx")
+        legacy_agg = self.cli("submit", "demo3", "orch", "--skip-verify")
+        self.assertIn("completed; recorded without a redundant handoff", legacy_agg.stdout)
+        self.assertIn("status: completed", (legacy / "orch-report-01.mdx").read_text())
+        self.assertTrue((legacy / ".bundles" / "orch" / "rounds.json").is_file())
+
+        no_key = self.init_legacy_as("demo4", "split", evidence_mode="documents-only")
+        plan = no_key / "plan.mdx"
+        text = plan.read_text()
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("workflow:"))
+        plan.write_text(text + "\n")
+        self.cli(
+            "assign", "demo4", "T09", "--complexity", "high", "--executor", "orchestrator",
+            "--harness", "opencode", "--file", "src/t09.py",
+            "--verify", 'printf "T09 ok\\n"',
+        )
+        self.fill_task(no_key / "T09-task.mdx")
+        self.fill_task_report(no_key / "T09-report-01.mdx",
+                              files="- `src/t09.py:1` - implemented T09.")
+        no_key_out = self.cli("submit", "demo4", "T09")
+        self.assertIn("completed; recorded without a redundant handoff", no_key_out.stdout)
+        self.assertIn("status: completed", (no_key / "T09-report-01.mdx").read_text())
+
+    def test_p1_five_role_aggregate_wakes_reviewer_not_planner(self) -> None:
+        """Five-role aggregate routes to reviewer; legacy aggregate stays with planner."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.submit_aggregate(run, "demo")
+        reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        planner = self.cli("events", "demo", "--role", "planner", "--peek").stdout
+        self.assertIn("orch:1:submitted", reviewer)
+        self.assertNotIn("orch:1:submitted", planner)
+        self.cli("propose-amendment", "demo", "T01", "--need", "decide the cache scope",
+                 "--conflicts", "task says memory, repo uses disk",
+                 "--evidence", "src/cache.py:40",
+                 "--alternative", "allow either backend",
+                 "--impact", "T01 acceptance")
+        planner_after = self.cli("events", "demo", "--role", "planner", "--peek").stdout
+        self.assertIn("amendment", planner_after)
+        self.assertNotIn("orch:1:submitted", planner_after)
+
+        blocked_run = self.init5_topology("split", "demo2")
+        self.submit5_in(blocked_run, "demo2", "T01")
+        self.cli("verify", "demo2", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo2", "T01", "--approve", "--as", "reviewer")
+        self.cli(
+            "assign", "demo2", "orch", "--complexity", "high", "--executor",
+            "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+        )
+        orch_report = blocked_run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        blocked_text = orch_report.read_text().replace(
+            "## Decisions needed\n\nnone",
+            "## Decisions needed\n\nWaive the slow integration job?")
+        orch_report.write_text(blocked_text)
+        self.cli("submit", "demo2", "orch", "--blocked", "--as", "orchestrator")
+        blocked_reviewer = self.cli("events", "demo2", "--role", "reviewer", "--peek").stdout
+        blocked_planner = self.cli("events", "demo2", "--role", "planner", "--peek").stdout
+        self.assertIn("orch:1:blocked", blocked_reviewer)
+        self.assertNotIn("orch:1:blocked", blocked_planner)
+
+        legacy = self.init_legacy_as("demo3", "split", evidence_mode="documents-only")
+        self.cli(
+            "assign", "demo3", "T01", "--complexity", "high", "--executor", "orchestrator",
+            "--harness", "opencode", "--file", "src/t01.py",
+            "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_task(legacy / "T01-task.mdx")
+        self.fill_task_report(legacy / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo3", "T01")
+        self.cli("assign", "demo3", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py")
+        self.fill_orch_report(legacy / "orch-report-01.mdx")
+        self.cli("submit", "demo3", "orch", "--skip-verify")
+        legacy_planner = self.cli("events", "demo3", "--role", "planner", "--peek").stdout
+        legacy_reviewer = self.cli("events", "demo3", "--role", "reviewer", "--peek").stdout
+        self.assertIn("orch:1:submitted", legacy_planner)
+        self.assertIn("orchestrator submitted round 1 for review", legacy_planner)
+        self.assertIn("no derived events", legacy_reviewer)
+
+    def test_p1_verifier_resolves_event_and_batch_needs_verification(self) -> None:
+        """A recorded verdict resolves its verifier event; milestone review needs pass."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        before = self.cli("events", "demo", "--role", "verifier", "--peek").stdout
+        self.assertIn("T01:1:submitted", before)
+        self.assign_simple(run, "T02")
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02", "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        early_reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("batch:M1:ready:", early_reviewer)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        after = self.cli("events", "demo", "--role", "verifier", "--peek").stdout
+        self.assertNotIn("T01:1:submitted", after)
+        self.assertIn("T02:1:submitted", after)
+        self.cli("verify", "demo", "T02", "--result", "uncertain", "--as", "verifier",
+                 "--detail", "oracle partly offline")
+        ready = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("batch:M1:ready:1", ready)
+        first_key = [line.strip().split()[-1] for line in ready.splitlines()
+                     if "batch:M1:ready:" in line][0]
+        self.cli("reconcile", "demo", "--role", "reviewer")
+        pending = list((run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        first_pending = [json.loads(p.read_text()) for p in pending
+                         if json.loads(p.read_text()).get("key") == first_key][0]
+        first_revision = first_pending.get("revision", "")
+        self.assertTrue(str(first_revision).startswith("sha256:"))
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "changed finding with new evidence pointer")
+        changed = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        changed_keys = [line.strip().split()[-1] for line in changed.splitlines()
+                        if "batch:M1:ready:" in line]
+        self.assertEqual(1, len(changed_keys))
+        self.assertEqual(first_key, changed_keys[0])
+        self.cli("reconcile", "demo", "--role", "reviewer")
+        pending_after = list((run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        changed_pending = [json.loads(p.read_text()) for p in pending_after
+                           if json.loads(p.read_text()).get("key") == first_key][0]
+        self.assertNotEqual(first_revision, changed_pending.get("revision", ""))
+        same = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertEqual(changed, same)
+        self.cli("reconcile", "demo", "--role", "reviewer")
+        pending_same = list((run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        same_pending = [json.loads(p.read_text()) for p in pending_same
+                        if json.loads(p.read_text()).get("key") == first_key][0]
+        self.assertEqual(changed_pending.get("revision", ""), same_pending.get("revision", ""))
+
+        fail_run = self.init5_topology("split", "demo2")
+        self.submit5_in(fail_run, "demo2", "T01")
+        self.submit5_in(fail_run, "demo2", "T02")
+        self.cli("batch", "demo2", "--create", "M1", "--members", "T01,T02", "--milestone")
+        self.cli("batch", "demo2", "--close", "M1")
+        self.cli("verify", "demo2", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("verify", "demo2", "T02", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch")
+        fail_reviewer = self.cli("events", "demo2", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("batch:M1:ready:", fail_reviewer)
+        fail_verifier = self.cli("events", "demo2", "--role", "verifier", "--peek").stdout
+        self.assertNotIn("T01:1:submitted", fail_verifier)
+        self.assertNotIn("T02:1:submitted", fail_verifier)
+
+        new_round_run = self.init5_topology("split", "demo3")
+        self.submit5_in(new_round_run, "demo3", "T01")
+        self.cli("verify", "demo3", "T01", "--result", "pass", "--as", "verifier")
+        self.assertNotIn("T01:1:submitted",
+                         self.cli("events", "demo3", "--role", "verifier", "--peek").stdout)
+        self.cli("decide", "demo3", "T01", "--changes", "--as", "reviewer")
+        dec = new_round_run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Fix `src/t01.py:1` - handle the empty input.\n"))
+        self.cli("decide", "demo3", "T01", "--changes", "--as", "reviewer")
+        self.fill_task_report(new_round_run / "T01-report-02.mdx",
+                              files="- `src/t01.py:2` - fixed T01.")
+        self.cli("submit", "demo3", "T01", "--as", "implementor")
+        second = self.cli("events", "demo3", "--role", "verifier", "--peek").stdout
+        self.assertIn("T01:2:submitted", second)
+
+        exempt_run = self.init5_topology("split", "demo4")
+        plan = exempt_run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: forbidden\nverifier_exempt: T02"))
+        self.submit5_in(exempt_run, "demo4", "T01")
+        self.submit5_in(exempt_run, "demo4", "T02")
+        self.cli("batch", "demo4", "--create", "M1", "--members", "T01,T02", "--milestone")
+        self.cli("batch", "demo4", "--close", "M1")
+        self.cli("verify", "demo4", "T01", "--result", "pass", "--as", "verifier")
+        exempt_ready = self.cli("events", "demo4", "--role", "reviewer", "--peek").stdout
+        self.assertIn("batch:M1:ready:1", exempt_ready)
+
+    def test_p2_frontier_wakes_reviewer_for_stalled_dependency(self) -> None:
+        """A closed batch with a verified submission blocking a dependent derives one frontier."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("batch", "demo", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo", "--close", "B1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        frontier_keys = [line.strip().split()[-1] for line in reviewer.splitlines()
+                         if "batch:B1:frontier:" in line]
+        self.assertEqual(1, len(frontier_keys))
+        self.assertIn("batch:B1:frontier:1", frontier_keys[0])
+        self.assertIn("T01", reviewer)
+        # T01 -> T02 completes through derived events alone.
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "w1", "--role", "implementor")
+        blocked_dispatch = self.cli("dispatch", "demo", "T02", "--session", "s1",
+                                    ok=False)
+        self.assertNotEqual(0, blocked_dispatch.returncode)
+        self.assertIn("T01", blocked_dispatch.stderr)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.assertIn("approved", (run / "T01-report-01.mdx").read_text())
+        self.assertIn("draft", (run / "T02-report-01.mdx").read_text())
+        dispatched = self.cli("dispatch", "demo", "T02", "--session", "s1")
+        self.assertEqual(0, dispatched.returncode)
+        self.assertIn("dispatched T02", dispatched.stdout)
+        # A decision binds to its own bundle; approving T01 never approves T02.
+        self.assertNotIn("approved", (run / "T02-report-01.mdx").read_text())
+        # A frontier is a wake, never a terminal state of its own.
+        self.assertNotIn("status: frontier", (run / "T01-report-01.mdx").read_text())
+        self.assertNotIn("status: frontier", (run / "T02-report-01.mdx").read_text())
+
+        # A member is in a frontier only with resolved verification and a stalled dependent.
+        fail_run = self.init5_topology("split", "demo2")
+        self.assign_simple_in(fail_run, "demo2", "T01")
+        self.assign_simple_in(fail_run, "demo2", "T02")
+        self.cli("batch", "demo2", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo2", "--close", "B1")
+        self.fill_task_report(fail_run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo2", "T01", "--as", "implementor")
+        self.cli("verify", "demo2", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch")
+        no_frontier = self.cli("events", "demo2", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("frontier", no_frontier)
+        # Unverified submissions never join a frontier either.
+        unverified_run = self.init5_topology("split", "demo3")
+        self.assign_simple_in(unverified_run, "demo3", "T01")
+        self.assign_simple_in(unverified_run, "demo3", "T02")
+        self.cli("batch", "demo3", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo3", "--close", "B1")
+        self.fill_task_report(unverified_run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo3", "T01", "--as", "implementor")
+        pending = self.cli("events", "demo3", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("frontier", pending)
+
+        # A milestone batch that is already ready does not wake twice for one decision.
+        milestone_run = self.init5_topology("split", "demo4")
+        self.submit5_in(milestone_run, "demo4", "T01")
+        self.submit5_in(milestone_run, "demo4", "T02")
+        self.cli("batch", "demo4", "--create", "M1", "--members", "T01,T02",
+                 "--milestone")
+        self.cli("batch", "demo4", "--close", "M1")
+        self.cli("verify", "demo4", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("verify", "demo4", "T02", "--result", "pass", "--as", "verifier")
+        both = self.cli("events", "demo4", "--role", "reviewer", "--peek").stdout
+        self.assertIn("batch:M1:ready:1", both)
+        self.assertNotIn("frontier", both)
+
+        # Identity is stable while nothing changes and moves when evidence moves.
+        stable_run = self.init5_topology("split", "demo5")
+        self.assign_simple_in(stable_run, "demo5", "T01")
+        self.assign_simple_in(stable_run, "demo5", "T02")
+        self.cli("batch", "demo5", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo5", "--close", "B1")
+        self.fill_task_report(stable_run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo5", "T01", "--as", "implementor")
+        self.cli("verify", "demo5", "T01", "--result", "pass", "--as", "verifier")
+        first = self.cli("events", "demo5", "--role", "reviewer", "--peek").stdout
+        first_keys = [line.strip().split()[-1] for line in first.splitlines()
+                      if "batch:B1:frontier:" in line]
+        self.assertEqual(1, len(first_keys))
+        self.cli("reconcile", "demo5", "--role", "reviewer")
+        pending_paths = list((stable_run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        first_pending = [json.loads(p.read_text()) for p in pending_paths
+                         if json.loads(p.read_text()).get("key") == first_keys[0]][0]
+        first_revision = first_pending.get("revision", "")
+        self.assertTrue(str(first_revision).startswith("sha256:"))
+        same = self.cli("events", "demo5", "--role", "reviewer", "--peek").stdout
+        self.assertEqual(first, same)
+        self.cli("reconcile", "demo5", "--role", "reviewer")
+        same_paths = list((stable_run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        same_pending = [json.loads(p.read_text()) for p in same_paths
+                        if json.loads(p.read_text()).get("key") == first_keys[0]][0]
+        self.assertEqual(first_revision, same_pending.get("revision", ""))
+        self.cli("verify", "demo5", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "changed finding with new evidence pointer")
+        changed = self.cli("events", "demo5", "--role", "reviewer", "--peek").stdout
+        changed_keys = [line.strip().split()[-1] for line in changed.splitlines()
+                        if "batch:B1:frontier:" in line]
+        self.assertEqual(1, len(changed_keys))
+        self.assertEqual(first_keys[0], changed_keys[0])
+        self.cli("reconcile", "demo5", "--role", "reviewer")
+        changed_paths = list((stable_run / ".delivery" / "reviewer" / "pending").glob("*.json"))
+        changed_pending = [json.loads(p.read_text()) for p in changed_paths
+                           if json.loads(p.read_text()).get("key") == first_keys[0]][0]
+        self.assertNotEqual(first_revision, changed_pending.get("revision", ""))
+
+        # Legacy runs derive no frontier event.
+        legacy = self.init5_topology("split", "demo6")
+        # Convert demo6 to legacy by removing the workflow key.
+        plan6 = legacy / "plan.mdx"
+        plan6.write_text("\n".join(
+            line for line in plan6.read_text().splitlines()
+            if not line.startswith("workflow:")) + "\n")
+        self.assign_simple_in(legacy, "demo6", "T01")
+        self.assign_simple_in(legacy, "demo6", "T02")
+        self.cli("batch", "demo6", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo6", "--close", "B1")
+        self.fill_task_report(legacy / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo6", "T01")
+        legacy_reviewer = self.cli("events", "demo6", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("frontier", legacy_reviewer)
+
+    def test_p2_packet_scoped_to_reviewable_members(self) -> None:
+        """Unscoped packets skip never-submitted tasks; batch scope selects exactly its batch."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("batch", "demo", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.cli("batch", "demo", "--close", "B1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertIn("T01 round 1", packet)
+        self.assertNotIn("T02 round", packet)
+        scoped = self.cli("review-packet", "demo", "--role", "reviewer",
+                          "--batch", "B1").stdout
+        self.assertIn("T01 round 1", scoped)
+        self.assertNotIn("T02 round", scoped)
+        # A second batch with no reviewable work stays outside a scoped packet.
+        self.assign_simple(run, "T03")
+        self.cli("batch", "demo", "--create", "B2", "--members", "T03")
+        self.cli("batch", "demo", "--close", "B2")
+        rescoped = self.cli("review-packet", "demo", "--role", "reviewer",
+                            "--batch", "B1").stdout
+        self.assertIn("T01 round 1", rescoped)
+        self.assertNotIn("T03 round", rescoped)
+        other = self.cli("review-packet", "demo", "--role", "reviewer",
+                         "--batch", "B2", ok=False)
+        self.assertNotEqual(0, other.returncode)
+        # The evidence gate is not weakened inside the selected scope.
+        rep = run / "T01-report-01.mdx"
+        rep.write_text(rep.read_text() + "\nStale edit.\n")
+        stale = self.cli("review-packet", "demo", "--role", "reviewer", ok=False)
+        self.assertNotEqual(0, stale.returncode)
+        self.assertIn("stale", stale.stderr.lower())
+        rep.write_text(rep.read_text().replace("\nStale edit.\n", ""))
+        entries = json.loads((run / ".bundles" / "T01" / "rounds.json").read_text())["entries"]
+        bdir = run / ".bundles" / "T01" / entries[-1]["dir"]
+        artifact = bdir / "report.mdx"
+        saved = artifact.read_bytes()
+        artifact.write_bytes(saved + b"tamper")
+        damaged = self.cli("review-packet", "demo", "--role", "reviewer", ok=False)
+        self.assertNotEqual(0, damaged.returncode)
+        self.assertIn("damaged", damaged.stderr)
+        artifact.write_bytes(saved)
+        # Correction and final selection keep their current behavior exactly.
+        self.submit5(run, "T04")
+        self.cli("verify", "demo", "T04", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "demo", "T04", "--approve", "--as", "reviewer")
+        correction = self.cli("review-packet", "demo", "--role", "reviewer",
+                              "--correction", "T04").stdout
+        self.assertIn("T04 round", correction)
+        self.assertNotIn("T01 round", correction)
+
+    def test_p2_milestone_and_frontier_agree_on_verification(self) -> None:
+        """One unresolved or failed member is excluded from both readiness paths."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.assign_simple(run, "T03")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02",
+                 "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        self.cli("batch", "demo", "--create", "B1", "--members", "T01,T03",
+                 "--depends-on", "T03:T01")
+        self.cli("batch", "demo", "--close", "B1")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        unresolved = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("batch:M1:ready:", unresolved)
+        self.assertNotIn("batch:B1:frontier:", unresolved)
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch")
+        failed = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn("batch:M1:ready:", failed)
+        self.assertNotIn("batch:B1:frontier:", failed)
+
+    # ---------------- T41: one canonical contract per role, docs that agree
+
+    @staticmethod
+    def _skill_root() -> Path:
+        return Path(DOCKET).parents[1]
+
+    @staticmethod
+    def _ref_text(name: str) -> str:
+        return (Path(DOCKET).parents[1] / "references" / name).read_text()
+
+    def test_t41_canonical_contracts_single_source_help_prompt_agree(self) -> None:
+        """Help and prompt both read the one contract file, so they cannot drift."""
+        contracts = self._skill_root() / "references" / "contracts"
+        for role in ("planner", "orchestrator", "implementor", "verifier", "reviewer"):
+            self.assertTrue((contracts / f"{role}.md").is_file(),
+                            f"missing canonical contract: contracts/{role}.md")
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        marker = "T41-CANONICAL-MARKER-7f3a"
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp)
+            for role in ("planner", "orchestrator", "implementor", "verifier", "reviewer"):
+                (overlay / f"{role}.md").write_text(
+                    (contracts / f"{role}.md").read_text().rstrip() + f"\n\n{marker}\n")
+            help_out = self.cli_env({"DOCKET_CONTRACTS_ROOT": str(overlay)},
+                                    "help", "implementor")
+            self.assertIn(marker, help_out.stdout)
+            prompt_out = self.cli_env({"DOCKET_CONTRACTS_ROOT": str(overlay)},
+                                      "prompt", "demo", "T01", "--role", "implementor")
+            self.assertEqual(0, prompt_out.returncode, prompt_out.stderr)
+            self.assertIn(marker, prompt_out.stdout)
+
+    def test_t41_prompt_compact_excludes_playbook_prose(self) -> None:
+        """The prompt carries the compact contract, never the playbook detail."""
+        contracts = self._skill_root() / "references" / "contracts"
+        maxima = {"implementor": 544, "orchestrator": 612, "verifier": 349,
+                  "reviewer": 359, "planner": 302}
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        for role, limit in maxima.items():
+            body = (contracts / f"{role}.md").read_text().strip()
+            self.assertTrue(body, f"empty contract {role}")
+            self.assertLessEqual(len(body), limit,
+                                 f"{role} contract exceeds its historic compact size")
+            out = self.prompt_text(run, "T01", role)
+            self.assertIn(body.split()[0], out)
+            self.assertIn(body.strip().splitlines()[0][:40], out)
+        impl = self.prompt_text(run, "T01", "implementor")
+        self.assertNotIn("return the report to", impl)
+        orch = self.prompt_text(run, "T01", "orchestrator")
+        self.assertNotIn("repeating the bare verdict", orch)
+        self.assertNotIn("return the report to", orch)
+
+    def test_t41_missing_contract_is_a_concrete_diagnostic(self) -> None:
+        """A missing contract names its file; it never renders a placeholder prompt."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        with tempfile.TemporaryDirectory() as tmp:
+            help_refused = self.cli_env({"DOCKET_CONTRACTS_ROOT": tmp},
+                                        "help", "implementor", ok=False)
+            self.assertNotEqual(0, help_refused.returncode)
+            self.assertIn("implementor.md", help_refused.stderr)
+            self.assertIn("contract", help_refused.stderr.lower())
+            self.assertNotIn("Implement the assigned task", help_refused.stdout)
+            prompt_refused = self.cli_env({"DOCKET_CONTRACTS_ROOT": tmp},
+                                          "prompt", "demo", "T01",
+                                          "--role", "implementor", ok=False)
+            self.assertNotEqual(0, prompt_refused.returncode)
+            self.assertIn("implementor.md", prompt_refused.stderr)
+            self.assertIn("contract", prompt_refused.stderr.lower())
+            self.assertNotIn("# Role: implementor", prompt_refused.stdout)
+
+    def test_t41_dispatch_records_unavailable_binding_when_contract_missing(self) -> None:
+        """A missing document must not make dispatch impossible."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "impl-one", "--role", "implementor")
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatched = self.cli_env({"DOCKET_CONTRACTS_ROOT": tmp},
+                                      "dispatch", "demo", "T01", "--session", "w1")
+            self.assertEqual(0, dispatched.returncode, dispatched.stderr)
+            self.assertIn("recorded binding", dispatched.stdout)
+            self.assertIn("unavailable", dispatched.stdout.lower())
+            record = json.loads((run / ".dispatch" / "T01.json").read_text())
+            self.assertTrue(str(record.get("prompt_digest", "")).startswith("unavailable"),
+                            f"prompt_digest is not unavailable: {record.get('prompt_digest')}")
+            self.assertIn("implementor.md", str(record.get("prompt_digest", "")))
+
+    def test_t41_planner_title_and_role_authority(self) -> None:
+        """Planner is not titled reviewer; only the reviewer approves, waives, reopens."""
+        planner = self._ref_text("planner.md")
+        first = next(line for line in planner.splitlines() if line.strip())
+        self.assertEqual("# Planner", first)
+        self.assertNotIn("# Planner / reviewer", planner)
+        orch = self._ref_text("orchestrator.md")
+        self.assertNotIn("Approve, waive a genuine external blocker", orch)
+        for name in ("planner.md", "orchestrator.md", "implementor.md",
+                     "verifier.md", "signalling.md"):
+            text = self._ref_text(name)
+            for line in text.splitlines():
+                stripped = line.strip()
+                if "docket decide" not in stripped:
+                    continue
+                if any(flag in stripped for flag in ("--approve", "--waive",
+                                                     "--changes", "--reopen")):
+                    self.assertIn("--as reviewer", stripped,
+                                  f"{name} directs a decision without reviewer authority: {stripped}")
+        reviewer = self._ref_text("reviewer.md")
+        self.assertIn("--approve --as reviewer", reviewer)
+        self.assertIn("--waive", reviewer)
+
+    def test_t41_no_playbook_hand_edits_lifecycle_status(self) -> None:
+        """No playbook tells anyone to edit lifecycle status by hand."""
+        for name in ("planner.md", "orchestrator.md", "implementor.md",
+                     "verifier.md", "reviewer.md", "signalling.md",
+                     "verification-obligations.md"):
+            text = self._ref_text(name)
+            self.assertNotIn("return the report to", text, f"{name} suggests a hand-edit")
+            self.assertNotIn("return the report to `status: draft`", text)
+        orch = self._ref_text("orchestrator.md")
+        self.assertNotIn("or return the report to", orch)
+
+    def test_t41_submission_examples_carry_as_and_commands_are_valid(self) -> None:
+        """Implementor examples carry five-role --as; every fenced docket command is real."""
+        impl = self._ref_text("implementor.md")
+        self.assertIn("docket submit <run> <owner> --as implementor", impl)
+        top = self.cli("--help")
+        self.assertEqual(0, top.returncode)
+        brace = re.search(r"\{([\w\-,]+)\}", top.stdout)
+        self.assertIsNotNone(brace, "no subcommand list in docket --help")
+        known_cmds = set(brace.group(1).split(","))
+        self.assertIn("dispatch", known_cmds)
+        flag_cache: dict[str, str] = {}
+        repo_refs = self._skill_root() / "references"
+        for path in sorted(repo_refs.glob("*.md")):
+            text = path.read_text()
+            for block in re.findall(r"```bash(.*?)```", text, re.S):
+                for raw in block.splitlines():
+                    line = raw.strip()
+                    if line.startswith("#") or not line.startswith("docket "):
+                        continue
+                    line = line.split("#", 1)[0].strip()
+                    tokens = line.split()
+                    self.assertGreater(len(tokens), 1, f"{path.name}: {raw}")
+                    cmd = tokens[1]
+                    self.assertIn(cmd, known_cmds, f"{path.name} names no such command: {raw}")
+                    if cmd not in flag_cache:
+                        help_out = self.cli(cmd, "--help")
+                        self.assertEqual(0, help_out.returncode, f"docket {cmd} --help")
+                        flag_cache[cmd] = help_out.stdout
+                    flags = [t for t in tokens[2:] if t.startswith("--")]
+                    for flag in flags:
+                        name = flag.split("=")[0]
+                        self.assertIn(name, flag_cache[cmd],
+                                      f"{path.name} names no such flag for {cmd}: {raw}")
+            for match in re.findall(r"`(references/[^\s`]+\.md)`", text):
+                self.assertTrue((self._skill_root() / match).is_file(),
+                                f"{path.name} names no such path: {match}")
+
+    def test_t41_readme_describes_five_roles_and_at_least_once(self) -> None:
+        """User-facing promises match the code: five roles, at-least-once delivery."""
+        repo = Path(DOCKET).parents[3]
+        readme = (repo / "README.md").read_text()
+        self.assertNotIn("Three logical roles", readme)
+        self.assertIn("Five logical roles", readme)
+        self.assertIn("at-least-once", readme)
+        self.assertNotIn("exactly once", readme.lower())
+        arch = (repo / "ARCHITECTURE.md").read_text()
+        self.assertIn("at-least-once", arch)
+
+    def test_t41_skill_is_a_router_not_a_duplicate_protocol(self) -> None:
+        """SKILL.md routes to help and references instead of restating the protocol."""
+        skill = (self._skill_root() / "SKILL.md").read_text()
+        self.assertIn("docket help", skill)
+        self.assertIn("references/", skill)
+        self.assertLess(len(skill.splitlines()), 120,
+                        f"SKILL.md is still a protocol duplicate at {len(skill.splitlines())} lines")
+        self.assertNotIn("docket dispatch <run> T03 --session", skill)
+        self.assertNotIn("One owner submits at a time", skill)
+        for needle in ("evidence_mode: git", "provisional_integration: allowed",
+                       "content-addressed", "at-least-once"):
+            found = needle in skill
+            in_refs = any(needle in p.read_text()
+                          for p in (self._skill_root() / "references").glob("*.md"))
+            self.assertTrue(found or in_refs, f"{needle} lost from the documentation set")
+
+    def test_t41_changed_documents_carry_no_em_dashes(self) -> None:
+        """Every changed document avoids em dashes."""
+        repo = Path(DOCKET).parents[3]
+        candidates = [repo / "README.md", repo / "ARCHITECTURE.md",
+                      self._skill_root() / "SKILL.md"]
+        candidates += sorted((self._skill_root() / "references").glob("*.md"))
+        candidates += sorted((self._skill_root() / "references" / "contracts").glob("*.md")) \
+            if (self._skill_root() / "references" / "contracts").is_dir() else []
+        for path in candidates:
+            if path.is_file():
+                self.assertNotIn("\u2014", path.read_text(), f"em dash in {path}")
+
+    # ------------------------------- T42: stage, workflow, budget, model guidance
+
+    def test_t42_stage_derived_and_inspectable(self) -> None:
+        """Derived stage labels initial work; an explicit flag inspects other stages."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        initial = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: initial", initial)
+        self.assertIn("workflow: legacy", initial)
+        # Resume needs no extra input and renders mechanical recovery when none is ready.
+        resume = self.prompt_text(run, "T01", "implementor", stage="resume")
+        self.assertIn("stage: resume", resume)
+        self.assertNotIn("stage: initial", resume)
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        verify_stage = self.prompt_text(run, "T01", "implementor", stage="verification")
+        self.assertIn("stage: verification", verify_stage)
+        self.cli("decide", "demo", "T01", "--changes")
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Fix `src/t01.py:1` for the stage probe.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes")
+        correction = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: correction", correction)
+        inspected = self.prompt_text(run, "T01", "implementor", stage="correction")
+        self.assertIn("stage: correction", inspected)
+        # Review is distinguishable where verification exists: five-role with a pass.
+        five = self.init5_topology("split", "demo2")
+        self.assign_simple_in(five, "demo2", "T01")
+        self.fill_task_report(five / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo2", "T01", "--as", "implementor")
+        self.cli("verify", "demo2", "T01", "--result", "pass", "--as", "verifier")
+        review = self.cli("prompt", "demo2", "T01", "--role", "implementor",
+                          "--stage", "review").stdout
+        self.assertIn("stage: review", review)
+
+    def test_t42_workflow_selects_authority(self) -> None:
+        """Five-role and legacy prompts differ where authority differs."""
+        legacy = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(legacy, "T01")
+        legacy_prompt = self.prompt_text(legacy, "T01", "implementor")
+        five = self.init5_topology("split", "demo2")
+        self.assign_simple_in(five, "demo2", "T01")
+        five_prompt = self.cli("prompt", "demo2", "T01", "--role", "implementor").stdout
+        self.assertNotEqual(legacy_prompt, five_prompt)
+        # The regression names the difference it asserts.
+        self.assertIn("only the reviewer approves", five_prompt)
+        self.assertIn("legacy completion", legacy_prompt)
+
+    def test_t42_planner_aggregate_has_plan_objective(self) -> None:
+        """A planner prompt about the aggregate carries the plan, never task placeholders."""
+        run = self.init("split", evidence_mode="documents-only")
+        marker = "PLAN-OBJECTIVE-T42-9f2c"
+        plan_text = (run / "plan.mdx").read_text()
+        (run / "plan.mdx").write_text(plan_text.replace(
+            "<!-- TODO: what \"done\" means for this whole run, in 2-4 sentences -->",
+            marker))
+        self.assign_simple(run, "T01")
+        out = self.prompt_text(run, "orch", "planner")
+        self.assertIn(marker, out)
+        self.assertNotIn("see task file", out)
+        self.assertNotIn("(see task file)", out)
+
+    def test_t42_missing_task_is_diagnostic(self) -> None:
+        """A missing required task file fails naming the artifact, never a placeholder."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        refused = self.cli("prompt", "demo", "T99", "--role", "implementor", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("T99-task.mdx", refused.stderr)
+        self.assertNotIn("see task file", refused.stdout)
+        self.assertNotIn("(see task file)", refused.stdout)
+
+    def test_t42_dispatch_records_unavailable_on_correction_refusal(self) -> None:
+        """Dispatch still binds when a correction cannot render; the digest is unavailable."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        opened = self.cli("decide", "demo", "T01", "--changes")
+        self.assertIn("opened decision draft", opened.stdout)
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Fix `src/t01.py:1` and add a regression.\n2. Re-run the verify command.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes")
+        # Empty the required changes so correction rendering must refuse.
+        broken = dec.read_text().replace(
+            "1. Fix `src/t01.py:1` and add a regression.\n2. Re-run the verify command.",
+            "<!-- TODO: required changes removed for the refusal probe -->")
+        dec.write_text(broken)
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "impl-one", "--role", "implementor")
+        dispatched = self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.assertEqual(0, dispatched.returncode, dispatched.stderr)
+        self.assertIn("recorded binding", dispatched.stdout)
+        self.assertIn("unavailable", dispatched.stdout.lower())
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertTrue(str(record.get("prompt_digest", "")).startswith("unavailable"))
+
+    def test_t42_correction_carries_required_changes(self) -> None:
+        """A correction prompt carries every numbered change plus frozen evidence pointers."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        opened = self.cli("decide", "demo", "T01", "--changes")
+        self.assertIn("opened decision draft", opened.stdout)
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Guard `src/t01.py:1` against empty input.\n"
+            "2. Add a regression asserting the guard fails without it.\n"
+            "3. Re-run `printf \"T01 ok\\n\"` and quote its output.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes")
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: correction", out)
+        self.assertIn("1. Guard `src/t01.py:1` against empty input.", out)
+        self.assertIn("2. Add a regression asserting the guard fails without it.", out)
+        self.assertIn("3. Re-run `printf \"T01 ok\\n\"` and quote its output.", out)
+        self.assertIn("bundle_digest: sha256:", out)
+        self.assertIn("T01-decision-01.mdx", out)
+
+    def test_t42_resume_selects_ready_only(self) -> None:
+        """Resume names the latest ready handoff; with none ready it says mechanical recovery."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-01.mdx")
+        self.cli("handoff", "demo", "T01", "--submit")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-02.mdx")
+        # 02 is still a draft; the resume prompt must name 01 as ready, never 02.
+        out = self.prompt_text(run, "T01", "implementor", stage="resume")
+        self.assertIn("T01-handoff-01.mdx", out)
+        self.assertIn("ready", out.lower())
+        ready_line = next(line for line in out.splitlines() if "ready handoff" in line.lower())
+        self.assertIn("T01-handoff-01.mdx", ready_line)
+        self.assertNotIn("T01-handoff-02.mdx", ready_line)
+        # With only a draft and no ready handoff, recovery is mechanical rediscovery.
+        # Use a fresh owner in the same run with only a draft handoff.
+        self.assign_simple(run, "T02")
+        self.cli("handoff", "demo", "T02")
+        self.fill_handoff(run / "T02-handoff-01.mdx")
+        lone = self.prompt_text(run, "T02", "implementor", stage="resume")
+        self.assertNotIn("T02-handoff-01.mdx (ready", lone)
+        self.assertIn("mechanical", lone.lower())
+        self.assertIn("task", lone.lower())
+        self.assertIn("scope", lone.lower())
+        self.assertIn("docket diff", lone)
+
+    def test_t42_budget_covers_profile_and_formatting(self) -> None:
+        """Reported guidance size matches the prompt bytes and never exceeds the budget."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Fix the flaky fixture oracle under concurrency."))
+        out = self.prompt_text(run, "T01", "implementor", model="unknown-model-9")
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        self.assertTrue(records)
+        record = json.loads(records[-1].read_text())
+        guidance_tokens = int(record["guidance_tokens"])
+        self.assertLessEqual(guidance_tokens, 600)
+        # The reported size matches what the prompt actually carries.
+        if "# Selected guidance" in out:
+            section = out.split("# Selected guidance", 1)[1]
+            # Guidance section ends at the next top-level heading.
+            cut = section.find("\n\n# Resume")
+            guidance_body = ("# Selected guidance" + (section[:cut] if cut != -1 else section))
+        else:
+            guidance_body = ""
+        actual = max(1, len(guidance_body) // 4) if guidance_body else 0
+        self.assertEqual(guidance_tokens, actual)
+
+    def test_t42_zero_budget_yields_no_guidance(self) -> None:
+        """Zero budget means no optional guidance at all, including no model profile."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Fix the flaky fixture oracle under concurrency."))
+        out = self.prompt_text(run, "T01", "implementor", model="claude-opus-9",
+                               max_tokens="0")
+        self.assertNotIn("[concurrency]", out)
+        self.assertNotIn("[fixture-changes]", out)
+        self.assertNotIn("[muse]", out)
+        self.assertNotIn("# Selected guidance", out)
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        record = json.loads(records[-1].read_text())
+        self.assertEqual(0, int(record["guidance_tokens"]))
+
+    def test_t42_oversized_first_card_skipped(self) -> None:
+        """A first card larger than the whole budget is skipped, never padded."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp)
+            (overlay / "huge.md").write_text(
+                "---\nprofile: huge\nversion: 1\ncard: true\ntriggers: feature\n---\n\n"
+                + ("Huge guidance line.\n" * 800))
+            task_text = (run / "T01-task.mdx").read_text()
+            (run / "T01-task.mdx").write_text(task_text.replace(
+                "Implement the feature.", "Implement the feature."))
+            out = self.cli_env({"DOCKET_PROFILES_ROOT": str(overlay)},
+                               "prompt", "demo", "T01", "--role", "implementor",
+                               "--max-tokens", "50").stdout
+            self.assertNotIn("[huge]", out)
+            records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+            record = json.loads(records[-1].read_text())
+            self.assertLessEqual(int(record["guidance_tokens"]), 50)
+
+    def test_t42_guidance_selection_recorded(self) -> None:
+        """Selected and rejected guidance is recorded with reasons in the digest record."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.prompt_text(run, "T01", "implementor")
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        self.assertTrue(records)
+        record = json.loads(records[-1].read_text())
+        self.assertIn("selected_guidance", record)
+        self.assertIn("rejected_guidance", record)
+        for entry in record["rejected_guidance"]:
+            self.assertIn("reason", entry)
+
+    def test_t42_mandatory_never_truncated(self) -> None:
+        """Mandatory contract and acceptance survive any budget and are sized separately."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        out = self.prompt_text(run, "T01", "implementor", max_tokens="1")
+        self.assertIn("Implement the assigned task", out)
+        self.assertIn("The feature works.", out)
+        self.assertIn("hard constraints:", out)
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        record = json.loads(records[-1].read_text())
+        self.assertIn("mandatory_tokens", record)
+        self.assertGreater(int(record["mandatory_tokens"]), 0)
+        self.assertIn("guidance_tokens", record)
+
+    def test_t42_model_matching_is_exact(self) -> None:
+        """A model name that merely contains another name never selects that profile."""
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = Path(tmp)
+            (overlay / "familymodel.md").write_text(
+                "---\nprofile: familymodel\nversion: 1\nmodels: claude\n---\n\nFamily guidance.\n")
+            (overlay / "musemodel.md").write_text(
+                "---\nprofile: musemodel\nversion: 1\nmodels: muse\n---\n\nMuse guidance.\n")
+            run = self.init("split", evidence_mode="documents-only")
+            self.assign_simple(run, "T01")
+            claude_test = self.cli_env(
+                {"DOCKET_PROFILES_ROOT": str(overlay)},
+                "prompt", "demo", "T01", "--role", "implementor",
+                "--model", "claude-test").stdout
+            self.assertNotIn("[familymodel]", claude_test)
+            exact = self.cli_env(
+                {"DOCKET_PROFILES_ROOT": str(overlay)},
+                "prompt", "demo", "T01", "--role", "implementor",
+                "--model", "claude").stdout
+            self.assertIn("[familymodel]", exact)
+            spark = self.cli_env(
+                {"DOCKET_PROFILES_ROOT": str(overlay)},
+                "prompt", "demo", "T01", "--role", "implementor",
+                "--model", "muse-spark-1.3").stdout
+            self.assertNotIn("[musemodel]", spark)
+
+    def test_t42_discarded_evaluation_removed(self) -> None:
+        """One-run model defaults are gone; task cards still trigger on task text."""
+        profiles = self._skill_root() / "references" / "model-profiles"
+        self.assertFalse((profiles / "muse.md").is_file(),
+                         "discarded one-run muse profile still present")
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Fix the flaky fixture oracle under concurrency."))
+        out = self.prompt_text(run, "T01", "implementor", model="claude-opus-9")
+        self.assertNotIn("[muse]", out)
+        self.assertNotIn("one-run", out.lower())
+        self.assertIn("[fixture-changes]", out)
+        self.assertIn("[concurrency]", out)
+
+    def test_t42_unknown_model_gets_task_cards(self) -> None:
+        """An unknown model still receives task-relevant cards under the stated policy."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.", "Fix the concurrent deployment configuration."))
+        out = self.prompt_text(run, "T01", "implementor", model="unknown-model-9")
+        self.assertIn("[concurrency]", out)
+        self.assertIn("[deployment-config]", out)
+        repo = Path(DOCKET).parents[3]
+        arch = (repo / "ARCHITECTURE.md").read_text()
+        self.assertNotIn("unknown models get the common contract", arch)
+
+    def test_t42_digest_record_has_workflow_stage_renderer_sources(self) -> None:
+        """The digest record binds workflow, stage, renderer, and every source revision."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.prompt_text(run, "T01", "implementor")
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        record = json.loads(records[-1].read_text())
+        self.assertEqual("legacy", record["workflow"])
+        self.assertEqual("initial", record["stage"])
+        self.assertTrue(str(record["renderer_revision"]).strip())
+        revisions = record["source_revisions"]
+        self.assertIn("sha256:", str(revisions.get("contract", "")))
+        self.assertIn("sha256:", str(revisions.get("task", "")))
+
+    def test_t42_literals_survive(self) -> None:
+        """Literal commands, fences, and tables round-trip byte-identical."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        command = "docket diff demo T01  --root app=./app"
+        task_path = run / "T01-task.mdx"
+        text = task_path.read_text()
+        text = text.replace("The feature works.",
+                            f"The feature works. Run `{command}` exactly.")
+        task_path.write_text(text)
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn(f"`{command}`", out)
+        fence = "```bash\ndocket diff demo T01\n```"
+        task_text = (run / "T01-task.mdx").read_text()
+        (run / "T01-task.mdx").write_text(task_text.replace(
+            "Implement the feature.",
+            f"Implement the feature.\n\n{fence}\n\n| a | b |\n| --- | --- |\n| 1 | 2 |"))
+        out2 = self.prompt_text(run, "T01", "implementor")
+        self.assertIn(fence, out2)
+        self.assertIn("| a | b |", out2)
+
+    # ------------------------- T43: complete packets and applicable obligations
+
+    def test_t43_standard_packet_preserves_findings_waiver_and_questions(self) -> None:
+        """Every selected owner's mandatory review material survives whole and in order."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files="- `src/t01.py:1` - implemented T01.")
+        question = "Should the reviewer accept the documented clock-skew tradeoff for T01?"
+        report.write_text(re.sub(
+            r"## Decisions needed\n\n.*?\n\n## Notes",
+            f"## Decisions needed\n\n{question}\n\n## Notes",
+            report.read_text(), flags=re.S))
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        first = "F1: the independent oracle disagrees at the empty-input boundary."
+        late = "F2-LATE: the final retry loses the byte-level provenance marker."
+        self.cli("verify", "demo", "T01", "--result", "uncertain", "--as", "verifier",
+                 "--detail", first)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", late)
+
+        self.assign_simple(run, "T02")
+        blocked = run / "T02-report-01.mdx"
+        self.fill_task_report(blocked, blocked=True,
+                              files="- `src/t02.py:1` - recorded the blocked attempt.")
+        blocked_question = "May T02 waive the unavailable external clock service?"
+        blocked.write_text(re.sub(
+            r"## Decisions needed\n\n.*?\n\n## Notes",
+            f"## Decisions needed\n\n{blocked_question}\n\n## Notes",
+            blocked.read_text(), flags=re.S))
+        self.cli("submit", "demo", "T02", "--blocked", "--as", "implementor")
+        waiver = ("The external clock service is unavailable; accept the local proof while "
+                  + "retaining the documented limitation " + "x" * 180
+                  + " QUALIFICATION-END: production still needs an online probe.")
+        self.cli("decide", "demo", "T02", "--waive", "--reason", waiver,
+                 "--as", "reviewer")
+
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertIn(first, packet)
+        self.assertIn(late, packet, "a late verifier finding must not disappear")
+        self.assertIn(waiver, packet)
+        self.assertIn("QUALIFICATION-END", packet)
+        self.assertIn(question, packet)
+        self.assertIn(blocked_question, packet)
+        self.assertNotIn("Approve the exact revisions above, request numbered corrections", packet)
+
+    def test_t43_correction_packet_preserves_every_numbered_change_in_full(self) -> None:
+        """Correction packets carry every outstanding item, including continuations and tails."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "F1: empty input is not guarded")
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        decision = run / "T01-decision-01.mdx"
+        long_tail = "FIRST-ITEM-TAIL-MUST-SURVIVE"
+        required = (
+            "1. Guard `src/t01.py:1` against empty input and preserve the independent "
+            + "oracle derivation " + "x" * 190 + f" {long_tail}.\n"
+            "   Keep this continuation because it qualifies the first required change.\n"
+            "2. Add a regression that fails when the guard is removed.\n"
+            "3. Re-run the registered verification and record the independently derived result."
+        )
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            required))
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        self.fill_task_report(run / "T01-report-02.mdx",
+                              files="- `src/t01.py:1` - corrected T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+
+        packet = self.cli("review-packet", "demo", "--role", "reviewer",
+                          "--correction", "T01").stdout
+        self.assertIn(long_tail, packet)
+        self.assertIn("Keep this continuation", packet)
+        self.assertIn("2. Add a regression", packet)
+        self.assertIn("3. Re-run the registered verification", packet)
+
+    def test_t43_packet_shrinks_routine_diff_before_mandatory_findings(self) -> None:
+        """A large routine patch is excerpted while mandatory findings remain complete."""
+        self.repo()
+        self.cli("init", "demo", "--harness", "claude", "--topology", "split",
+                 "--workflow", "five-role-v1", "--evidence-mode", "git",
+                 "--root", f"root={self.root}")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.assign_simple(run, "T01")
+        changed = self.root / "src" / "t01.py"
+        changed.write_text("\n".join(f"routine_line_{n} = {n}" for n in range(2400)) + "\n")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files="- `src/t01.py:1` - generated routine data.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        finding = "MANDATORY-FINDING-TAIL: retain the byte-sensitive mismatch in full."
+        self.cli("verify", "demo", "T01", "--result", "uncertain", "--as", "verifier",
+                 "--detail", finding)
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertIn(finding, packet)
+        self.assertLessEqual(self.packet_tokens(packet), 2000)
+        self.assertNotIn("routine_line_2399", packet)
+
+    def test_t43_mandatory_overage_is_explicit_with_required_reading_manifest(self) -> None:
+        """Mandatory-only overage is stated and names every artifact to open."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report, files="- `src/t01.py:1` - implemented T01.")
+        report.write_text(re.sub(
+            r"## Decisions needed\n\n.*?\n\n## Notes",
+            "## Decisions needed\n\nOVERAGE-QUESTION: decide the retained proof boundary.\n\n## Notes",
+            report.read_text(), flags=re.S))
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        finding = "OVERAGE-FINDING-BEGIN " + ("mandatory-evidence " * 700) + "OVERAGE-FINDING-END"
+        self.cli("verify", "demo", "T01", "--result", "uncertain", "--as", "verifier",
+                 "--detail", finding)
+        packet = self.cli("review-packet", "demo", "--role", "reviewer").stdout
+        self.assertGreater(self.packet_tokens(packet), 2000)
+        self.assertIn("OVERAGE-FINDING-BEGIN", packet)
+        self.assertIn("OVERAGE-FINDING-END", packet)
+        self.assertIn("Mandatory material exceeds the packet target", packet)
+        self.assertIn("## Required-reading manifest", packet)
+        self.assertIn("T01-verification-01.mdx", packet)
+        self.assertIn("T01-report-01.mdx", packet)
+
+    def test_t43_final_packet_uses_complete_frozen_findings_waiver_and_questions(self) -> None:
+        """The frozen-release packet uses the same complete mandatory renderer."""
+        self.repo()
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        t01_report = run / "T01-report-01.mdx"
+        self.fill_task_report(t01_report, files="- `src/t01.py:1` - implemented T01.")
+        t01_question = "FINAL-T01-QUESTION: accept the frozen retry boundary?"
+        t01_report.write_text(re.sub(
+            r"## Decisions needed\n\n.*?\n\n## Notes",
+            f"## Decisions needed\n\n{t01_question}\n\n## Notes",
+            t01_report.read_text(), flags=re.S))
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        early = "FINAL-EARLY-FINDING: preserve the first frozen finding body."
+        late = "FINAL-LATE-FINDING: preserve the finding recorded last."
+        self.cli("verify", "demo", "T01", "--result", "uncertain", "--as", "verifier",
+                 "--detail", early)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", late)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+
+        self.assign_simple(run, "T02")
+        t02_report = run / "T02-report-01.mdx"
+        self.fill_task_report(t02_report, blocked=True,
+                              files="- `src/t02.py:1` - recorded the blocked attempt.")
+        t02_question = "FINAL-T02-QUESTION: waive the external adapter outage?"
+        t02_report.write_text(re.sub(
+            r"## Decisions needed\n\n.*?\n\n## Notes",
+            f"## Decisions needed\n\n{t02_question}\n\n## Notes",
+            t02_report.read_text(), flags=re.S))
+        self.cli("submit", "demo", "T02", "--blocked", "--as", "implementor")
+        waiver = ("Freeze the local evidence while the external adapter is unavailable "
+                  + "w" * 190
+                  + " FINAL-WAIVER-QUALIFICATION: rerun the live adapter before release.")
+        self.cli("decide", "demo", "T02", "--waive", "--reason", waiver,
+                 "--as", "reviewer")
+
+        self.release_setup(run)
+        self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
+                 "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+                 "--verify", 'printf "orch ok\\n"')
+        orch_report = run / "orch-report-01.mdx"
+        self.fill_orch_report(orch_report)
+        orch_report.write_text(orch_report.read_text().replace(
+            "| T02 | approved | passed |", "| T02 | waived | blocked |"))
+        self.cli("submit", "demo", "orch", "--as", "orchestrator")
+        aggregate = json.loads(
+            (run / ".bundles" / "orch" / "rounds.json").read_text())["entries"][-1]["digest"]
+        frozen = self.freeze_release(run, str(aggregate))
+        release_digest = frozen.stdout.split("froze release ")[1].split()[0]
+        packet = self.cli("review-packet", "demo", "--role", "reviewer", "--final",
+                          "--release", release_digest).stdout
+        self.assertIn(early, packet)
+        self.assertIn(late, packet)
+        self.assertIn(waiver, packet)
+        self.assertIn("FINAL-WAIVER-QUALIFICATION", packet)
+        self.assertIn(t01_question, packet)
+        self.assertIn(t02_question, packet)
+
+    def test_t43_verifier_obligations_are_selected_by_submission_claims(self) -> None:
+        """Universal proof always applies; claim-specific duties appear only when relevant."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        unrelated = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", unrelated)
+        self.assertNotIn("obligation: offline-operation", unrelated)
+        self.assertNotIn("obligation: changed-oracle", unrelated)
+        self.assertNotIn("obligation: event-aggregation", unrelated)
+        self.assertNotIn("obligation: content-fingerprint", unrelated)
+        self.assertNotIn("obligation: configuration", unrelated)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", unrelated)
+
+        self.assign_simple(run, "T02")
+        task = run / "T02-task.mdx"
+        claims = ("Prove offline operation without network access, update a fixture oracle, "
+                  "aggregate zero/one/many callback events, validate a byte-sensitive "
+                  "fingerprint, and change deployment configuration.")
+        task.write_text(task.read_text().replace("Implement the feature.", claims))
+        report = run / "T02-report-01.mdx"
+        self.fill_task_report(report, files="- `src/t02.py:1` - implemented every claim.")
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.", claims))
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        selected = self.prompt_text(run, "T02", "verifier")
+        for obligation in ("offline-operation", "changed-oracle", "event-aggregation",
+                           "content-fingerprint", "configuration"):
+            self.assertIn(f"obligation: {obligation}", selected)
+        self.assertIn("applies because the submitted contract or report claims", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    def test_t43_required_documents_describe_complete_packets_without_em_dashes(self) -> None:
+        """The required architecture and playbooks document completeness and selection."""
+        repo = Path(DOCKET).parents[3]
+        expected = {
+            repo / "ARCHITECTURE.md": ("required-reading manifest", "applicability"),
+            self._skill_root() / "references" / "reviewer.md":
+                ("required-reading manifest", "complete waiver"),
+            self._skill_root() / "references" / "verifier.md":
+                ("applicable verification obligations", "another relevant obligation"),
+            self._skill_root() / "references" / "verification-obligations.md":
+                ("honest-acceptance", "offline-operation"),
+        }
+        for path, needles in expected.items():
+            text = path.read_text()
+            self.assertNotIn("\u2014", text, f"em dash in {path}")
+            for needle in needles:
+                self.assertIn(needle, text, f"{path} does not document {needle}")
+
+    # ------------------------------- T51: standard and quick presets
+
+    def test_t51_new_runs_default_to_standard_and_modes_are_explicit(self) -> None:
+        """Bare init is standard; explicit presets record every independent dimension."""
+        self.cli("init", "bare", "--evidence-mode", "documents-only")
+        bare = self.root / ".docket" / "runs" / "bare"
+        bare_meta = parse_meta(bare / "plan.mdx")
+        self.assertEqual("standard", bare_meta["mode"])
+        self.assertEqual("five-role-v1", bare_meta["workflow"])
+        self.assertEqual("split", bare_meta["topology"])
+        self.assertEqual(
+            "planner, orchestrator, implementor, verifier, reviewer",
+            bare_meta["role_sessions"],
+        )
+        self.assertEqual("independent-verifier-reviewer", bare_meta["review_policy"])
+        self.assertIn("mode: standard", self.cli("status", "bare").stdout)
+
+        self.cli("init", "standard", "--mode", "standard",
+                 "--evidence-mode", "documents-only")
+        self.assertEqual("standard", parse_meta(
+            self.root / ".docket" / "runs" / "standard" / "plan.mdx")["mode"])
+
+        self.cli("init", "quick", "--mode", "quick",
+                 "--evidence-mode", "documents-only")
+        quick_meta = parse_meta(
+            self.root / ".docket" / "runs" / "quick" / "plan.mdx")
+        self.assertEqual("quick", quick_meta["mode"])
+        self.assertEqual("five-role-v1", quick_meta["workflow"])
+        self.assertEqual("combined", quick_meta["topology"])
+        self.assertEqual("coordinator, implementor, checker", quick_meta["role_sessions"])
+        self.assertEqual("combined-checker", quick_meta["review_policy"])
+
+        deferred = self.cli("init", "two", "--mode", "quick", "--agents", "2",
+                            "--evidence-mode", "documents-only", ok=False)
+        self.assertIn("two-role quick variant is deferred", deferred.stderr)
+        self.assertFalse((self.root / ".docket" / "runs" / "two").exists())
+
+        unknown_mode = self.cli("init", "bad-mode", "--mode", "instant", ok=False)
+        self.assertIn("invalid choice", unknown_mode.stderr)
+        self.assertFalse((self.root / ".docket" / "runs" / "bad-mode").exists())
+        unknown_workflow = self.cli(
+            "init", "bad-workflow", "--workflow", "mystery", ok=False)
+        self.assertIn("invalid choice", unknown_workflow.stderr)
+        self.assertFalse((self.root / ".docket" / "runs" / "bad-workflow").exists())
+
+    def test_t51_missing_and_explicit_legacy_keep_completion_events_and_authority(self) -> None:
+        """Old missing-key and explicit legacy plans retain their original semantics."""
+        for run_id, missing_key in (("missing", True), ("explicit", False)):
+            with self.subTest(run=run_id):
+                self.init_legacy_as(run_id, "split", evidence_mode="documents-only")
+                run = self.root / ".docket" / "runs" / run_id
+                if missing_key:
+                    plan = run / "plan.mdx"
+                    old_keys = ("workflow:", "mode:", "role_sessions:",
+                                "review_policy:", "model_policy:")
+                    plan.write_text("\n".join(
+                        line for line in plan.read_text().splitlines()
+                        if not line.startswith(old_keys)
+                    ) + "\n")
+                self.cli(
+                    "assign", run_id, "T01", "--complexity", "high", "--executor",
+                    "orchestrator", "--harness", "opencode", "--file", "src/t01.py",
+                    "--verify", 'printf "T01 ok\\n"',
+                )
+                self.fill_task(run / "T01-task.mdx")
+                self.fill_task_report(run / "T01-report-01.mdx",
+                                      files="- `src/t01.py:1` - implemented T01.")
+                completed = self.cli("submit", run_id, "T01")
+                self.assertIn("completed; recorded without a redundant handoff",
+                              completed.stdout)
+
+                self.cli("assign", run_id, "orch", "--complexity", "high",
+                         "--executor", "orchestrator", "--harness", "opencode",
+                         "--file", "src/orch.py")
+                self.fill_orch_report(run / "orch-report-01.mdx")
+                self.cli("submit", run_id, "orch")
+                planner = self.cli("events", run_id, "--role", "planner", "--peek").stdout
+                reviewer = self.cli("events", run_id, "--role", "reviewer", "--peek").stdout
+                self.assertIn("orch:1:submitted", planner)
+                self.assertIn("no derived events", reviewer)
+
+    def test_t51_malformed_recorded_policy_refuses_instead_of_falling_back(self) -> None:
+        """An explicit malformed mode or workflow never inherits legacy authority."""
+        self.cli("init", "bad-workflow", "--mode", "standard",
+                 "--evidence-mode", "documents-only")
+        workflow_plan = self.root / ".docket" / "runs" / "bad-workflow" / "plan.mdx"
+        workflow_plan.write_text(workflow_plan.read_text().replace(
+            "workflow: five-role-v1", "workflow: mystery"))
+        workflow = self.cli("status", "bad-workflow", ok=False)
+        self.assertIn("unknown workflow 'mystery'", workflow.stderr)
+
+        self.cli("init", "bad-mode", "--mode", "standard",
+                 "--evidence-mode", "documents-only")
+        mode_plan = self.root / ".docket" / "runs" / "bad-mode" / "plan.mdx"
+        mode_plan.write_text(mode_plan.read_text().replace("mode: standard", "mode:"))
+        mode = self.cli("status", "bad-mode", ok=False)
+        self.assertIn("malformed mode", mode.stderr)
+
+    def test_t51_quick_checker_runs_both_gates_and_binds_the_exact_bundle(self) -> None:
+        """Quick combines duties explicitly while retaining verification and verdict binding."""
+        self.repo()
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor",
+            "implementor", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", 'printf "T01 ok\\n"',
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+
+        submitted = self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.assertIn("submitted for review", submitted.stdout)
+        manifest, _ = self.frozen()
+        self.assertEqual("passed", manifest["verification"]["status"])
+        self.assertEqual("quick", manifest["mode"])
+        self.assertEqual("combined-checker", manifest["review_policy"])
+        self.assertNotIn("verifier_exempt", (run / "plan.mdx").read_text())
+        self.assertIn("T01:1:submitted",
+                      self.cli("events", "demo", "--role", "checker", "--peek").stdout)
+
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "checker",
+                 "--verifier", "checker")
+        self.assertEqual("combined-checker", parse_meta(
+            run / "T01-verification-01.mdx")["review_policy"])
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self_approval = self.cli("decide", "demo", "T01", "--approve",
+                                 "--as", "implementor", ok=False)
+        self.assertIn("requires --as checker", self_approval.stderr)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "checker",
+                 "--reviewer", "checker")
+        decision = parse_meta(run / "T01-decision-01.mdx")
+        self.assertEqual("combined-checker", decision["review_policy"])
+        self.assertEqual(manifest["digest"], decision["bundle_digest"])
+        self.assertIn("status: approved", (run / "T01-report-01.mdx").read_text())
+        for name in ("plan.mdx", "T01-task.mdx", "T01-scope.mdx",
+                     "T01-report-01.mdx", "T01-verification-01.mdx",
+                     "T01-decision-01.mdx"):
+            self.assertIn("review_policy: combined-checker", (run / name).read_text(), name)
+
+    def test_t51_quick_rejects_source_drift_and_records_escalation_without_migration(self) -> None:
+        """Quick keeps source binding, and escalation preserves mode and baseline bytes."""
+        self.repo()
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor",
+            "orchestrator", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", "printf 'allowed = 9\\n' > src/a.py",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        rejected = self.cli("submit", "demo", "T01", "--as", "coordinator", ok=False)
+        self.assertIn("changed while the verification ran", rejected.stderr)
+        self.assertIn("status: draft", (run / "T01-report-01.mdx").read_text())
+
+        before = {
+            path.relative_to(run).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((run / ".snapshots").rglob("*")) if path.is_file()
+        }
+        escalation = self.cli(
+            "escalate-mode", "demo", "--reason",
+            "Discovery found a concurrency protocol change requiring standard separation.",
+        )
+        self.assertIn("mode remains quick", escalation.stdout)
+        self.assertEqual("quick", parse_meta(run / "plan.mdx")["mode"])
+        after = {
+            path.relative_to(run).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted((run / ".snapshots").rglob("*")) if path.is_file()
+        }
+        self.assertEqual(before, after)
+        requests = sorted((run / ".mode-escalations").glob("*.mdx"))
+        self.assertEqual(1, len(requests))
+        request = requests[0].read_text()
+        self.assertIn("review_policy: combined-checker", request)
+        self.assertIn("concurrency protocol change", request)
+
+    def test_t51_required_documents_describe_presets_without_em_dashes(self) -> None:
+        """The required architecture and playbooks document standard and quick."""
+        repo = Path(DOCKET).parents[3]
+        expected = {
+            repo / "ARCHITECTURE.md": ("standard preset", "combined-checker"),
+            repo / "README.md": ("standard preset", "combined-checker"),
+            self._skill_root() / "SKILL.md": ("standard preset", "quick"),
+            self._skill_root() / "references" / "planner.md":
+                ("standard preset", "coordinator"),
+            self._skill_root() / "references" / "orchestrator.md":
+                ("standard preset", "coordinator"),
+            self._skill_root() / "references" / "implementor.md":
+                ("standard preset", "checker"),
+            self._skill_root() / "references" / "verifier.md":
+                ("combined-checker", "independent verifier"),
+            self._skill_root() / "references" / "reviewer.md":
+                ("combined-checker", "independent verifier"),
+        }
+        for path, needles in expected.items():
+            text = path.read_text()
+            self.assertNotIn("\u2014", text, f"em dash in {path}")
+            for needle in needles:
+                self.assertIn(needle, text, f"{path} does not document {needle}")
+
+    def test_t61_quick_roles_register_and_prompt_per_preset(self) -> None:
+        """Quick coordinator and checker register and prompt in quick, refuse elsewhere."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.assign_simple(run, "T01")
+        coord = self.cli("session", "demo", "--register", "--session", "c1",
+                         "--name", "coord", "--role", "coordinator")
+        self.assertIn("c1", coord.stdout)
+        check = self.cli("session", "demo", "--register", "--session", "k1",
+                         "--name", "check", "--role", "checker")
+        self.assertIn("k1", check.stdout)
+        coord_prompt = self.prompt_text(run, "T01", "coordinator")
+        self.assertIn("planning", coord_prompt.lower())
+        self.assertIn("orchestration", coord_prompt.lower())
+        checker_prompt = self.prompt_text(run, "T01", "checker")
+        self.assertIn("verification", checker_prompt.lower())
+        self.assertIn("review", checker_prompt.lower())
+        self.assertIn("combined-checker", checker_prompt)
+        prompt_help = self.cli("prompt", "--help").stdout
+        self.assertIn("coordinator", prompt_help)
+        self.assertIn("checker", prompt_help)
+        session_help = self.cli("session", "--help").stdout
+        self.assertIn("coordinator", session_help)
+        self.assertIn("checker", session_help)
+        watch_help = self.cli("watch", "--help").stdout
+        self.assertIn("coordinator", watch_help)
+        self.assertIn("checker", watch_help)
+        self.assertIn("implementor", watch_help)
+        legacy_run = self.init_legacy_as("legacy", "split", evidence_mode="documents-only")
+        self.cli("assign", "legacy", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t01.py",
+                 "--verify", 'printf "T01 ok\\n"')
+        self.fill_task(legacy_run / "T01-task.mdx")
+        self.fill_scope(legacy_run / "T01-scope.mdx")
+        self.cli("scope", "legacy", "T01", "--submit")
+        refused_session = self.cli("session", "legacy", "--register", "--session", "bad1",
+                                   "--name", "bad", "--role", "coordinator", ok=False)
+        self.assertNotEqual(0, refused_session.returncode)
+        self.assertIn("legacy", refused_session.stderr.lower())
+        refused_prompt = self.cli("prompt", "legacy", "T01", "--role", "coordinator", ok=False)
+        self.assertNotEqual(0, refused_prompt.returncode)
+        self.assertIn("legacy", refused_prompt.stderr.lower())
+        self.cli("init", "standard", "--mode", "standard", "--evidence-mode", "documents-only")
+        std_refused = self.cli("session", "standard", "--register", "--session", "bad2",
+                               "--name", "bad", "--role", "checker", ok=False)
+        self.assertNotEqual(0, std_refused.returncode)
+        self.assertIn("standard", std_refused.stderr.lower())
+
+    def test_t61_wake_hook_delivers_to_quick_roles(self) -> None:
+        """The wake hook wakes coordinator and checker by executing it."""
+        self.repo()
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "T01 ok\\n"')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.cli("arm", "demo", "--role", "checker")
+        self.cli("arm", "demo", "--role", "coordinator")
+        base_env = dict(os.environ) | {
+            "CLAUDE_PROJECT_DIR": str(self.root),
+            "DOCKET_WATCH_TIMEOUT": "0",
+        }
+        checker = subprocess.run([str(HOOK)], cwd=self.root, capture_output=True, text=True,
+                                 env=base_env | {"DOCKET_ROLE": "checker"})
+        self.assertEqual(2, checker.returncode)
+        self.assertIn("T01", checker.stderr)
+        coordinator = subprocess.run([str(HOOK)], cwd=self.root, capture_output=True, text=True,
+                                     env=base_env | {"DOCKET_ROLE": "coordinator"})
+        self.assertEqual(2, coordinator.returncode)
+        self.assertIn("T01", coordinator.stderr)
+
+    def test_t61_quick_end_to_end_via_session_surface(self) -> None:
+        """A quick round runs through register, dispatch, submit, verify and decide."""
+        self.repo()
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "T01 ok\\n"')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.cli("session", "demo", "--register", "--session", "c1",
+                 "--name", "coord", "--role", "coordinator")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "k1",
+                 "--name", "check", "--role", "checker")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        submitted = self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.assertIn("submitted for review", submitted.stdout)
+        manifest, _ = self.frozen()
+        self.assertEqual("quick", manifest["mode"])
+        self.assertEqual("combined-checker", manifest["review_policy"])
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "checker",
+                 "--verifier", "checker")
+        self.assertEqual("combined-checker", parse_meta(
+            run / "T01-verification-01.mdx")["review_policy"])
+        self.cli("decide", "demo", "T01", "--approve", "--as", "checker",
+                 "--reviewer", "checker")
+        decision = parse_meta(run / "T01-decision-01.mdx")
+        self.assertEqual("combined-checker", decision["review_policy"])
+        self.assertEqual(manifest["digest"], decision["bundle_digest"])
+        for name in ("plan.mdx", "T01-task.mdx", "T01-scope.mdx",
+                     "T01-report-01.mdx", "T01-verification-01.mdx",
+                     "T01-decision-01.mdx"):
+            self.assertIn("review_policy: combined-checker", (run / name).read_text(), name)
+
+    def test_t61_prompt_carries_mandatory_contract_sections(self) -> None:
+        """Existing decisions, discovery constraints and plan text reach the prompt as mandatory."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        existing_marker = "T61-EXISTING-DECISION-9f2c"
+        discovery_marker = "T61-DISCOVERY-CONSTRAINT-7a1b"
+        scope_marker = "T61-OUT-OF-SCOPE-3e8d"
+        plan_marker = "T61-PLAN-CONSTRAINT-5c4a"
+        task_path = run / "T01-task.mdx"
+        task_text = task_path.read_text()
+        task_text = task_text.replace("## Out of scope\n", f"## Out of scope\n\n{scope_marker}\n")
+        task_text = task_text.replace("## Existing decisions\n\nnone",
+                                      f"## Existing decisions\n\n{existing_marker}\n")
+        task_text = task_text.replace("## Discovery constraints\n\nnone",
+                                      f"## Discovery constraints\n\n{discovery_marker}\n")
+        task_path.write_text(task_text)
+        plan_path = run / "plan.mdx"
+        plan_text = plan_path.read_text()
+        plan_text = plan_text.replace("## Out of scope", f"## Out of scope\n\n{plan_marker}\n")
+        plan_path.write_text(plan_text)
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn(existing_marker, out)
+        self.assertIn(discovery_marker, out)
+        self.assertIn(scope_marker, out)
+        self.assertIn(plan_marker, out)
+        self.assertNotIn("return the report to", out)
+        self.assertNotIn("repeating the bare verdict", out)
+        zero = self.prompt_text(run, "T01", "implementor", max_tokens="0")
+        self.assertIn(existing_marker, zero)
+        self.assertIn(discovery_marker, zero)
+        self.assertIn(plan_marker, zero)
+        self.assertNotIn("# Selected guidance", zero)
+        records = sorted((run / ".prompts").glob("T01-implementor-*.json"))
+        record = json.loads(records[-1].read_text())
+        self.assertEqual(0, int(record["guidance_tokens"]))
+        self.assertGreater(int(record["mandatory_tokens"]), 0)
+
+    def test_t61_mechanical_checkpoint_resumes_as_resume(self) -> None:
+        """A resume with a mechanical checkpoint and no ready handoff renders as resume."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.cli("set-model", "demo", "T01", "--actual", "live-m")
+        resumed = self.cli("resume", "demo", "T01", "--session", "w2",
+                           "--reason", "process killed")
+        self.assertIn("mechanical", resumed.stdout.lower())
+        checkpoint = sorted((run / ".checkpoints").glob("T01-*.json"))[-1].name
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: resume", out)
+        self.assertNotIn("stage: initial", out)
+        self.assertIn(checkpoint, out)
+        self.assertIn("T01-task.mdx", out)
+        self.assertIn("T01-scope.mdx", out)
+        self.assertIn("docket diff demo T01", out)
+
+    def test_t61_required_documents_describe_quick_roles_and_mandatory_contract(self) -> None:
+        """Architecture and playbooks name quick roles and mandatory sections without em dashes."""
+        repo = Path(DOCKET).parents[3]
+        skill = self._skill_root()
+        expected = {
+            repo / "ARCHITECTURE.md": ("coordinator", "checker", "Existing decisions",
+                                       "Discovery constraints", "mandatory"),
+            skill / "references" / "coordinator.md": ("coordinator", "quick"),
+            skill / "references" / "checker.md": ("checker", "combined-checker"),
+            skill / "references" / "contracts" / "coordinator.md": ("planning", "orchestration"),
+            skill / "references" / "contracts" / "checker.md": ("verification", "combined-checker"),
+        }
+        for path, needles in expected.items():
+            self.assertTrue(path.is_file(), f"missing {path}")
+            text = path.read_text()
+            self.assertNotIn("\u2014", text, f"em dash in {path}")
+            for needle in needles:
+                self.assertIn(needle, text, f"{path} does not document {needle}")
+
+    def test_t62_failure_routes_to_reviewer_and_batch_not_ready(self) -> None:
+        """A fail verdict wakes the reviewer, never claims batch readiness, and resolves."""
+        run = self.init5()
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("correction_limit: 2", "correction_limit: 5"))
+        self.submit5(run, "T01")
+        before_orch = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertIn("review batch ready with 1 submitted", before_orch)
+        self.assertIn("T01 round 1", before_orch)
+        self.assertIn("T01:1:submitted",
+                      self.cli("events", "demo", "--role", "verifier", "--peek").stdout)
+        self.assertIn("no derived events",
+                      self.cli("events", "demo", "--role", "reviewer", "--peek").stdout)
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch at src/t01.py:1")
+        self.assertNotIn("T01:1:submitted",
+                         self.cli("events", "demo", "--role", "verifier", "--peek").stdout)
+        after_reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("T01", after_reviewer)
+        self.assertIn("fail", after_reviewer.lower())
+        after_orch = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertNotIn("review batch ready with 1 submitted", after_orch)
+        self.cli("reconcile", "demo")
+        pending = [json.loads(p.read_text()) for p in
+                   (run / ".delivery" / "reviewer" / "pending").glob("*.json")]
+        fail_pending = [r for r in pending if "verification-failed" in str(r.get("key", ""))]
+        self.assertEqual(1, len(fail_pending))
+        first_rev = str(fail_pending[0].get("revision", ""))
+        self.cli("reconcile", "demo")
+        again = [json.loads(p.read_text()) for p in
+                 (run / ".delivery" / "reviewer" / "pending").glob("*.json")]
+        self.assertEqual(1, len([r for r in again
+                                 if "verification-failed" in str(r.get("key", ""))]))
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "second finding at src/t01.py:2")
+        self.cli("reconcile", "demo")
+        moved = [json.loads(p.read_text()) for p in
+                 (run / ".delivery" / "reviewer" / "pending").glob("*.json")]
+        fail_moved = [r for r in moved if "verification-failed" in str(r.get("key", ""))]
+        self.assertEqual(1, len(fail_moved))
+        self.assertNotEqual(first_rev, str(fail_moved[0].get("revision", "")))
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01", "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        self.assertNotIn("batch:M1:ready:",
+                         self.cli("events", "demo", "--role", "reviewer", "--peek").stdout)
+        refused = self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        fail_key = next(line.strip().split()[-1] for line in after_reviewer.splitlines()
+                        if "T01" in line and ("fail" in line.lower() or "verification" in line.lower()))
+        opened = self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        self.assertIn("opened decision draft", opened.stdout)
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            self.REQUIREMENT))
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        resolved = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertNotIn(fail_key, resolved)
+
+    def test_t62_verifier_correction_carries_numbered_changes_and_refuses_empty(self) -> None:
+        """A verifier-opened correction renders numbered changes; empty findings refuse."""
+        run = self.init5()
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: allowed"))
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "oracle mismatch at src/t01.py:1", "--open-correction")
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("1.", decision)
+        self.assertIn("oracle mismatch", decision)
+        self.assertNotIn("See the linked verification findings", decision)
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: correction", out)
+        self.assertIn("oracle mismatch", out)
+        orch_peek = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        self.assertIn("T01", orch_peek)
+        self.assertIn("correction", orch_peek.lower())
+        self.assign_simple(run, "T02")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        refused = self.cli("verify", "demo", "T02", "--result", "fail", "--as", "verifier",
+                           "--detail", "none", "--open-correction", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("numbered", refused.stderr.lower())
+        self.assertFalse((run / "T02-decision-01.mdx").is_file())
+        self.assertEqual(["T02-report-01.mdx"], self.rounds(run, "T02"))
+
+    def test_t62_resume_claims_capacity_like_dispatch(self) -> None:
+        """Resume passes the cap like dispatch; takeover succeeds, over-cap refuses."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        for sid in ("w1", "w2", "w3"):
+            self.cli("session", "demo", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        takeover = self.cli("resume", "demo", "T01", "--session", "w2",
+                            "--reason", "worker restarted")
+        self.assertIn("resumed T01", takeover.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual("dispatched", record.get("state"))
+        self.assertEqual("w2", record.get("session"))
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-01.mdx")
+        self.cli("handoff", "demo", "T01", "--submit")
+        self.cli("dispatch", "demo", "T02", "--session", "w3")
+        over = self.cli("resume", "demo", "T01", "--session", "w1", ok=False)
+        self.assertNotEqual(0, over.returncode)
+        self.assertIn("concurrency", over.stderr.lower())
+        self.assertIn("1/1", over.stderr)
+        live = [p for p in (run / ".dispatch").glob("*.json")
+                if json.loads(p.read_text()).get("state") == "dispatched"]
+        self.assertEqual(1, len(live))
+        self.assertEqual("T02", json.loads(live[0].read_text()).get("owner"))
+
+    def test_t62_suite_qualifies_colorized_output(self) -> None:
+        """A green suite with FORCE_COLOR set qualifies; frozen output validates too."""
+        self.repo()
+        run = self.init("split", evidence_mode="documents-only")
+        tiny = self.root / "tiny-suite"
+        (tiny / "test_tiny.py").parent.mkdir(parents=True, exist_ok=True)
+        (tiny / "test_tiny.py").write_text(
+            "import unittest\n"
+            "class Tiny(unittest.TestCase):\n"
+            "    def test_holds(self):\n"
+            "        self.assertEqual(1 + 1, 2)\n")
+        before = sorted((run / ".suite").glob("qual-*.json")) if (run / ".suite").is_dir() else []
+        qualified = self.cli_env({"FORCE_COLOR": "1"}, "suite", "demo", "--qualify",
+                                 "--command", f"python3 -m unittest discover -s {tiny} -v")
+        self.assertEqual(0, qualified.returncode, qualified.stderr)
+        self.assertIn("qualified suite", qualified.stdout)
+        arts = sorted((run / ".suite").glob("qual-*.json"))
+        self.assertEqual(len(before) + 1, len(arts))
+        record = json.loads(arts[-1].read_text())
+        self.assertEqual(1, record["tests"])
+        self.assertEqual(0, record["failures"])
+        self.assertTrue(record["ok"])
+        mod = self.docket_mod()
+        self.assertEqual([], mod.suite_problems(arts[-1], "demo"))
+
+    def test_t62_required_documents_describe_failure_capacity_and_color(self) -> None:
+        """Architecture and playbooks describe failure routing, corrections, capacity, and color."""
+        repo = Path(DOCKET).parents[3]
+        skill = self._skill_root()
+        expected = {
+            repo / "ARCHITECTURE.md": ("verification-failed", "numbered required changes",
+                                       "capacity", "ANSI"),
+            skill / "references" / "signalling.md": ("verification-failed", "correction"),
+            skill / "references" / "verifier.md": ("numbered",),
+            skill / "references" / "orchestrator.md": ("capacity", "correction"),
+            skill / "references" / "reviewer.md": ("verification-failed", "fail"),
+            skill / "references" / "implementor.md": ("numbered", "correction"),
+        }
+        for path, needles in expected.items():
+            self.assertTrue(path.is_file(), f"missing {path}")
+            text = path.read_text()
+            self.assertNotIn("\u2014", text, f"em dash in {path}")
+            for needle in needles:
+                self.assertIn(needle, text, f"{path} does not document {needle}")
+
+    # ------------------------------- T71: legacy door and honesty follow-ups
+
+    def test_t71_legacy_init_refuses_and_decode_and_migrate_survive(self) -> None:
+        """New legacy runs refuse naming standard and quick; old decodes and migrate keep working."""
+        refused = self.cli("init", "legacy-new", "--workflow", "legacy",
+                           "--evidence-mode", "documents-only", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("standard", refused.stderr.lower())
+        self.assertIn("quick", refused.stderr.lower())
+        self.assertFalse((self.root / ".docket" / "runs" / "legacy-new").exists())
+        run = self.init5()
+        plan = run / "plan.mdx"
+        old_keys = ("workflow:", "mode:", "role_sessions:",
+                    "review_policy:", "model_policy:")
+        plan.write_text("\n".join(
+            line for line in plan.read_text().splitlines()
+            if not line.startswith(old_keys)
+        ) + "\n")
+        missing_status = self.cli("status", "demo").stdout
+        self.assertIn("legacy-unversioned", missing_status)
+        self.cli("init", "explicit", "--harness", "claude", "--topology", "split",
+                 "--evidence-mode", "documents-only", "--workflow", "five-role-v1")
+        explicit_run = self.root / ".docket" / "runs" / "explicit"
+        explicit_plan = explicit_run / "plan.mdx"
+        explicit_plan.write_text(explicit_plan.read_text().replace(
+            "workflow: five-role-v1", "workflow: legacy"))
+        explicit_plan.write_text("\n".join(
+            line for line in explicit_plan.read_text().splitlines()
+            if not line.startswith(("mode:", "role_sessions:",
+                                    "review_policy:", "model_policy:"))
+        ) + "\n")
+        explicit_status = self.cli("status", "explicit").stdout
+        self.assertIn("legacy-unversioned", explicit_status)
+        migrated = self.cli("migrate", "explicit", "--to", "five-role-v1")
+        self.assertIn("migrated", migrated.stdout.lower())
+        self.assertIn("workflow: five-role-v1",
+                      (explicit_run / "plan.mdx").read_text())
+
+    def _renderer_of(self, text: str) -> str:
+        for line in text.splitlines():
+            if line.strip().startswith("renderer:"):
+                return line.strip().split(":", 1)[1].strip()
+        self.fail("no renderer line in prompt")
+        return ""
+
+    def _prompt_with_bin(self, binary: Path, owner: str, role: str) -> str:
+        result = subprocess.run(
+            [sys.executable, str(binary), "prompt", "demo", owner,
+             "--role", role],
+            cwd=str(self.root), text=True, capture_output=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout
+
+    def _stage_patched_bin(self, name: str, patched_text: str) -> Path:
+        skill = self.root / name
+        (skill / "bin").mkdir(parents=True)
+        binary = skill / "bin" / "docket"
+        binary.write_text(patched_text)
+        binary.chmod(0o755)
+        os.symlink(self._skill_root() / "references", skill / "references",
+                   target_is_directory=True)
+        return binary
+
+    def test_t71_renderer_derived_stable_moves_and_no_churn(self) -> None:
+        """Renderer revision is stable, moves on renderer edits, and ignores unrelated edits."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        first = self.prompt_text(run, "T01", "implementor")
+        second = self.prompt_text(run, "T01", "implementor")
+        rev1 = self._renderer_of(first)
+        rev2 = self._renderer_of(second)
+        self.assertTrue(rev1.strip())
+        self.assertEqual(rev1, rev2)
+        self.assertNotEqual("t43-p4-v1", rev1)
+        docket_text = Path(DOCKET).read_text()
+        renderer_text = docket_text.replace(
+            '    """Render one role prompt',
+            '    # T71 renderer probe - composition tracking\n    """Render one role prompt',
+            1)
+        self.assertNotEqual(docket_text, renderer_text)
+        renderer_bin = self._stage_patched_bin("patched-renderer", renderer_text)
+        patched_text = self._prompt_with_bin(renderer_bin, "T01", "implementor")
+        patched_rev = self._renderer_of(patched_text)
+        self.assertNotEqual(rev1, patched_rev)
+        if '    """A checkout with one commit' in docket_text:
+            unrelated_text = docket_text.replace(
+                '    """A checkout with one commit',
+                '    # T71 unrelated probe - must not churn renderer\n    """A checkout with one commit',
+                1)
+        else:
+            unrelated_text = docket_text.replace(
+                'def capture_root_baseline',
+                '# T71 unrelated probe - must not churn renderer\ndef capture_root_baseline',
+                1)
+        self.assertNotEqual(docket_text, unrelated_text)
+        unrelated_bin = self._stage_patched_bin("patched-unrelated", unrelated_text)
+        unrelated_out = self._prompt_with_bin(unrelated_bin, "T01", "implementor")
+        unrelated_rev = self._renderer_of(unrelated_out)
+        self.assertEqual(rev1, unrelated_rev)
+
+    def test_t71_prompt_states_identity_exactly_once(self) -> None:
+        """Workflow, stage and renderer each render exactly once and stay present."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        out = self.prompt_text(run, "T01", "implementor")
+        def count(prefix: str) -> int:
+            return sum(1 for line in out.splitlines()
+                       if line.strip().startswith(prefix))
+        self.assertEqual(1, count("workflow:"))
+        self.assertEqual(1, count("stage:"))
+        self.assertEqual(1, count("renderer:"))
+        self.assertIn("workflow:", out)
+        self.assertIn("stage:", out)
+        self.assertIn("renderer:", out)
+
+    def test_t71_obligations_select_claims_not_out_of_scope(self) -> None:
+        """Same word offline in Out of scope does not select, in Goal it does."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "## Out of scope",
+            "## Out of scope\n\noffline operation is out of scope and will not be implemented.\n"))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        discussed = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", discussed)
+        self.assertNotIn("obligation: offline-operation", discussed)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", discussed)
+        self.assign_simple(run, "T02")
+        genuine_task = run / "T02-task.mdx"
+        genuine_task.write_text(genuine_task.read_text().replace(
+            "Implement the feature.",
+            "Prove offline operation without network access."))
+        genuine_report = run / "T02-report-01.mdx"
+        self.fill_task_report(genuine_report,
+                              files="- `src/t02.py:1` - implemented offline.")
+        genuine_report.write_text(genuine_report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Prove offline operation without network access."))
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        selected = self.prompt_text(run, "T02", "verifier")
+        self.assertIn("obligation: honest-acceptance", selected)
+        self.assertIn("obligation: offline-operation", selected)
+        self.assertIn("applies because the submitted contract or report claims", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    def test_t71_obligations_ignore_obligation_discussion(self) -> None:
+        """Same word offline in obligation discussion does not select, genuine does."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.",
+            "This task discusses verification obligations and duties about offline operation."))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        discussed = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", discussed)
+        self.assertNotIn("obligation: offline-operation", discussed)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", discussed)
+        self.assign_simple(run, "T02")
+        genuine_task = run / "T02-task.mdx"
+        genuine_task.write_text(genuine_task.read_text().replace(
+            "Implement the feature.",
+            "Prove offline operation without network access."))
+        genuine_report = run / "T02-report-01.mdx"
+        self.fill_task_report(genuine_report,
+                              files="- `src/t02.py:1` - implemented offline.")
+        genuine_report.write_text(genuine_report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Prove offline operation without network access."))
+        self.cli("submit", "demo", "T02", "--as", "implementor")
+        selected = self.prompt_text(run, "T02", "verifier")
+        self.assertIn("obligation: offline-operation", selected)
+
+    def test_t81_skipped_verification_cannot_support_approval(self) -> None:
+        """An approving verdict over skipped verification is refused; waiving still works."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        submitted = self.cli("submit", "demo", "T01", "--as", "implementor",
+                             "--skip-verify", "--skip-verify-reason", "broken command")
+        self.assertIn("submitted for review", submitted.stdout)
+        manifest, _ = self.frozen("T01")
+        self.assertEqual("skipped", manifest["verification"]["status"])
+        self.assertEqual("broken command", manifest["verification"]["skip_reason"])
+        bundle_out = self.cli("bundle", "demo", "T01").stdout
+        self.assertIn("skipped", bundle_out)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        refused = self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer",
+                           ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("skipped", refused.stderr)
+        self.assertIn("--waive", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+        self.cli("decide", "demo", "T01", "--waive", "--reason",
+                 "broken command needs waiver", "--as", "reviewer")
+        self.assertIn("status: waived", (run / "T01-report-01.mdx").read_text())
+
+    def test_t81_quick_skipped_verification_refuses_approval(self) -> None:
+        """The audit reproduction: quick init with verify false, skip, checker pass, no approval."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", "false")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        submitted = self.cli("submit", "demo", "T01", "--as", "implementor",
+                             "--skip-verify", "--skip-verify-reason", "broken command")
+        self.assertIn("submitted for review", submitted.stdout)
+        shown = self.cli("bundle", "demo", "T01").stdout
+        self.assertIn("skipped", shown)
+        self.assertIn("false", shown)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "checker",
+                 "--verifier", "checker")
+        refused = self.cli("decide", "demo", "T01", "--approve", "--as", "checker",
+                           "--reviewer", "checker", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("skipped", refused.stderr)
+        self.assertIn("--waive", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self.assertIn("status: submitted", (run / "T01-report-01.mdx").read_text())
+
+    def test_t81_declared_env_overrides_ambient_and_records_effective(self) -> None:
+        """Declared inputs control the run; only declared keys are captured as effective."""
+        run = self.init5()
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t01.py",
+                 "--verify", 'test "$FOO" = "actual"', "--env", "FOO=declared")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        refused = self.cli_env({"FOO": "actual"}, "submit", "demo", "T01",
+                               "--as", "implementor", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("verify command failed", refused.stderr)
+        self.cli("assign", "demo", "T02", "--complexity", "high", "--executor",
+                 "implementor", "--harness", "opencode", "--file", "src/t02.py",
+                 "--verify", 'test "$FOO" = "declared"', "--env", "FOO=declared")
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli_env({"FOO": "actual", "UNRELATED": "zzz"}, "submit", "demo", "T02",
+                     "--as", "implementor")
+        manifest, _ = self.frozen("T02")
+        self.assertEqual("passed", manifest["verification"]["status"])
+        self.assertEqual(["FOO=declared"], manifest["verification"]["declared_env"])
+        self.assertEqual(["FOO=declared"], manifest["verification"]["effective_env"])
+        self.assertNotIn("UNRELATED", json.dumps(manifest["verification"]))
+        self.assertNotIn("zzz", json.dumps(manifest["verification"]))
+
+    def test_t81_rereview_report_names_replacement_bundle(self) -> None:
+        """After a re-review the decided report names the replacement digest, not the superseded one."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        first, _ = self.frozen("T01")
+        first_digest = first["digest"]
+        report = run / "T01-report-01.mdx"
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Implemented the feature, verified its behavior, and rewrote the guard.",
+        ))
+        applied = self.cli("decide", "demo", "T01", "--approve", "--re-review")
+        self.assertIn("froze the re-reviewed evidence as sha256:", applied.stdout)
+        second, _ = self.frozen("T01")
+        second_digest = second["digest"]
+        self.assertNotEqual(first_digest, second_digest)
+        decision_text = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn(f"bundle_digest: {second_digest}", decision_text)
+        self.assertIn(f"superseded_bundle: {first_digest}", decision_text)
+        report_meta = parse_meta(report)
+        decision_meta = parse_meta(run / "T01-decision-01.mdx")
+        self.assertEqual(second_digest, report_meta["bundle_digest"])
+        self.assertEqual(second_digest, decision_meta["bundle_digest"])
+
+    def test_t81_interrupted_rereview_resumes_without_second_round(self) -> None:
+        """An interrupted re-review repeated finishes without a second round or stale pointer."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        first_digest = self.frozen("T01")[0]["digest"]
+        report = run / "T01-report-01.mdx"
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Implemented the feature, verified its behavior, and rewrote the guard.",
+        ))
+        crash = self.cli("decide", "demo", "T01", "--approve", "--re-review",
+                         ok=False, fault="transition:decision")
+        self.assertEqual(70, crash.returncode)
+        resumed = self.cli("decide", "demo", "T01", "--approve")
+        self.assertIn("resumed interrupted approved transition txn:", resumed.stdout)
+        rounds = sorted(p.name for p in run.glob("T01-report-*.mdx"))
+        self.assertEqual(["T01-report-01.mdx"], rounds)
+        second_digest = self.frozen("T01")[0]["digest"]
+        self.assertNotEqual(first_digest, second_digest)
+        report_meta = parse_meta(report)
+        decision_meta = parse_meta(run / "T01-decision-01.mdx")
+        self.assertEqual(second_digest, report_meta["bundle_digest"])
+        self.assertEqual(second_digest, decision_meta["bundle_digest"])
+        self.assertIn("status: approved", report.read_text())
+
+    def test_t82_ordering_past_ninety_nine_resolves_to_failure(self) -> None:
+        """Past 99 attempts the newest verification counts: pass at 99 then fail at 100 is a failure."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        for _ in range(98):
+            self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        self.assertTrue((run / "T01-verification-99.mdx").is_file())
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "regression at attempt 100")
+        self.assertTrue((run / "T01-verification-100.mdx").is_file())
+        rendered = self.cli("bundle", "demo", "T01").stdout
+        self.assertIn("T01", rendered)
+        refused = self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer",
+                           ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("no passing verification", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        peek = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("T01:1:verification-failed", peek)
+
+    def test_t82_dependency_cycle_refused_at_ingress(self) -> None:
+        """A cycle is refused at ingress on both surfaces; diamonds, chains, and re-declares still work."""
+        run = self.init5()
+        refused_self = self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t01.py",
+            "--verify", 'printf "T01 ok\\n"', "--depends-on", "T01", ok=False)
+        self.assertNotEqual(0, refused_self.returncode)
+        self.assertIn("cycle", refused_self.stderr.lower())
+        self.assertIn("T01", refused_self.stderr)
+        self.assertFalse((run / "T01-task.mdx").exists())
+        self.assertFalse((run / "T01-report-01.mdx").exists())
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t01.py",
+            "--verify", 'printf "T01 ok\\n"')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.cli(
+            "assign", "demo", "T02", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t02.py",
+            "--verify", 'printf "T02 ok\\n"')
+        self.fill_task(run / "T02-task.mdx")
+        self.fill_scope(run / "T02-scope.mdx")
+        self.cli("scope", "demo", "T02", "--submit")
+        refused_batch = self.cli(
+            "batch", "demo", "--create", "B1", "--members", "T01,T02",
+            "--depends-on", "T01:T02", "--depends-on", "T02:T01", ok=False)
+        self.assertNotEqual(0, refused_batch.returncode)
+        self.assertIn("cycle", refused_batch.stderr.lower())
+        self.assertFalse((run / ".batches" / "B1.json").exists())
+        self.cli("batch", "demo", "--create", "B1", "--members", "T01,T02",
+                 "--depends-on", "T02:T01")
+        self.assertTrue((run / ".batches" / "B1.json").is_file())
+        self.cli(
+            "assign", "demo", "T10", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t10.py",
+            "--verify", 'printf "T10 ok\\n"')
+        self.fill_task(run / "T10-task.mdx")
+        self.fill_scope(run / "T10-scope.mdx")
+        self.cli("scope", "demo", "T10", "--submit")
+        self.cli(
+            "assign", "demo", "T11", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t11.py",
+            "--verify", 'printf "T11 ok\\n"', "--depends-on", "T10")
+        self.fill_task(run / "T11-task.mdx")
+        self.fill_scope(run / "T11-scope.mdx")
+        self.cli("scope", "demo", "T11", "--submit")
+        self.cli(
+            "assign", "demo", "T12", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t12.py",
+            "--verify", 'printf "T12 ok\\n"', "--depends-on", "T10")
+        self.fill_task(run / "T12-task.mdx")
+        self.fill_scope(run / "T12-scope.mdx")
+        self.cli("scope", "demo", "T12", "--submit")
+        self.cli(
+            "assign", "demo", "T13", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t13.py",
+            "--verify", 'printf "T13 ok\\n"',
+            "--depends-on", "T11", "--depends-on", "T12")
+        self.fill_task(run / "T13-task.mdx")
+        self.fill_scope(run / "T13-scope.mdx")
+        self.cli("scope", "demo", "T13", "--submit")
+        status = self.cli("status", "demo").stdout
+        self.assertIn("T13", status)
+        self.cli("batch", "demo", "--create", "B2", "--members", "T11,T12",
+                 "--depends-on", "T11:T10", "--depends-on", "T11:T10")
+        self.assertTrue((run / ".batches" / "B2.json").is_file())
+
+    def test_t91_verifier_correction_records_acting_role(self) -> None:
+        """A verifier correction records checker in quick and verifier in standard."""
+        # Standard: verifier acts and the decision names verifier.
+        self.cli("init", "demo", "--mode", "standard", "--evidence-mode",
+                 "documents-only", "--harness", "claude")
+        run = self.root / ".docket" / "runs" / "demo"
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: allowed"))
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "1. oracle mismatch at src/t01.py:1",
+                 "--open-correction")
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("reviewer: verifier", decision)
+        self.assertIn("triggered_by: verifier", decision)
+        # The recorded verifier is the role that acted: checker is refused here.
+        refused_checker = self.cli("verify", "demo", "T01", "--result", "pass",
+                                   "--as", "checker", ok=False)
+        self.assertNotEqual(0, refused_checker.returncode)
+        # Quick: checker acts and the decision names checker.
+        self.cli("init", "demoq", "--mode", "quick", "--evidence-mode",
+                 "documents-only", "--harness", "claude")
+        qrun = self.root / ".docket" / "runs" / "demoq"
+        qplan = qrun / "plan.mdx"
+        qplan.write_text(qplan.read_text().replace("verifier_correction: forbidden",
+                                                   "verifier_correction: allowed"))
+        self.assign_simple_in(qrun, "demoq", "T01")
+        self.fill_task_report(qrun / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demoq", "T01", "--as", "implementor")
+        # The quick run refuses the standard name for this operation.
+        refused_verifier = self.cli("verify", "demoq", "T01", "--result", "fail",
+                                    "--as", "verifier", "--detail", "1. x",
+                                    ok=False)
+        self.assertNotEqual(0, refused_verifier.returncode)
+        self.assertIn("checker", refused_verifier.stderr)
+        self.cli("verify", "demoq", "T01", "--result", "fail", "--as", "checker",
+                 "--verifier", "checker",
+                 "--detail", "1. oracle mismatch at src/t01.py:1",
+                 "--open-correction")
+        qdecision = (qrun / "T01-decision-01.mdx").read_text()
+        self.assertIn("reviewer: checker", qdecision)
+        self.assertIn("triggered_by: checker", qdecision)
+        self.assertNotIn("reviewer: verifier", qdecision)
+        # The verification artifact keeps its acting identity as today.
+        qvmeta = parse_meta(qrun / "T01-verification-01.mdx")
+        self.assertEqual("checker", qvmeta["verifier"])
+        # The recorded checker is accepted where verifier was refused:
+        # opening the correction with checker succeeded above, and a second
+        # verifier attempt still refuses.
+        still_refused = self.cli("verify", "demoq", "T01", "--result", "fail",
+                                 "--as", "verifier", "--detail", "1. y",
+                                 ok=False)
+        self.assertNotEqual(0, still_refused.returncode)
+
+    def test_t91_batch_refuses_non_member_source(self) -> None:
+        """A batch edge from a non-member is refused fail-closed; member edges work."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        # Audit reproduction: source T99 is not a member.
+        refused = self.cli("batch", "demo", "--create", "Bbad",
+                           "--members", "T01,T02",
+                           "--depends-on", "T99:T01", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("T99", refused.stderr)
+        self.assertIn("source", refused.stderr.lower())
+        self.assertFalse((run / ".batches" / "Bbad.json").exists())
+        # A legitimate edge whose source is a member in the same command works.
+        created = self.cli("batch", "demo", "--create", "B1",
+                           "--members", "T01,T02",
+                           "--depends-on", "T02:T01")
+        self.assertIn("created batch B1", created.stdout)
+        self.assertTrue((run / ".batches" / "B1.json").is_file())
+        batch = json.loads((run / ".batches" / "B1.json").read_text())
+        self.assertEqual(["T01"], batch["depends_on"]["T02"])
+        self.cli("batch", "demo", "--close", "B1")
+        # The real member edge still blocks the dependent dispatch as today.
+        self.cli("session", "demo", "--register", "--session", "s1",
+                 "--name", "w1", "--role", "implementor")
+        blocked = self.cli("dispatch", "demo", "T02", "--session", "s1",
+                           ok=False)
+        self.assertNotEqual(0, blocked.returncode)
+        self.assertIn("T01", blocked.stderr)
+        # A batch written before the rule stays readable; its stray edge is inert.
+        legacy = {
+            "batch": "Blegacy",
+            "run": "demo",
+            "members": ["T01", "T02"],
+            "depends_on": {"T99": ["T01"]},
+            "milestone": False,
+            "state": "open",
+            "generation": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        (run / ".batches" / "Blegacy.json").write_text(json.dumps(legacy))
+        listed = self.cli("batch", "demo", "--list").stdout
+        self.assertIn("Blegacy", listed)
+        self.assertIn("B1", listed)
+
+    def test_t82_dispatch_refuses_unresolved_task_intent(self) -> None:
+        """The same untouched task the validator rejects is a task dispatch refuses, with no binding."""
+        run = self.init5()
+        self.cli(
+            "assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+            "--harness", "opencode", "--file", "src/t01.py",
+            "--verify", 'printf "T01 ok\\n"')
+        task_path = run / "T01-task.mdx"
+        self.assertIn("<!-- TODO", task_path.read_text())
+        invalid = self.cli("validate-task", "demo", "T01", ok=False)
+        self.assertNotEqual(0, invalid.returncode)
+        self.assertIn("INVALID TASK", invalid.stderr)
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "impl-one", "--role", "implementor")
+        refused = self.cli("dispatch", "demo", "T01", "--session", "w1", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        for problem in ("unresolved placeholder", "acceptance criterion", "task needs"):
+            if problem in invalid.stderr:
+                self.assertIn(problem, refused.stderr)
+                break
+        else:
+            self.assertIn(invalid.stderr.strip().splitlines()[-1][:20], refused.stderr)
+        self.assertFalse((run / ".dispatch" / "T01.json").exists())
+        prompt_refused = self.cli("prompt", "demo", "T01", "--role", "implementor",
+                                  ok=False)
+        self.assertNotEqual(0, prompt_refused.returncode)
+        self.assertIn("missing required artifact", prompt_refused.stderr)
+        self.assertIn("T01-task.mdx", prompt_refused.stderr)
+        self.assertNotIn("<!-- TODO", prompt_refused.stdout)

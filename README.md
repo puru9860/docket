@@ -1,20 +1,40 @@
 # docket
 
-Run a **planner / orchestrator / implementor** pipeline across coding agents, coordinated
-through numbered `.mdx` docket files, with a mechanical report-validation gate and
-zero-token wake signalling.
+Run a **planner / orchestrator / implementor / verifier / reviewer** pipeline across
+coding agents, coordinated through numbered `.mdx` docket files, with a mechanical
+report-validation gate and zero-token wake signalling.
 
-Three logical roles, one file protocol:
+Five logical roles, one file protocol:
 
 | Role | Model tier | Does |
 | --- | --- | --- |
-| **planner / reviewer** | biggest | writes the plan, does the final review |
-| **orchestrator** | flexible | dispatches work, handles real blockers or scope collisions, and reviews task reports |
+| **planner** | biggest | writes the plan, owns intent and constraint amendments |
+| **orchestrator** | flexible | dispatches work, handles real blockers or scope collisions, routes rounds to review |
 | **implementor** | small | implements exactly one task, writes an honest report |
+| **verifier** | small | checks whether the frozen evidence proves acceptance, records pass, fail, or uncertain |
+| **reviewer** | biggest | judges from a fresh context and alone approves, waives, or requests changes |
 
 The planner and orchestrator may be separate (`split`) or one agent (`combined`).
 Implementors can run cheaply in another harness. Docket supports Claude Code, Codex
 (temporary compatibility), and OpenCode.
+
+Two presets select tested combinations of mode, workflow, topology, and review policy.
+The standard preset is the default for new runs: five sessions (planner, orchestrator,
+implementor, verifier, reviewer) with an independent verifier behind every decision.
+The quick preset is three roles for small certain work: a coordinator combining planning
+and orchestration, an implementor, and a checker combining verification and review.
+Quick records `combined-checker` on every artifact, so no reader mistakes a quick decision
+for independently verified work.
+Quick merges duties through explicit recorded policy only.
+It never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut,
+and it keeps scope claims, complete baselines, immutable evidence, source-drift rejection,
+honest blocking, and decisions bound to exact bundle digests.
+A run that outgrows quick records an escalation request; no command silently changes its mode.
+The two-role quick variant is deferred and refuses explicitly.
+Old runs keep their meaning as a historical legacy decode: a missing workflow
+key still reads as legacy and an explicit legacy plan keeps its semantics.
+New runs cannot select legacy: `docket init` uses standard or quick
+(workflow five-role-v1) and refuses `--workflow legacy`.
 
 ## Why this instead of prompting one agent to "use subagents"
 
@@ -26,6 +46,17 @@ Three things make it hold up on real work:
   cannot report success it did not achieve.
 - **`status: blocked` is a first-class good outcome.** A blocked report skips the
   acceptance requirement but *requires* a stated question. The honest path is the easy path.
+- **Lifecycle transitions survive interruption.** Every artifact is published
+  through a temporary file and an atomic replace, and a decision transition holds an
+  owner lock and records a durable identity together with the reviewer's own text.
+  Retrying an interrupted approve, waive, or changes request finishes it from the
+  bare verdict - the recorded reason and reviewer survive, and a retry that states
+  anything different is refused, including one that fills in a reason the interrupted
+  attempt recorded as absent - without overwriting review evidence or opening a
+  second round. A verdict that would land on a report body edited after review is
+  refused until that body passes the whole gate again and is re-verified, and an
+  edited blocked report stays waivable because its re-review skips completion
+  verification exactly as its submission did.
 - **Signalling costs nothing while idle.** A supervisor finishes its turn and goes idle.
   A watcher sleeps in the background and re-enters the session only when something is
   actionable, using the harness's own wake mechanism rather than a polling loop that
@@ -38,7 +69,17 @@ Run `docket doctor` at any time to see what you have and what each missing piece
 **Required**
 
 - Python 3.11+ (via [uv](https://docs.astral.sh/uv/), or swap the shebang for `python3`)
-- git, if you want reviewers to read diffs. The validation gate works without it.
+- git, if you want reviewers to read diffs. The validation gate works without it:
+  a run without Git declares `evidence_mode: documents-only` and Docket then reports
+  diff coverage as unavailable instead of as an unchanged worktree. A `git` run
+  declares every checkout root it may change before dispatch, explicitly and by name -
+  nested repositories and separate worktrees included - and captures a baseline it can
+  reconstruct, without ever committing or stashing your work. A root that was not
+  declared is never captured, and a run that cannot capture a complete baseline refuses
+  to dispatch rather than recording a partial one. Every submitted round is then frozen
+  as a full patch against that baseline, alongside the contract, the report body, the
+  captured verification, and the resulting revision - still without writing anything
+  into your checkout, not even a loose Git object.
 
 **Optional, and what you lose without each**
 
@@ -123,6 +164,8 @@ The role playbooks ship beside the skill and are surfaced by the CLI:
 docket help planner
 docket help orchestrator
 docket help implementor
+docket help verifier
+docket help reviewer
 docket help signalling
 ```
 
@@ -135,32 +178,79 @@ docket help signalling
   T03-scope.mdx            implementor-owned discovery and claimed change surface
   T03-handoff-01.mdx       resumable partial-work checkpoint when replacement is needed
   T03-report-01.mdx        implementor fills this; round 1
-  T03-decision-01.mdx      reviewer's verdict and required changes
+  T03-decision-01.mdx      reviewer's verdict, reason, and submitted-evidence digest
   T03-report-02.mdx        opened automatically when changes are requested
-  orch-report-01.mdx       orchestrator's own report, reviewed by the planner
+  orch-report-01.mdx       orchestrator's own report, reviewed by the planner (legacy) or reviewer (five-role-v1)
   docs/                    supporting docs
-  .woke-<role>             role-scoped wake ledger; delivers each event exactly once
+  .snapshots/roots.json    the run's declared checkout roots
+  .snapshots/run.json      run baseline, taken before the first implementor edit
+  .snapshots/T03.json      T03's own baseline and accepted scope
+  .snapshots/T03/          that baseline's patches and untracked content
+  .bundles/T03/rounds.json every frozen round for T03, oldest first
+  .bundles/T03/01/<addr>/  round 1 frozen whole, named by its own content digest
+  .bundles/orch/rounds.json every frozen aggregate round, oldest first
+  .bundles/orch/01/<addr>/ aggregate round 1, pinning constituent tasks
+  .deps/T03.json           frozen evidence T03 consumed, and on what terms
+  .transitions/T03.json    in-flight decision transition; a retry finishes it
+  .woke-<role>             role-scoped wake ledger; delivers each event at-least-once
 ```
 
 Round numbers are per-owner, so `T03-decision-02.mdx` is unambiguously round 2 of T03.
 
+A bundle is immutable and named by its own `sha256`, so a later edit, a retry, a
+re-review, or a later round can only ever produce a new one. It carries its own copy of
+the baseline it was measured from, so tidying `.snapshots/` later cannot hollow out
+evidence somebody already reviewed. `docket decide` refuses a verdict when the bundle for
+that round is missing, damaged, or stale for the report body in front of it, which is
+what stops an approval from quietly covering work nobody read. Damaged includes a bundle
+whose pinned Git trees are gone: a round nobody can rebuild is not intact evidence, however
+well the manifest hashes. Under `evidence_mode: documents-only` a round still freezes, and
+records its patch coverage as unavailable rather than as an empty patch. The orchestrator's
+aggregate bundle pins its constituent task bundles, and a reopened or moved constituent
+makes the aggregate stale. A waived task may be reopened with
+`docket decide <run> <owner> --reopen --reason ...`, preserving its prior round evidence
+and invalidating any aggregate that pinned it.
+
+One submission runs at a time per owner. The verify command, the freeze, and the report
+write are a single locked step, and the contract, report, scope, and consumed inputs are
+rechecked afterwards: if any of them moved while the command ran, the submission is
+refused and your edit is left alone rather than being overwritten by a stale copy. What
+gets frozen is the bytes that were verified, captured before the command ran, so nothing
+that lands afterwards can slip into the bundle.
+
+A round also freezes the inputs it consumed, including "none" as an explicit record, and
+an approval or a waiver checks the live record against that frozen one. Re-recording a
+pin is not a reverification, so `docket depend --on` only records into a draft round: for
+submitted or blocked work it tells you to open a fresh round with `docket decide ...
+--changes` first, and for decided work it refuses and leaves the round visibly stale in
+`docket status` rather than quietly refreshing it.
+
 ## Commands
 
 ```
-docket init <run> --topology split|combined --harness H
+docket init <run> [--mode standard|quick] [--topology split|combined] [--harness H] [--evidence-mode M]
+                                  [--root alias=path ...]
 docket assign <run> <owner> --complexity low|high --executor implementor|orchestrator
 docket validate-task <run> <owner>                   validate functional intent
 docket scope <run> <owner> --submit                  claim implementor-discovered paths
 docket handoff <run> <owner> [--submit]              partial-work checkpoint
 docket set-model <run> <owner> --actual MODEL        record the verified live model
 docket preflight <run> <owner>                       record the verification baseline
-docket submit <run> <owner>                          validate and hand off <- the gate
-docket decide <run> <owner> --approve|--changes|--waive
-docket status <run> [--role planner|orchestrator]
+docket roots <run> [--declare|--redeclare alias=path ...]
+                                                     the run's declared checkout roots
+docket submit <run> <owner> [--as implementor]      validate, freeze, and hand off <- the gate
+docket verify <run> <owner> --result pass --as verifier
+docket bundle <run> <owner> [--round N] [--list]     the frozen evidence for a round
+docket depend <run> <owner> [--on TASK]              consume another task's frozen evidence
+docket decide <run> <owner> --approve|--changes|--waive [--reason TEXT] [--re-review] --as reviewer
+                                                     repeat the bare verdict to finish an interrupted one
+docket status <run> [--role planner|orchestrator|verifier|reviewer]
+docket events <run> --role R --peek                  inspect events, consuming none
 docket arm <run> --role R                            arm the watcher for a waiting role
 docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
-docket watch <run> --role orchestrator|planner       block until something needs you
+docket watch <run> --role orchestrator|planner|verifier|reviewer
+                                                     block until something needs you
 docket help <role>                                   the playbooks
 ```
 
@@ -194,15 +284,18 @@ Arm **every role that will wait**, then disarm when the run ends:
 
 ```bash
 docket arm R01 --role orchestrator   # waiting on implementors
-docket arm R01 --role planner        # waiting on the orchestrator
+docket arm R01 --role planner        # waiting on the orchestrator (split only)
+docket arm R01 --role verifier       # waiting on submissions (five-role runs)
+docket arm R01 --role reviewer       # waiting on milestone batches (five-role runs)
 docket disarm R01                    # done
 ```
 
 A role that is not armed is never woken, silently. `docket doctor` lists every armed
 pair so you can check. Each role keeps its own ledger, so an orchestrator and a planner
 watching the same run cannot consume each other's events, and each wake line is tagged
-with the role it belongs to. Set `DOCKET_ROLE=<role>` in a session to be woken only for
-that role.
+with the role it belongs to. Ordinary implementor submissions produce one wake only
+when the current review batch is ready; blockers, collisions, and handoffs remain
+immediate. Set `DOCKET_ROLE=<role>` in a session to be woken only for that role.
 
 The watcher is inert unless `watch.conf` exists, so an idle project costs nothing. It must
 run in the hook's own foreground process tree - never with shell `&` - so the harness can
@@ -237,7 +330,7 @@ worked out in more depth elsewhere.
   wake mechanism comes from firstmate's event-driven, zero-token supervision: arm a
   watcher from a Claude Code `Stop` hook with `asyncRewake`, keep it in the hook's own
   **foreground** process tree instead of backgrounding it so the harness tears it down
-  with the session, and keep a ledger so each event is delivered exactly once. Its
+  with the session, and keep a ledger so each event is delivered at-least-once. Its
   `docs/turnend-guard.md` and `.agents/skills/harness-adapters/SKILL.md` also map which
   harnesses can block on turn-end and which only allow a bounded follow-up, which is
   research this project simply relies on.
@@ -245,7 +338,7 @@ worked out in more depth elsewhere.
   No code is copied here. If you want the full-featured version of this idea - parallel
   crews, git worktree isolation, restart-proof reconciliation, many multiplexer backends,
   and a real test suite for all of it - use firstmate instead of this. `docket` covers a
-  much narrower case: one repo, three roles, a numbered paper trail.
+  much narrower case: one repo, five roles, a numbered paper trail.
 
 - **[lavish](https://github.com/kunchenguid/lavish-axi)** by Kun Chen (MIT) - the pattern
   of keeping the real instructions in the CLI (`docket help <role>`) and leaving `SKILL.md`

@@ -7,75 +7,95 @@ metadata:
 
 # Docket
 
-Docket minimizes expensive supervisor context by coordinating work through files.
+Docket coordinates planned coding work through files.
 It supports only Claude Code (`claude`), Codex (`codex`, temporary compatibility),
 and OpenCode (`opencode`).
 
-The logical roles are planner/reviewer, orchestrator, and implementor. They need
-not always be three agents:
+Five logical roles: planner, orchestrator, implementor, verifier, reviewer.
+They need not always be five agents: `split` keeps planner and orchestrator
+separate, `combined` merges them, and `workflow: five-role-v1` (declared in
+`plan.mdx`) selects separate reviewer registration, verifier findings, correction
+budgets, and reviewer-owned approval.
 
-- `split`: planner and orchestrator are separate; the planner sees only the
-  orchestrator's aggregate report.
-- `combined`: one agent performs planner/reviewer and orchestrator duties; cheap
-  implementors may remain separate.
+Two presets select tested combinations of those dimensions.
+The standard preset is the default for new runs: five sessions with an independent
+verifier behind every decision.
+The quick preset is three roles for small certain work: a coordinator combining
+planning and orchestration, an implementor, and a checker combining verification
+and review with `combined-checker` recorded on every artifact.
+Quick never weakens the gate, the evidence, or the decision binding.
+A run that outgrows quick records an escalation request instead of migrating silently.
+Legacy is a historical decode for existing runs only: old plans keep their
+meaning and migrate explicitly, while new runs use standard or quick and
+`docket init --workflow legacy` refuses.
 
-Choose and read the relevant playbook completely before acting:
+## Read your playbook first
+
+Choose and read the relevant playbook completely before acting.
+The one canonical contract per role lives in `references/contracts/<role>.md`;
+both `docket help <role>` and the generated prompt read that same file.
 
 ```bash
 docket help planner
 docket help orchestrator
 docket help implementor
+docket help verifier
+docket help reviewer
 docket help signalling
 ```
 
-The task file defines intent; the implementor-owned discovery capsule defines the
-change surface and verification. The latest ready partial-work checkpoint and
-task-local diff preserve continuity. The submitted report and task-local diff are
-the review truth. Agent chat, terminal scrollback, and lifecycle state are not
-completion evidence.
+| Role | Start here | Detail |
+| --- | --- | --- |
+| planner | `docket help planner` | `references/planner.md`, contract in `references/contracts/planner.md` |
+| orchestrator | `docket help orchestrator` | `references/orchestrator.md`, contract in `references/contracts/orchestrator.md` |
+| implementor | `docket help implementor` | `references/implementor.md`, contract in `references/contracts/implementor.md` |
+| verifier | `docket help verifier` | `references/verifier.md`, contract in `references/contracts/verifier.md` |
+| reviewer | `docket help reviewer` | `references/reviewer.md`, contract in `references/contracts/reviewer.md` |
 
-Repository understanding belongs in the cheap implementor harness. Supervisors
-provide goals, acceptance criteria, constraints, and optional hints - not mandatory
-code maps. The implementor discovers progressively, submits its capsule through
-`docket scope`, and continues silently when Docket finds no collision. Only a real
-scope collision wakes the orchestrator for sequencing or ownership.
+Shared detail lives in `references/`: `signalling.md` for wake delivery,
+`verification-obligations.md` for evidence duties, `contracts/` for the five
+canonical contracts, and `model-profiles/` for guidance cards.
+The full command surface is `docket --help`; per-role usage is in the playbooks.
 
-In split topology, preserve the cost boundary: the planner must not monitor
-implementors, read task reports, receive task-level wakes, or give the human
-per-task implementation updates. The orchestrator handles all of that and submits
-one standardized `orch-report-NN.mdx`.
+## Install
 
-`progress_updates: quiet` is the default in both topologies. After announcing a
-dispatch, do not narrate healthy task activity such as coding, file edits, test
-execution, lifecycle state, or “still working.” Wait without polling or producing
-model turns. Speak again only for an actionable blocker/decision, a batched review
-outcome, completion, or when the user explicitly asks for status.
+### Recommended: the `skills` CLI (handles 14 agents)
 
 ```bash
-docket init <run> --topology split|combined --harness claude|codex|opencode
-docket assign <run> T03 --complexity low|high \
-  --executor implementor|orchestrator --harness opencode \
-  --model <requested-model> [--effort <requested-effort>]
-docket validate-task <run> T03
-docket scope <run> T03
-docket scope <run> T03 --submit
-docket set-model <run> T03 --actual <verified-active-model> [--effort <verified-effort>]
-docket handoff <run> T03
-docket handoff <run> T03 --submit
-docket submit <run> T03 [--blocked]
-docket preflight <run> T03
-docket diff <run> T03
-docket decide <run> T03 --approve | --changes | --waive --reason TEXT
-docket status <run> [--role planner|orchestrator]
-docket assign <run> orch --executor orchestrator --harness opencode
+npx skills add puru9860/docket --all
 ```
 
-Templates may be overridden in
-`.docket/templates/<plan|task|scope|report|handoff|orchestrator_report|decision>.mdx`.
+### Manual
 
-For Claude Code wake signalling, merge `hooks/settings.json.example` into the
-project's `.claude/settings.json`, set `DOCKET_ROLE`, and read
-`docket help signalling`.
+```bash
+git clone https://github.com/puru9860/docket.git /tmp/docket-src
+mkdir -p ~/.agents/skills
+cp -r /tmp/docket-src/skills/docket ~/.agents/skills/docket
+```
+
+**Claude Code** does not read `~/.agents/skills`, so symlink it in:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -sfn ~/.agents/skills/docket ~/.claude/skills/docket
+```
+
+### Put the CLI on PATH
+
+```bash
+ln -sfn ~/.agents/skills/docket/bin/docket ~/.local/bin/docket
+docket help planner
+```
+
+`bin/docket` is a single stdlib-only script with no dependencies.
+
+## Quick start
+
+```bash
+cd <your project> && mkdir -p .docket
+docket init R01          # scaffolds .docket/runs/R01/plan.mdx
+docket help planner      # then follow the playbook
+```
 
 ## Request
 

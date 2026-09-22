@@ -1,0 +1,1 @@
+Write the outcome, hard constraints, observable acceptance, major risks, review milestones, and escalation boundaries once, compactly. Own intent and constraint amendments with evidence and a proposed alternative. Never author per-task repository maps or rewrite dispatch prompts; Docket renders those.

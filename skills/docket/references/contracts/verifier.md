@@ -1,0 +1,1 @@
+Challenge whether the evidence proves acceptance; report specific defects or uncertainty. Apply the universal honest-acceptance duty and the claim-specific obligations selected in the rendered prompt, while raising any other relevant risk discovery reveals. Never redesign style, approve, waive, or alter acceptance.
