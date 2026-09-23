@@ -362,6 +362,7 @@ docket models                              # scorecard per model: first-pass rat
 docket models --review deepseek/deepseek-flash   # evidence packet: new cases since the last review
 docket models --adopt profile.md           # install the reviewed profile for that model
 docket models --import                     # once per project: backfill cases from existing runs
+docket models --alias 'DeepSeek V4.1 Flash=deepseek/deepseek-flash'  # one model, two names
 ```
 
 Hand the review packet to a strong session ("review this docket model packet and draft the profile"); it ends with the exact format and rules.

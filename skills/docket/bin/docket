@@ -9584,6 +9584,7 @@ RENDERER_SOURCE_FUNCTIONS = (
     "user_profiles_dir",
     "profile_path",
     "normalized_model",
+    "model_aliases",
     "decision_required_lines",
     "contract_path",
     "load_contract",
@@ -11214,8 +11215,32 @@ REJECT_CASES = (("gate", "refused"), ("verification", "fail"),
 
 
 def normalized_model(value: str) -> str:
-    """A model id without a display suffix: `x/y (Some Name)` becomes `x/y`."""
-    return re.split(r"\s+\(", (value or "").strip(), maxsplit=1)[0].strip()
+    """A model's canonical id: display suffix dropped, recorded aliases resolved.
+
+    `x/y (Some Name)` becomes `x/y`, and a name recorded with `docket models
+    --alias NAME=ID` becomes that ID, so one model never splits into two
+    scorecards or misses its own profile.
+    """
+    name = re.split(r"\s+\(", (value or "").strip(), maxsplit=1)[0].strip()
+    return model_aliases().get(name.lower(), name)
+
+
+def model_aliases_path() -> Path:
+    return user_profiles_dir() / "aliases.txt"
+
+
+def model_aliases() -> dict[str, str]:
+    """Recorded `NAME = ID` lines, keyed by the lowercased name."""
+    try:
+        lines = model_aliases_path().read_text().splitlines()
+    except OSError:
+        return {}
+    out = {}
+    for line in lines:
+        name, sep, target = line.partition("=")
+        if sep and name.strip() and target.strip() and not line.lstrip().startswith("#"):
+            out[name.strip().lower()] = target.strip()
+    return out
 
 
 def task_model(d: Path, owner: str) -> tuple[str, str, str]:
@@ -11319,6 +11344,10 @@ def outcome_records(path: Path | None, since: str = "") -> list[dict]:
             continue
         if isinstance(record, dict) and record.get("origin") in ("outcome", "usage", "profile") \
                 and (not since or str(record.get("at", "")) >= since):
+            if record.get("origin") == "outcome":
+                record["model"] = normalized_model(str(record.get("model", ""))) or "unknown"
+            elif record.get("origin") == "usage":
+                record["models"] = [normalized_model(str(m)) for m in record.get("models") or []]
             out.append(record)
     return out
 
@@ -11392,6 +11421,17 @@ def cmd_models(a: argparse.Namespace) -> None:
     if a.adopt:
         adopt_model_profile(Path(a.adopt).expanduser())
         return
+    if a.alias:
+        name, sep, target = a.alias.partition("=")
+        if not sep or not name.strip() or not target.strip():
+            die("--alias takes NAME=ID, for example 'DeepSeek V4.1 Flash=deepseek/deepseek-flash'")
+        path = model_aliases_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kept = [line for line in (path.read_text().splitlines() if path.is_file() else [])
+                if line.partition("=")[0].strip().lower() != name.strip().lower()]
+        publish(path, "\n".join([*kept, f"{name.strip()} = {target.strip()}"]) + "\n")
+        print(f"{name.strip()} is now counted as {target.strip()}, in past cases too")
+        return
     if a.import_runs is not None:
         runs_root = root() / STATE_DIR / "runs"
         names = a.import_runs
@@ -11428,7 +11468,7 @@ def cmd_models(a: argparse.Namespace) -> None:
     due = [item for item in pending_reviews(records) if item[1] >= 3]
     for model, count, _ in due:
         print(f"  review due: {model} has {count} new reject case(s); "
-              f"run `docket models --review {model}`")
+              f"run `docket models --review {shlex.quote(model)}`")
 
 
 def model_review_packet(records: list[dict], model: str, since: str) -> str:
@@ -11584,7 +11624,7 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
         print("\nmodel profiles due for review")
         for model, count, through in due:
             print(f"  {model}: {count} new reject case(s) since "
-                  f"{through or 'no review yet'}; run `docket models --review {model}`")
+                  f"{through or 'no review yet'}; run `docket models --review {shlex.quote(model)}`")
     latest: dict[tuple[str, str, str, str], dict] = {}
     for record in usage:
         key = tuple(str(record.get(k, "")) for k in ("project", "run", "harness", "session_id"))
@@ -15112,6 +15152,8 @@ def main() -> None:
                    help="print the evidence packet for updating one model's profile")
     q.add_argument("--adopt", default="", metavar="FILE",
                    help="validate a reviewed profile and install it for that model")
+    q.add_argument("--alias", default="", metavar="NAME=ID",
+                   help="count another name (a display label, a provider prefix) as that model id")
     q.add_argument("--import", dest="import_runs", nargs="*", default=None, metavar="RUN",
                    help="backfill cases from runs' artifacts (every run here when none named)")
     q.add_argument("--since", default="", help="only cases at or after this date")

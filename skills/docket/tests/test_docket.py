@@ -10483,6 +10483,17 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("acme/old-1: 1 task(s), no decided task yet, 0.0 rounds to accept, "
                       "rejects: decision 1, verification 1", self.cli("models").stdout)
         self.assertIn("off by one", self.cli("models", "--review", "acme/old-1").stdout)
+        # A display label recorded elsewhere is the same model once aliased, in past cases too.
+        log = Path(os.environ["DOCKET_FEEDBACK_LOG"])
+        record = json.loads(log.read_text().splitlines()[0])
+        log.write_text(log.read_text() + json.dumps({**record, "model": "Acme Old One",
+                                                     "pointer": "elsewhere"}) + "\n")
+        self.assertIn("Acme Old One: 1 task(s)", self.cli("models").stdout)
+        aliased = self.cli("models", "--alias", "Acme Old One=acme/old-1")
+        self.assertIn("counted as acme/old-1", aliased.stdout)
+        board = self.cli("models").stdout
+        self.assertNotIn("Acme Old One", board)
+        self.assertIn("rejects: decision 1, verification 2", board)
 
     def test_every_role_prompt_asks_for_feedback_and_it_accumulates(self) -> None:
         """Roles record what docket cost them; records reach the user-level log and digest."""
