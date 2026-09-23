@@ -58,12 +58,13 @@ Then start the worker and hand it that file (herdr shown; any terminal works):
 herdr pane split --current --direction right --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
 herdr agent start impl-1 --kind opencode --pane <pane_id> -- --auto     # see harness flags below
 herdr agent prompt impl-1 "$(cat <prompt file>)"                        # no --wait
-docket set-model R01 T01 --actual <model label the pane shows> [--effort LEVEL]
+docket set-model R01 T01 --actual <provider/model id the pane shows> [--effort LEVEL]
 ```
 
 Harness flags after `--`: opencode `--auto --model provider/model`, codex
 `--yolo -m MODEL`, claude `--dangerously-skip-permissions --model MODEL`.
 herdr agent names are global across tabs, so prefix them with the run (`r01-impl-1`).
+A new Codex worker can stop at a directory-trust screen and a "Hooks need review" screen: trust the project directory, and continue without trusting hooks (the docket hook is for supervisors).
 
 Start each supervising session you own the same way: the checker in quick, the
 orchestrator in standard (which starts the verifier and reviewer itself). For a

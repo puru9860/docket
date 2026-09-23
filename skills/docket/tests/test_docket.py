@@ -4366,8 +4366,8 @@ class DocketCLI(unittest.TestCase):
         gated_submit = self.cli("submit", "demo", "T09", "--as", "implementor",
                                 ok=False)
         self.assertNotEqual(0, gated_submit.returncode)
-        self.assertEqual(1, json.loads(
-            (run / ".corrections" / "T09.json").read_text())["gate_repairs"])
+        # A refusal before handoff returns nothing to the implementor: never charged.
+        self.assertFalse((run / ".corrections" / "T09.json").exists())
         (run / "T09-report-01.mdx").write_text(
             (run / "T09-report-01.mdx").read_text().replace("\nTODO: finish\n", "\n"))
         self.fill_task_report(run / "T09-report-01.mdx",
@@ -4452,23 +4452,26 @@ class DocketCLI(unittest.TestCase):
         submit(1)
         self.cli("verify", "eg", "T01", "--result", "fail", "--as", "checker",
                  "--detail", "1. oracle mismatch")
-        self.assertEqual(0, corrections()["verifier_returns"])
-        # An older build charged every fail; that stale charge no longer counts.
-        stale = corrections()
-        stale.update({"verifier_returns": 1, "counted": ["T01-verification-01.mdx"]})
-        (run / ".corrections" / "T01.json").write_text(json.dumps(stale))
+        self.assertFalse((run / ".corrections" / "T01.json").exists())
+        # An older build charged the gate refusal and every fail; neither counts now.
+        (run / ".corrections").mkdir(exist_ok=True)
+        (run / ".corrections" / "T01.json").write_text(json.dumps({
+            "owner": "T01", "chain_start_round": 1, "gate_repairs": 1, "verifier_returns": 1,
+            "reviewer_returns": 0, "escalated": "", "counted": ["T01-verification-01.mdx"]}))
         request_changes(1)
         self.assertEqual((1, 0, 1), tuple(corrections()[k] for k in
                                           ("gate_repairs", "verifier_returns", "reviewer_returns")))
         submit(2)
+        request_changes(2)
+        submit(3)
         self.cli("verify", "eg", "T01", "--result", "fail", "--as", "checker",
                  "--detail", "1. still mismatched")
-        refused = request_changes(2, ok=False)
+        refused = request_changes(3, ok=False)
         self.assertIn("escalation T01-r01 is open", refused.stderr)
         self.assertEqual(["T01:escalated:T01-r01"], self.derived_keys("eg", "coordinator"))
         self.assertIn("docket escalation eg T01 --grant 1 --reason TEXT",
                       self.cli("events", "eg", "--role", "coordinator", "--peek").stdout)
-        self.assertNotIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        self.assertNotIn("T01:3:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
         denied = self.cli("escalation", "eg", "T01", "--grant", "1", "--reason", "one more",
                           "--as", "checker", ok=False)
         self.assertIn("only the coordinator extends a correction budget", denied.stderr)
@@ -4476,13 +4479,13 @@ class DocketCLI(unittest.TestCase):
                            "--reason", "the UTF-8 fix is worth one more round")
         self.assertIn("granted T01 1 more correction round(s): 3 used of 3", granted.stdout)
         self.assertEqual([], self.derived_keys("eg", "coordinator"))
-        self.assertIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        self.assertIn("T01:3:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
         self.cli("decide", "eg", "T01", "--changes", "--as", "checker")
-        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx", "T01-report-03.mdx"],
-                         self.rounds(run, "T01"))
-        self.assertEqual(2, corrections()["reviewer_returns"])
-        self.assertNotIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
-        submit(3)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx", "T01-report-03.mdx",
+                          "T01-report-04.mdx"], self.rounds(run, "T01"))
+        self.assertEqual(3, corrections()["reviewer_returns"])
+        self.assertNotIn("T01:3:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        submit(4)
         self.cli("verify", "eg", "T01", "--result", "pass", "--as", "checker",
                  "--detail", "1. fixed")
         self.cli("decide", "eg", "T01", "--approve", "--as", "checker",
@@ -4490,6 +4493,32 @@ class DocketCLI(unittest.TestCase):
         entry = json.loads((run / ".escalations" / "T01-r01.json").read_text())
         self.assertEqual("closed", entry["state"])
         self.assertNotIn("T01:escalated:T01-r01", self.derived_keys("eg", "coordinator"))
+
+    def test_an_accepted_aggregate_wakes_the_coordinator_to_close_the_run(self) -> None:
+        """The session the user talks to learns the run is complete, and runs the aggregate."""
+        run = self.init5_in("fin", mode="quick")
+        self.assign_simple_in(run, "fin", "T01")
+        self.cli("dispatch", "fin", "T01", "--session", "w1", "--register")
+        self.fill_task_report(run / "T01-report-01.mdx", files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "fin", "T01", "--as", "implementor")
+        self.cli("verify", "fin", "T01", "--result", "pass", "--as", "checker", "--detail", "1. ok")
+        self.cli("decide", "fin", "T01", "--approve", "--as", "checker", "--reason", "holds")
+        env = {"CLAUDE_CODE_SESSION_ID": "0c1d2e3f-aaaa-bbbb-cccc-000000000009",
+               "CLAUDE_PID": str(os.getpid())}
+        self.cli_env(env, "assign", "fin", "orch", "--executor", "orchestrator",
+                     "--verify", "printf ok")
+        self.assertIn("harness: claude", (run / "orch-report-01.mdx").read_text())
+        report = run / "orch-report-01.mdx"
+        self.fill_orch_report(report)
+        report.write_text(report.read_text().replace("| T02 | approved | passed |\n", ""))
+        self.cli("submit", "fin", "orch", "--as", "coordinator")
+        self.assertNotIn("orch:1:complete", self.derived_keys("fin", "coordinator"))
+        self.cli("decide", "fin", "orch", "--approve", "--as", "checker", "--reason", "delivered")
+        self.assertIn("orch:1:complete", self.derived_keys("fin", "coordinator"))
+        peek = self.cli("events", "fin", "--role", "coordinator", "--peek").stdout
+        self.assertIn("run fin is complete: the aggregate was approved at round 1", peek)
+        self.assertIn("`docket usage fin --archive` and `docket disarm fin`", peek)
+        self.assertEqual([], self.derived_keys("fin", "checker"))
 
     def test_m8_stale_revision_blocks_verdict(self) -> None:
         """A verdict never falls back to whatever the workspace holds now."""
@@ -9908,6 +9937,9 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("stage: correction", correcting)
         self.assertIn("Apply every required change listed above.", correcting)
         self.assertIn("`.docket/runs/steps/T01-report-02.mdx`", correcting)
+        self.assertIn("files changed (every path `docket diff steps T01` lists, earlier rounds "
+                      "included)", correcting)
+        self.assertIn("Only if you must stop before submitting", correcting)
         # Standard names its own roles, and legacy needs no --as at all.
         standard = self.init5_in("std")
         self.submit5_in(standard, "std", "T01")

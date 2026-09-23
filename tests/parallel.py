@@ -5,14 +5,19 @@ and each runs in its own `python -m unittest` process from a shared work queue.
 The output keeps unittest's shape: one progress line per test, failure details, and
 exactly one terminal `Ran N tests` summary, which is what `docket suite --qualify`
 parses. `DOCKET_TEST_JOBS` sets the worker count; 1 runs the plain serial suite.
+
+The run executes against a snapshot of the repository taken when it starts, so an
+edit made while the suite runs never mixes old and new code inside one test.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -63,8 +68,24 @@ def split_output(text: str) -> tuple[list[str], list[str], dict[str, int], bool]
     return [line for line in progress if line.strip()], details, counts, match.group(1) == "OK"
 
 
+def snapshot(start: Path, into: Path) -> Path:
+    """Copy the files the suite reads into a repository layout; return its test dir."""
+    repo = start.parents[2]
+    skip = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for name in ("skills", "docs"):
+        if (repo / name).is_dir():
+            shutil.copytree(repo / name, into / name, ignore=skip)
+    for path in repo.glob("*.md"):
+        shutil.copy2(path, into / path.name)
+    return into / start.relative_to(repo)
+
+
 def main() -> int:
-    start = Path(sys.argv[1]).resolve()
+    with tempfile.TemporaryDirectory(prefix="docket-suite-") as frozen:
+        return run(snapshot(Path(sys.argv[1]).resolve(), Path(frozen)))
+
+
+def run(start: Path) -> int:
     jobs = int(os.environ.get("DOCKET_TEST_JOBS", "0") or 0) or max(2, (os.cpu_count() or 2) // 2)
     if jobs <= 1:
         return subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(start),

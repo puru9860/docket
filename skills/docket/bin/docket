@@ -3433,6 +3433,15 @@ def cmd_assign(a: argparse.Namespace) -> None:
         a.executor = "implementor" if a.tier == "small" else "orchestrator"
     if a.files:
         a.file.extend(shlex.split(a.files))
+    if not a.harness:
+        # The aggregate and an orchestrator-executed task run in the assigning
+        # supervisor's own session, so its harness is the honest default.
+        if a.owner == "orch" or a.executor == "orchestrator":
+            planned = str(parse((d / "plan.mdx").read_text())[0].get("planner_harness", ""))
+            a.harness = calling_harness() or (planned if planned in SUPPORTED_HARNESSES
+                                              else "opencode")
+        else:
+            a.harness = "opencode"
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
     criteria = [c.strip() for c in (a.criterion or []) if c.strip()]
@@ -4236,8 +4245,8 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
         problems.extend(drifted_inputs(d, a.owner, rep, verified))
 
     if problems:
-        if is_five_role(d) and a.owner != "orch":
-            note_correction(d, a.owner, "gate_repairs")
+        # A refused submit is the implementor's own check before handoff:
+        # nothing was returned to it, so it is recorded, never charged.
         machine_feedback(d, "verification", a.owner,
                          "submit refused by the gate: " + problems[0].splitlines()[0],
                          role=a.as_role or "implementor")
@@ -5984,6 +5993,9 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
         if is_five_role(d):
             for key, message, owner, ernd, revision in escalation_events(d):
                 emit(key, message, owner, ernd, revision)
+            complete = run_complete_event(d)
+            if complete:
+                emit(*complete)
         if not is_five_role(d):
             rnd, st = state_of(d, "orch")
             if st == "submitted":
@@ -6018,6 +6030,9 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
     if topology(d) == "combined" and is_five_role(d):
         for key, message, owner, ernd, revision in escalation_events(d):
             emit(key, message, owner, ernd, revision)
+        complete = run_complete_event(d)
+        if complete:
+            emit(*complete)
     scope = []
     orchestrator_tasks = []
     for o in owners(d):
@@ -8873,8 +8888,9 @@ def read_corrections(d: Path, owner: str) -> dict:
 
 
 def correction_attempts(record: dict) -> int:
+    """Returns of work to the implementor; gate refusals before handoff are not returns."""
     total = 0
-    for key in ("gate_repairs", "verifier_returns", "reviewer_returns"):
+    for key in ("verifier_returns", "reviewer_returns"):
         try:
             total += int(record.get(key, 0) or 0)
         except (TypeError, ValueError):
@@ -8969,6 +8985,25 @@ def escalation_events(d: Path) -> list[tuple[str, str, str, int, str]]:
                     owner, state_of(d, owner)[0],
                     f"sha256:{hashlib.sha256(iid.encode()).hexdigest()}"))
     return out
+
+
+def run_complete_event(d: Path) -> tuple[str, str, str, int, str] | None:
+    """(key, message, owner, round, revision) once the aggregate is accepted.
+
+    The plan owner is the session the user talks to; without this wake it keeps
+    waiting after the reviewer settles the run and never reports the outcome.
+    """
+    rnd, st = state_of(d, "orch")
+    if st not in ("approved", "waived", "completed"):
+        return None
+    dec = d / f"orch-decision-{rnd:02d}.mdx"
+    revision = digest_of(dec.read_bytes()) if dec.is_file() else f"orch:{rnd}:{st}"
+    return (f"orch:{rnd}:complete",
+            f"run {d.name} is complete: the aggregate was {st} at round {rnd}. Tell the user the "
+            f"outcome, record what docket cost you with `docket feedback {d.name} --add --role "
+            f"{plan_owner_role(d)} --category <kind> --body TEXT`, then run `docket usage {d.name} "
+            f"--archive` and `docket disarm {d.name}`",
+            "orch", rnd, revision)
 
 
 def cmd_escalation(a: argparse.Namespace) -> None:
@@ -10411,7 +10446,8 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
     submit_op = submit_op_for(d, owner)
     submit_as = as_role(submit_op)
     finish = [
-        f"Fill `{report}`: summary, files changed, the acceptance boxes (criteria exactly as "
+        f"Fill `{report}`: summary, files changed (every path `docket diff {run} {owner}` lists, "
+        "earlier rounds included), the acceptance boxes (criteria exactly as "
         "the task states them, each checked only when it genuinely passes), the verify command "
         "with its real output, and decisions needed.",
         f"Submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
@@ -14532,7 +14568,9 @@ def main() -> None:
     q.add_argument("--complexity", default="low", choices=["low", "high"])
     q.add_argument("--executor", default="implementor", choices=["implementor", "orchestrator"])
     q.add_argument("--tier", choices=["small", "self"], help=argparse.SUPPRESS)
-    q.add_argument("--harness", default="opencode", choices=SUPPORTED_HARNESSES)
+    q.add_argument("--harness", default="", choices=("", *SUPPORTED_HARNESSES),
+                   help="the worker's harness; opencode for a task, the supervisor's own "
+                        "harness for the aggregate")
     q.add_argument("--model", default="")
     q.add_argument("--effort", default="", help="requested reasoning effort when supported by the harness")
     q.add_argument("--file", action="append", default=[], help="allowed path; repeat for multiple paths")

@@ -327,9 +327,9 @@ carrying round, attempt, contract revision, and source digest; a retry on the
 same submission takes the next attempt number. A recorded verdict for the
 exact round and evidence resolves its verifier event, so the event is no
 longer derived as pending; a new round or a re-review that freezes a second
-bundle for the same round derives a new event with a new identity. Local corrections - gate
-repairs, verifier returns, reviewer returns - share one budget per chain
-(`correction_limit`, default 2). One return to the implementor is charged once:
+bundle for the same round derives a new event with a new identity. Local corrections - verifier
+returns and reviewer returns - share one budget per chain
+(`correction_limit`, default 2). A gate refusal is the implementor's own check before handoff, so it is recorded as a machine observation and never charged. One return to the implementor is charged once:
 a verification fail is charged only when it opens the correction itself, since a
 fail left for the reviewer returns nothing until the reviewer's changes do, and
 a retried changes request is charged by its decision artifact. Exhaustion writes
@@ -380,6 +380,8 @@ A standard run routes that wake to the orchestrator, which sends verified work t
 An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, since five-role submission is never terminal for it; a blocked one wakes the reviewer directly, as a blocked aggregate does.
 A delegated task's block wakes the orchestrator first, since it may own the answer, but only the reviewer can settle the round, so the hand-off is durable: `docket route <run> --kind blocked --owner T01 --note TEXT` writes `.routes/T01-01-blocked.json`, the orchestrator's event retires, and the reviewer (the checker in quick) derives `T01:1:blocked-routed` carrying the note until a verdict moves the round.
 A message typed into the reviewer's session would sit behind a Codex poll for up to an hour, while a derived event ends `docket watch` at once.
+An accepted aggregate derives `orch:N:complete` for the plan owner (the planner, or the coordinator in quick), because the reviewer settles the run and the session the user talks to would otherwise keep waiting without ever reporting the outcome.
+`docket assign ... orch` (and any orchestrator-executed task) defaults its harness to the assigning session's own harness, since that session executes it.
 A `correction-ready` event retires as soon as a live dispatch record binds its round, and the same wake exists for an orchestrator-owned task and for changes requested on the aggregate.
 An interrupted decision transition derives one `unfinished-<verdict>` event naming the exact finishing command, read from the artifacts first and the journal second, as `applied_steps` does: a report left `changes-requested` with no next round, an applied decision over a report still submitted or blocked, or an in-progress journal.
 It goes to the reviewer in five-role runs and to the legacy orchestrator or split planner otherwise, and a transition whose owner lock is held is still running and derives nothing.
@@ -1274,7 +1276,7 @@ Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
 | gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | verification | `task_env`, `parse_framework_counts`, `run_verification` |
 | transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
-| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `cmd_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
+| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
 | prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
 | feedback | `cmd_feedback`, `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
 | dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `resumable_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
