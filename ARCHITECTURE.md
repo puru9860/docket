@@ -370,6 +370,8 @@ Under `five-role-v1` review readiness means verified: the whole-run review batch
 Readiness at submission woke a supervisor with nothing to route and no later event to wait for, so it polled until the verifier finished.
 A standard run routes that wake to the orchestrator, which sends verified work to the reviewer; a quick run routes it to the checker, which holds the review duty itself, and leaves the coordinator asleep.
 An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, since five-role submission is never terminal for it; a blocked one wakes the reviewer directly, as a blocked aggregate does.
+A delegated task's block wakes the orchestrator first, since it may own the answer, but only the reviewer can settle the round, so the hand-off is durable: `docket route <run> --kind blocked --owner T01 --note TEXT` writes `.routes/T01-01-blocked.json`, the orchestrator's event retires, and the reviewer (the checker in quick) derives `T01:1:blocked-routed` carrying the note until a verdict moves the round.
+A message typed into the reviewer's session would sit behind a Codex poll for up to an hour, while a derived event ends `docket watch` at once.
 A `correction-ready` event retires as soon as a live dispatch record binds its round, and the same wake exists for an orchestrator-owned task and for changes requested on the aggregate.
 An interrupted decision transition derives one `unfinished-<verdict>` event naming the exact finishing command, read from the artifacts first and the journal second, as `applied_steps` does: a report left `changes-requested` with no next round, an applied decision over a report still submitted or blocked, or an in-progress journal.
 It goes to the reviewer in five-role runs and to the legacy orchestrator or split planner otherwise, and a transition whose owner lock is held is still running and derives nothing.
@@ -475,6 +477,15 @@ Each record is also appended to a user-level log (`~/.local/state/docket/feedbac
 docket appends machine observations of its own at the points that cost roles effort, at no model cost: a gate refusal, a prompt rebound after the task changed, a resume, and an exhausted correction budget.
 `docket feedback --digest` summarizes the log by role, category, and recurring item; the `none` reports are the denominator that shows which roles and stages run without friction.
 
+Each role's harness session is noted too, so its token usage and full conversation can be reviewed later without asking the agent for anything.
+When a role runs one of its own commands (`watch`, `arm`, `submit`, `verify`, `decide`, dispatch commands, `feedback --add`) inside a harness, docket appends that session to the run's `.harness-sessions.jsonl`.
+Claude Code and Codex name their session in every command's environment (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
+OpenCode names only its process (`OPENCODE_PID`), so its session is the one whose running shell call, in OpenCode's own database, is this very command; newest-session guesses are wrong whenever several sessions are open.
+Variables inherited from an unrelated session are never trusted: the harness process must be an ancestor of the docket process (`CLAUDE_PID`, `OPENCODE_PID`, or a `codex` process).
+`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) and prints tokens per role; `--archive` also copies each transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the usage there, and the final aggregate verdict archives automatically.
+`docket feedback --digest` then shows token usage by role across runs.
+Transcripts can hold secrets, so the copies stay in the user's own state directory with private permissions, never in the project; `DOCKET_SESSION_CAPTURE=off` disables noting sessions.
+
 Feedback is optional evidence, never a gate. Any role may record a short
 observation at its handoff (`docket feedback --add`); absent or failed
 feedback never blocks submission, blocking, handoff, approval, waiver, or
@@ -546,7 +557,10 @@ own record. `docket resume` checkpoints first - diff identity, last
 verification, session and model history, task and decision pointers - and the
 checkpoint is always mechanical: an automatic snapshot is never a ready
 semantic handoff, and abrupt loss without one still recovers through targeted
-discovery. `docket switch-model` walks the approved fallback list; past its
+discovery. The checkpoint records whether measured work exists (`work: none`,
+`changed`, or `unknown` when the evidence cannot be measured); a replacement for
+a worker that changed nothing renders the initial prompt, since there is nothing
+to rediscover. `docket switch-model` walks the approved fallback list; past its
 end, or past the spending tier, exactly one compact exception opens instead of
 silent higher-tier spend. An initial `docket dispatch --model` outside the
 approved list is refused through that same open exception before any record is
@@ -1252,10 +1266,10 @@ Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
 | gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | verification | `task_env`, `parse_framework_counts`, `run_verification` |
 | transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
-| five-role | `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `guard_correction_budget`, `open_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
+| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `guard_correction_budget`, `open_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
 | prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
-| feedback | `cmd_feedback`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
-| dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
+| feedback | `cmd_feedback`, `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
+| dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `resumable_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
 | amendments | `list_amendments`, `amendment_consumers`, `amendment_blocks`, `cmd_propose_amendment`, `cmd_amendment` |
 | packets | `task_coverage_row`, `packet_tokens`, `cmd_review_packet` |
 | metrics | `cmd_metrics`, `run_artifact_span` |

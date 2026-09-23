@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.agents/skills/docket/hooks/wake.sh",
+            "timeout": 28800,
+            "statusMessage": "waiting for a docket wake"
+          }
+        ]
+      }
+    ]
+  }
+}

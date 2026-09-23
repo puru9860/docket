@@ -11,6 +11,7 @@ import argparse
 import base64
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import inspect
 import json
@@ -4606,10 +4607,18 @@ def adopt_pending_payload(
 
 
 def announce_transition(a: argparse.Namespace, d: Path, rnd: int, verdict: str, dec: Path) -> None:
-    if verdict == "approved":
-        print(f"{a.owner} round {rnd} approved -> {dec.name}")
-    elif verdict == "waived":
-        print(f"{a.owner} round {rnd} waived -> {dec.name}")
+    if verdict in ("approved", "waived"):
+        print(f"{a.owner} round {rnd} {verdict} -> {dec.name}")
+        if a.owner == "orch":
+            # The run is settled: keep every role's conversation and token usage
+            # before harness retention can delete them. Never blocks the verdict.
+            try:
+                kept = [r for r in collect_run_usage(d, archive=True) if r["archive"]]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                kept = []
+            if kept:
+                print(f"archived {len(kept)} harness session(s) with token usage; "
+                      f"`docket usage {d.name}` shows them")
     else:
         nxt = d / f"{a.owner}-report-{rnd + 1:02d}.mdx"
         print(f"{a.owner} round {rnd} needs changes -> {dec.name}")
@@ -5789,6 +5798,19 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
                      f"{o} is BLOCKED at round {ornd} and needs a decision",
                      o, ornd, rev)
                 continue
+            # A delegated task's block reaches the reviewer once the
+            # orchestrator has routed it, with whatever answer it gave.
+            route = blocked_route(d, o, ornd) if ost == "blocked" else None
+            if route is not None:
+                rep = d / f"{o}-report-{ornd:02d}.mdx"
+                rev = evidence_digest(rep.read_text()) if rep.is_file() else ""
+                note = str(route.get("note", "") or "")
+                emit(f"{o}:{ornd}:blocked-routed",
+                     f"{o} round {ornd} is BLOCKED and routed to you: request changes that "
+                     f"carry the answer, or waive" + (f"; orchestrator answer: {note}" if note
+                                                       else ""),
+                     o, ornd, rev)
+                continue
             # As above, a failed verification on an executor: orchestrator
             # task still routes to the reviewer for required changes.
             if ost != "submitted" or o in exempt:
@@ -6015,11 +6037,15 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
             emit(f"{o}:handoff:{handoff_number}:ready",
                  f"{o} handoff checkpoint {handoff_number} is ready; resume with a replacement implementor",
                  o, rnd, rev)
-        if st == "blocked":
+        if st == "blocked" and not (is_five_role(d) and blocked_route(d, o, rnd)):
             rep = d / f"{o}-report-{rnd:02d}.mdx"
             rev = evidence_digest(rep.read_text()) if rep.is_file() else ""
-            emit(f"{o}:{rnd}:blocked", f"{o} is BLOCKED at round {rnd} and needs a decision",
-                 o, rnd, rev)
+            handoff = (f"; answer what is yours, then `docket route {d.name} --kind blocked "
+                       f"--owner {o}` wakes the "
+                       f"{'checker' if mode_of(d) == MODE_QUICK else 'reviewer'} to decide it"
+                       if is_five_role(d) else "")
+            emit(f"{o}:{rnd}:blocked",
+                 f"{o} is BLOCKED at round {rnd} and needs a decision{handoff}", o, rnd, rev)
         emit_correction_ready(
             o, f"{o} round {rnd} needs re-dispatch to an implementor for the requested correction")
 
@@ -6322,6 +6348,33 @@ def cmd_disarm(a: argparse.Namespace) -> None:
         print(f"  {r} {ro}")
 
 
+CODEX_HOUR_POLL_MS = 3_600_000
+
+
+def codex_poll_cap() -> int:
+    """The longest empty poll this Codex allows, from its `config.toml`."""
+    try:
+        import tomllib
+        with (codex_home() / "config.toml").open("rb") as fh:
+            value = tomllib.load(fh).get("background_terminal_max_timeout")
+    except (ImportError, OSError, ValueError):
+        value = None
+    return int(value) if isinstance(value, int) and value > 0 else 300_000
+
+
+def codex_wait_hint(role: str) -> str:
+    cap = codex_poll_cap()
+    if cap >= CODEX_HOUR_POLL_MS:
+        return (f"docket watch: waiting for {role} events. This Codex allows one-hour polls "
+                f"(background_terminal_max_timeout = {cap}): pass yield_time_ms: "
+                f"{CODEX_HOUR_POLL_MS} to every write_stdin and wait on this command. Each "
+                "return is a full model turn, so never poll in shorter windows.")
+    return (f"docket watch: waiting for {role} events. This Codex caps a poll at {cap} ms, so "
+            f"pass yield_time_ms: {cap} to every write_stdin and wait on this command. Add "
+            f"background_terminal_max_timeout = {CODEX_HOUR_POLL_MS} at the top of "
+            f"{codex_home() / 'config.toml'} for one turn per idle hour.")
+
+
 def cmd_watch(a: argparse.Namespace) -> None:
     """Block with no token cost until something needs a watched role, then exit 2.
 
@@ -6345,6 +6398,11 @@ def cmd_watch(a: argparse.Namespace) -> None:
         die("--role is required so one supervisor cannot consume another role's events")
     if a.run:
         require_preset_role(need_run(a.run), a.role)
+    if os.environ.get("DOCKET_WATCH_HOOK") != "1" and calling_harness() == "codex":
+        # Codex shows a command's first second of output to the model, then
+        # re-enters the model on every poll. Say how long one poll may be on
+        # this machine, right where the model decides it; a hook needs no line.
+        print(codex_wait_hint(a.role), file=sys.stderr, flush=True)
 
     def watched_pairs() -> list[tuple[str, str]]:
         if a.armed:
@@ -9145,8 +9203,51 @@ ROUTE_TABLE = {
                       "apply the numbered corrections, reverify, and return to the reviewer"),
     "plan-gap": ("planner", "explain the objective and contract gap in an amendment"),
     "waiver-request": ("reviewer", "decide the explicit waiver packet"),
+    "blocked": ("reviewer",
+                "decide the blocked round: request changes that carry the answer, or waive"),
     "spending-request": ("user", "the authorized budget owner decides outside policy spend"),
 }
+
+
+def routes_dir(d: Path) -> Path:
+    return d / ".routes"
+
+
+def blocked_route(d: Path, owner: str, rnd: int) -> dict[str, object] | None:
+    """The record handing owner's blocked round rnd to the reviewer, if any."""
+    path = routes_dir(d) / f"{owner}-{rnd:02d}-blocked.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def route_blocked(d: Path, run: str, owner: str, note: str) -> None:
+    """Hand an implementor's blocked round to the reviewer with a durable wake.
+
+    The orchestrator is woken for a block first, so it can answer what is its
+    own to answer; only the reviewer can settle the round. The record, not a
+    message typed into another session, is what wakes the reviewer, so a
+    reviewer waiting on `docket watch` is woken at once on every harness.
+    """
+    if not owner or owner == "orch":
+        die("--kind blocked needs --owner TASK; a blocked aggregate already wakes the reviewer")
+    if not is_five_role(d):
+        die(f"run {run} has no separate reviewer; decide the blocked round yourself")
+    with owner_lock(d, owner):
+        rnd, st = state_of(d, owner)
+        if st != "blocked":
+            die(f"{owner} round {rnd} is {st}, not blocked; nothing to route")
+        if task_executor(d, owner) == "orchestrator":
+            die(f"{owner} is executed by the orchestrator; its block already wakes the reviewer")
+        path = routes_dir(d) / f"{owner}-{rnd:02d}-blocked.json"
+        if not path.is_file():
+            routes_dir(d).mkdir(parents=True, exist_ok=True)
+            publish_json(path, {"owner": owner, "round": rnd, "kind": "blocked",
+                                "note": note.strip(), "routed_at": stamp()})
+    reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+    print(f"routed {owner} round {rnd} to the {reviewer}; its watcher is woken to decide it")
 
 
 def cmd_route(a: argparse.Namespace) -> None:
@@ -9154,6 +9255,9 @@ def cmd_route(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     if a.kind not in ROUTE_TABLE:
         die(f"unknown kind {a.kind!r}; use one of: {', '.join(sorted(ROUTE_TABLE))}")
+    if a.kind == "blocked":
+        route_blocked(d, a.run, a.owner or "", a.note or "")
+        return
     dest, action = ROUTE_TABLE[a.kind]
     owner = a.owner or ""
     pointer = ""
@@ -9265,6 +9369,7 @@ RENDERER_SOURCE_FUNCTIONS = (
     "raw_checkbox_lines",
     "ready_handoff",
     "latest_checkpoint",
+    "resumable_checkpoint",
     "decision_required_lines",
     "contract_path",
     "load_contract",
@@ -9619,6 +9724,25 @@ def latest_checkpoint(d: Path, owner: str) -> Path | None:
     return latest(paths)
 
 
+def resumable_checkpoint(d: Path, owner: str, rnd: int) -> Path | None:
+    """The latest checkpoint of round rnd that measured work, or None.
+
+    A replacement for a worker that never changed anything starts the round
+    fresh; only measured changes, or evidence that could not be measured,
+    make it a resume.
+    """
+    path = latest_checkpoint(d, owner)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return path
+    if str(data.get("round", rnd)) != str(rnd):
+        return None
+    return None if data.get("work") == "none" else path
+
+
 def decision_required_lines(d: Path, owner: str) -> tuple[Path | None, list[str]]:
     """Every numbered required change from the latest decision, verbatim.
 
@@ -9677,7 +9801,7 @@ def derive_stage(d: Path, owner: str) -> str:
             return "correction"
         if ready_handoff(d, owner) is not None:
             return "resume"
-        if latest_checkpoint(d, owner) is not None:
+        if resumable_checkpoint(d, owner, rnd) is not None:
             return "resume"
         if decs and rnd > 1:
             return "correction"
@@ -10267,6 +10391,573 @@ def machine_feedback(d: Path, category: str, owner: str, body: str,
                   "task": owner or "-", "round": str(rnd or "-"), "body": body})
 
 
+# ------------------------------------------------------------ harness sessions
+#
+# Which harness session played which role, so each role's token usage and full
+# conversation can be reviewed after a run. Claude Code and Codex name their
+# session in the environment of every command they run. OpenCode names only its
+# process, so its session is the one whose running shell call is this very
+# command. Environment inherited from an unrelated session is never trusted:
+# the harness process has to be an ancestor of this one.
+
+HARNESS_SESSION_LEDGER = ".harness-sessions.jsonl"
+SESSION_ROLE_COMMANDS = ("watch", "arm", "feedback", "submit", "handoff", "verify", "decide",
+                         "assign", "dispatch", "resume", "batch", "release")
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", "").strip() or Path.home() / ".claude")
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", "").strip() or Path.home() / ".codex")
+
+
+def opencode_db() -> Path:
+    base = os.environ.get("XDG_DATA_HOME", "").strip() or str(Path.home() / ".local" / "share")
+    return Path(base) / "opencode" / "opencode.db"
+
+
+def process_ancestors(limit: int = 48) -> list[tuple[int, str]] | None:
+    """(pid, command name) from the parent upward, or None when unreadable."""
+    chain: list[tuple[int, str]] = []
+    pid = os.getppid()
+    proc = Path("/proc")
+    for _ in range(limit):
+        if pid <= 0:
+            break
+        try:
+            if proc.is_dir():
+                comm = (proc / str(pid) / "comm").read_text().strip()
+                ppid = int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+            else:
+                out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                                     capture_output=True, text=True, timeout=5).stdout.split(None, 1)
+                ppid, comm = int(out[0]), Path(out[1].strip()).name
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return chain or None
+        chain.append((pid, comm))
+        if pid == 1:
+            break
+        pid = ppid
+    return chain
+
+
+def calling_harness() -> str:
+    """claude, codex, or opencode when that harness runs this command, else ''."""
+    env = os.environ
+    markers = (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"),
+               ("opencode", "OPENCODE_PID"))
+    candidates = [name for name, var in markers if env.get(var, "").strip()]
+    if not candidates:
+        return ""
+    chain = process_ancestors()
+    if chain is None:
+        return candidates[0] if len(candidates) == 1 else ""
+    # A harness that names its own process is matched by that pid alone, so a
+    # stale variable never attaches to an unrelated process of the same name.
+    claude_pid = env.get("CLAUDE_PID", "").strip()
+    for pid, comm in chain:
+        name = comm.lower()
+        if "claude" in candidates and (str(pid) == claude_pid if claude_pid
+                                       else name == "claude"):
+            return "claude"
+        if "opencode" in candidates and str(pid) == env.get("OPENCODE_PID", "").strip():
+            return "opencode"
+        if "codex" in candidates and name.startswith("codex"):
+            return "codex"
+    return ""
+
+
+def opencode_running_session(needles: list[str]) -> tuple[str, str]:
+    """The OpenCode session whose running shell call is this command, and its version."""
+    try:
+        import sqlite3
+    except ImportError:
+        return "", ""
+    db = opencode_db()
+    if not db.is_file():
+        return "", ""
+    since = int((time.time() - 3600) * 1000)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = con.execute(
+                "select p.session_id, p.data, p.time_updated, s.version from session s "
+                "join part p on p.session_id = s.id where s.time_updated >= ? "
+                "and p.time_updated >= ? and p.data like '%\"running\"%'",
+                (since, since)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return "", ""
+    best: tuple[str, int, str] | None = None
+    for sid, data, updated, version in rows:
+        try:
+            part = json.loads(data)
+        except ValueError:
+            continue
+        state = part.get("state") if isinstance(part, dict) else None
+        if not isinstance(state, dict) or part.get("type") != "tool" \
+                or state.get("status") != "running":
+            continue
+        command = str((state.get("input") or {}).get("command", ""))
+        if all(needle in command for needle in needles) and (best is None or updated > best[1]):
+            best = (str(sid), int(updated), str(version or ""))
+    return (best[0], best[2]) if best else ("", "")
+
+
+def harness_session(needles: list[str]) -> dict[str, str] | None:
+    """The harness session running this command, or None outside a known harness.
+
+    `DOCKET_SESSION_CAPTURE=off` disables detection entirely.
+    """
+    if os.environ.get("DOCKET_SESSION_CAPTURE", "").strip().lower() in ("off", "0", "no", "none"):
+        return None
+    harness = calling_harness()
+    if not harness:
+        return None
+    try:
+        ref = {"harness": harness, "cwd": os.getcwd()}
+    except OSError:
+        ref = {"harness": harness, "cwd": ""}
+    if harness == "claude":
+        ref["session_id"] = os.environ["CLAUDE_CODE_SESSION_ID"].strip()
+        version = Path(os.environ.get("CLAUDE_CODE_EXECPATH", "")).name
+    elif harness == "codex":
+        ref["session_id"] = os.environ["CODEX_THREAD_ID"].strip()
+        version = os.environ.get("CODEX_VERSION", "").strip()
+    else:
+        ref["session_id"], version = opencode_running_session(needles)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", ref["session_id"]):
+        return None
+    if version:
+        ref["version"] = version
+    return ref
+
+
+def note_harness_session(d: Path, role: str, owner: str,
+                         needles: list[str]) -> dict[str, str] | None:
+    """Append the calling session to the run's ledger once per role and task. Never raises."""
+    ref = harness_session(needles)
+    if not ref:
+        return None
+    entry = {"role": role, "owner": owner or "-", **ref}
+    identity = ("harness", "session_id", "role", "owner")
+    try:
+        with (d / HARNESS_SESSION_LEDGER).open("a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                for line in fh:
+                    try:
+                        seen = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(seen, dict) and all(seen.get(k) == entry[k] for k in identity):
+                        return ref
+                fh.write(json.dumps({"at": stamp(), **entry}, sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    return ref
+
+
+def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
+    """The role and task a command speaks for, or ('', '') when it names none."""
+    owner = str(getattr(a, "owner", "") or getattr(a, "task", "") or "")
+    if a.cmd in ("watch", "arm"):
+        return str(getattr(a, "role", "") or ""), ""
+    if a.cmd == "feedback":
+        return (str(a.role or ""), owner) if a.add else ("", "")
+    quick = mode_of(d) == MODE_QUICK
+    explicit = str(getattr(a, "as_role", "") or "")
+    if a.cmd in ("submit", "handoff"):
+        if explicit:
+            return explicit, owner
+        if owner == "orch":
+            return ("coordinator" if quick else "orchestrator"), owner
+        return "implementor", owner
+    if a.cmd == "verify":
+        return explicit or ("checker" if quick else "verifier"), owner
+    if a.cmd == "decide":
+        return explicit or ("checker" if quick else "reviewer"), owner
+    return ("coordinator" if quick else "orchestrator"), ""
+
+
+def note_command_session(a: argparse.Namespace) -> None:
+    """Record the calling harness session when a command speaks for a role."""
+    a.harness_session_ref = None
+    if a.cmd not in SESSION_ROLE_COMMANDS or not getattr(a, "run", ""):
+        return
+    try:
+        d = run_dir(a.run)
+        if not d.is_dir():
+            return
+        role, owner = command_session_role(a, d)
+    except SystemExit:
+        return
+    if role:
+        a.harness_session_ref = note_harness_session(d, role, owner, [a.run, a.cmd])
+
+
+def run_harness_sessions(d: Path) -> list[dict[str, object]]:
+    """Every harness session noted in a run, merged across the roles it played."""
+    try:
+        lines = (d / HARNESS_SESSION_LEDGER).read_text().splitlines()
+    except OSError:
+        return []
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or not entry.get("session_id"):
+            continue
+        key = (str(entry.get("harness", "")), str(entry["session_id"]))
+        ref = merged.setdefault(key, {"harness": key[0], "session_id": key[1], "roles": [],
+                                      "owners": [], "cwd": str(entry.get("cwd", "")),
+                                      "version": str(entry.get("version", "")),
+                                      "first_seen": str(entry.get("at", ""))})
+        for field, value in (("roles", entry.get("role")), ("owners", entry.get("owner"))):
+            if value and value != "-" and value not in ref[field]:
+                ref[field].append(str(value))
+    return list(merged.values())
+
+
+def session_transcripts(ref: dict[str, object]) -> list[Path]:
+    """A session's own transcript files, main first. OpenCode keeps its in a database."""
+    sid = str(ref.get("session_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid):
+        return []
+    if ref.get("harness") == "claude":
+        mains = sorted((claude_config_dir() / "projects").glob(f"*/{sid}.jsonl"))
+        if not mains:
+            return []
+        extra = mains[0].parent / sid
+        return [mains[0], *sorted(p for p in extra.rglob("*") if p.is_file())]
+    if ref.get("harness") == "codex":
+        home = codex_home()
+        found = sorted(home.glob(f"sessions/*/*/*/rollout-*-{sid}.jsonl"))
+        return (found or sorted(home.glob(f"archived_sessions/rollout-*-{sid}.jsonl")))[:1]
+    return []
+
+
+def empty_usage() -> dict[str, object]:
+    return {"found": False, "calls": 0, "input": 0, "cache_read": 0, "cache_write": 0,
+            "output": 0, "reasoning": 0, "total": 0, "cost": 0.0, "models": [],
+            "started": "", "ended": "", "harness_cwd": "", "transcript": ""}
+
+
+def _span(usage: dict[str, object], when: str) -> None:
+    if when:
+        usage["started"] = min(str(usage["started"]) or when, when)
+        usage["ended"] = max(str(usage["ended"]), when)
+
+
+def _jsonl(path: Path) -> list[dict]:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
+def claude_session_usage(files: list[Path]) -> dict[str, object]:
+    """Tokens from a Claude Code transcript and its subagents, one count per API message."""
+    usage = empty_usage()
+    counted: dict[str, dict] = {}
+    for path in (p for p in files if p.suffix == ".jsonl"):
+        for record in _jsonl(path):
+            _span(usage, str(record.get("timestamp", "") or ""))
+            if not usage["harness_cwd"] and record.get("cwd"):
+                usage["harness_cwd"] = str(record["cwd"])
+            message = record.get("message")
+            if record.get("type") != "assistant" or not isinstance(message, dict):
+                continue
+            model = str(message.get("model", "") or "")
+            if not model or model.startswith("<"):
+                continue
+            if model not in usage["models"]:
+                usage["models"].append(model)
+            if isinstance(message.get("usage"), dict):
+                key = f"{path.name}:{message.get('id') or record.get('uuid')}"
+                counted[key] = message["usage"]
+    for counts in counted.values():
+        usage["calls"] += 1
+        usage["input"] += int(counts.get("input_tokens") or 0)
+        usage["cache_write"] += int(counts.get("cache_creation_input_tokens") or 0)
+        usage["cache_read"] += int(counts.get("cache_read_input_tokens") or 0)
+        usage["output"] += int(counts.get("output_tokens") or 0)
+    usage["total"] = (usage["input"] + usage["cache_write"] + usage["cache_read"]
+                      + usage["output"])
+    return usage
+
+
+def codex_session_usage(files: list[Path]) -> dict[str, object]:
+    """Tokens from a Codex rollout: its last cumulative token count."""
+    usage = empty_usage()
+    last: dict = {}
+    for record in (r for path in files for r in _jsonl(path)):
+        _span(usage, str(record.get("timestamp", "") or ""))
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") == "session_meta" and payload.get("cwd"):
+            usage["harness_cwd"] = str(payload["cwd"])
+        elif record.get("type") == "turn_context" and payload.get("model"):
+            if payload["model"] not in usage["models"]:
+                usage["models"].append(str(payload["model"]))
+        elif (record.get("type") == "event_msg" and payload.get("type") == "token_count"
+              and isinstance(payload.get("info"), dict)):
+            usage["calls"] += 1
+            last = payload["info"].get("total_token_usage") or last
+    cached = int(last.get("cached_input_tokens") or 0)
+    written = int(last.get("cache_write_input_tokens") or 0)
+    usage["input"] = max(0, int(last.get("input_tokens") or 0) - cached - written)
+    usage["cache_read"], usage["cache_write"] = cached, written
+    usage["output"] = int(last.get("output_tokens") or 0)
+    usage["reasoning"] = int(last.get("reasoning_output_tokens") or 0)
+    usage["total"] = int(last.get("total_tokens") or 0)
+    return usage
+
+
+def opencode_session_rows(sid: str) -> dict[str, object] | None:
+    """An OpenCode session and its subagent sessions, read from OpenCode's database."""
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+    db = opencode_db()
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            sessions, frontier = [], [sid]
+            while frontier and len(sessions) < 256:
+                current = frontier.pop()
+                row = con.execute("select * from session where id = ?", (current,)).fetchone()
+                if row is None:
+                    continue
+                sessions.append(dict(row))
+                frontier += [r[0] for r in con.execute(
+                    "select id from session where parent_id = ?", (current,))]
+            if not sessions:
+                return None
+            messages = []
+            for session in sessions:
+                for message in con.execute(
+                        "select id, data from message where session_id = ? "
+                        "order by time_created, id", (session["id"],)):
+                    parts = [json.loads(p[0]) for p in con.execute(
+                        "select data from part where message_id = ? order by id",
+                        (message["id"],))]
+                    messages.append({"session": session["id"],
+                                     "info": json.loads(message["data"]), "parts": parts})
+        finally:
+            con.close()
+    except (sqlite3.Error, ValueError):
+        return None
+    return {"sessions": sessions, "messages": messages}
+
+
+def opencode_session_usage(rows: dict[str, object] | None) -> dict[str, object]:
+    """Tokens summed over an OpenCode session's assistant messages, subagents included."""
+    usage = empty_usage()
+    if not rows:
+        return usage
+    usage["harness_cwd"] = str(rows["sessions"][0].get("directory", "") or "")
+    for message in rows["messages"]:
+        info = message["info"] if isinstance(message.get("info"), dict) else {}
+        created = (info.get("time") or {}).get("created")
+        if isinstance(created, (int, float)):
+            _span(usage, stamp(created / 1000))
+        if info.get("role") != "assistant":
+            continue
+        tokens = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
+        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        usage["calls"] += 1
+        usage["input"] += int(tokens.get("input") or 0)
+        usage["output"] += int(tokens.get("output") or 0)
+        usage["reasoning"] += int(tokens.get("reasoning") or 0)
+        usage["cache_read"] += int(cache.get("read") or 0)
+        usage["cache_write"] += int(cache.get("write") or 0)
+        usage["total"] += int(tokens.get("total") or 0) or sum(
+            int(v or 0) for v in (tokens.get("input"), tokens.get("output"),
+                                  tokens.get("reasoning"), cache.get("read"), cache.get("write")))
+        usage["cost"] += float(info.get("cost") or 0)
+        model = "/".join(str(v) for v in (info.get("providerID"), info.get("modelID")) if v)
+        if model and model not in usage["models"]:
+            usage["models"].append(model)
+    return usage
+
+
+def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path], object]:
+    """Usage, transcript files, and OpenCode rows for one noted session."""
+    if ref.get("harness") == "opencode":
+        rows = opencode_session_rows(str(ref.get("session_id", "")))
+        usage = opencode_session_usage(rows)
+        usage["found"] = rows is not None
+        usage["transcript"] = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
+        return usage, [], rows
+    files = session_transcripts(ref)
+    usage = (claude_session_usage if ref.get("harness") == "claude"
+             else codex_session_usage)(files)
+    usage["found"] = bool(files)
+    usage["transcript"] = str(files[0]) if files else ""
+    return usage, files, None
+
+
+def opencode_export(sid: str) -> bytes | None:
+    """`opencode export` of one session, or None when OpenCode cannot export it."""
+    binary = shutil.which("opencode")
+    if not binary or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid):
+        return None
+    try:
+        done = subprocess.run([binary, "export", sid], capture_output=True, timeout=120)
+        data = json.loads(done.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode or not isinstance(data, dict) or "info" not in data:
+        return None
+    return done.stdout
+
+
+def session_archive_root() -> Path | None:
+    """Where session transcripts are kept: beside the user-level feedback log."""
+    log = feedback_log_path()
+    return None if log is None else log.parent / "sessions"
+
+
+def _gzip_to(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    with gzip.open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+
+
+def archive_session(d: Path, ref: dict[str, object], usage: dict[str, object],
+                    files: list[Path], rows: object) -> Path | None:
+    """Copy one session's transcript and usage under the archive root; None if disabled.
+
+    Transcripts can hold secrets, so the copies stay in a private directory in
+    the user's own state, never in the project.
+    """
+    base = session_archive_root()
+    if base is None or not usage.get("found"):
+        return None
+    project = re.sub(r"[^A-Za-z0-9._-]+", "-", str(root())).strip("-") or "project"
+    label = "-".join(part for part in (
+        "+".join(ref.get("roles") or ["unknown"]), "+".join(ref.get("owners") or []),
+        str(ref.get("harness")), str(ref.get("session_id"))[:16]) if part)
+    target = base / project / d.name / re.sub(r"[^A-Za-z0-9+._-]+", "-", label)
+    for directory in (base, base / project, base / project / d.name, target):
+        directory.mkdir(exist_ok=True, mode=0o700)
+    if rows is not None:
+        # `opencode export` is the format `opencode import` loads back; the raw
+        # database rows are kept only when the export is unavailable.
+        exported = opencode_export(str(ref.get("session_id")))
+        if exported is None:
+            _gzip_to(target / "opencode-session.json.gz",
+                     json.dumps(rows, indent=1, sort_keys=True).encode())
+        else:
+            _gzip_to(target / "opencode-export.json.gz", exported)
+            for child in rows["sessions"][1:]:
+                child_export = opencode_export(str(child.get("id")))
+                if child_export is not None:
+                    _gzip_to(target / "subagents" / f"{child.get('id')}.json.gz", child_export)
+    elif files:
+        _gzip_to(target / "transcript.jsonl.gz", files[0].read_bytes())
+        for extra in files[1:]:
+            relative = extra.relative_to(files[0].parent / str(ref.get("session_id")))
+            _gzip_to(target / "subagents-and-tools" / f"{relative}.gz", extra.read_bytes())
+    publish_json(target / "usage.json", {**ref, **usage, "run": d.name,
+                                          "archived_at": stamp()})
+    return target
+
+
+def collect_run_usage(d: Path, archive: bool) -> list[dict[str, object]]:
+    """Usage per noted session; archiving also copies transcripts and logs usage."""
+    out = []
+    for ref in run_harness_sessions(d):
+        usage, files, rows = session_usage(ref)
+        target = None
+        if archive:
+            try:
+                target = archive_session(d, ref, usage, files, rows)
+            except OSError:
+                target = None
+            if usage["found"]:
+                log_feedback({"origin": "usage", "run": d.name,
+                              "role": "+".join(ref["roles"]) or "unknown",
+                              "task": "+".join(ref["owners"]) or "-",
+                              "harness": ref["harness"], "session_id": ref["session_id"],
+                              "cwd": ref["cwd"], "archive": str(target or ""),
+                              **{k: v for k, v in usage.items() if k != "found"}})
+        out.append({**ref, **usage, "archive": str(target or "")})
+    return out
+
+
+def tokens_h(count: object) -> str:
+    n = int(count or 0)
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}k" if n < 1_000_000 else f"{n / 1_000_000:.2f}M"
+
+
+def cmd_usage(a: argparse.Namespace) -> None:
+    """Token usage per role, read from each harness session's own transcript."""
+    d = need_run(a.run)
+    rows = collect_run_usage(d, a.archive)
+    if a.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    if not rows:
+        print(f"run {a.run}: no harness session noted yet. Sessions are noted when a role "
+              "runs its own docket commands inside Claude Code, Codex, or OpenCode")
+        return
+    total = sum(int(r["total"]) for r in rows)
+    print(f"run {a.run}: {len(rows)} harness session(s), {tokens_h(total)} tokens processed")
+    print(f"  {'role':<14} {'task':<8} {'harness':<9} {'calls':>6} {'input':>8} "
+          f"{'cache rd':>9} {'cache wr':>9} {'output':>8} {'total':>9}  model")
+    for r in sorted(rows, key=lambda r: (",".join(r["roles"]), ",".join(r["owners"]))):
+        roles = "+".join(r["roles"]) or "unknown"
+        task = "+".join(r["owners"]) or "-"
+        if not r["found"]:
+            print(f"  {roles:<14} {task:<8} {r['harness']:<9} transcript not found "
+                  f"for session {r['session_id']}")
+            continue
+        print(f"  {roles:<14} {task:<8} {r['harness']:<9} {r['calls']:>6} "
+              f"{tokens_h(r['input']):>8} {tokens_h(r['cache_read']):>9} "
+              f"{tokens_h(r['cache_write']):>9} {tokens_h(r['output']):>8} "
+              f"{tokens_h(r['total']):>9}  {', '.join(r['models']) or '-'}")
+    by_role: dict[str, list[int]] = {}
+    for r in rows:
+        by_role.setdefault("+".join(r["roles"]) or "unknown", []).append(int(r["total"]))
+    print("  by role: " + "; ".join(f"{role} {tokens_h(sum(v))} ({len(v)})"
+                                    for role, v in sorted(by_role.items())))
+    for r in rows:
+        print(f"  {r['harness']} {r['session_id']}: "
+              f"{r['transcript'] or 'no transcript'}")
+    archived = [r["archive"] for r in rows if r["archive"]]
+    if archived:
+        print(f"archived {len(archived)} session(s) under {Path(archived[0]).parent}")
+    elif a.archive:
+        print("nothing archived: the user-level feedback log is off, or no transcript was found")
+
+
 def cmd_feedback_digest(a: argparse.Namespace) -> None:
     """Summarize the user-level feedback log: where docket costs roles effort."""
     path = Path(a.log).expanduser() if a.log else feedback_log_path()
@@ -10288,6 +10979,8 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
     def quiet(record: dict) -> bool:
         return str(record.get("body", "")).strip().lower().rstrip(".") in ("none", "")
 
+    usage = [r for r in records if r.get("origin") == "usage"]
+    records = [r for r in records if r.get("origin") != "usage"]
     agent = [r for r in records if r.get("origin") != "machine"]
     machine = [r for r in records if r.get("origin") == "machine"]
     projects = {str(r.get("project", "")) for r in records}
@@ -10296,6 +10989,24 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
           f"{len(projects)} project(s) - {path}")
     print(f"  agent reports: {len(agent)} ({sum(1 for r in agent if quiet(r))} said none); "
           f"machine observations: {len(machine)}")
+    latest: dict[tuple[str, str, str, str], dict] = {}
+    for record in usage:
+        key = tuple(str(record.get(k, "")) for k in ("project", "run", "harness", "session_id"))
+        latest[key] = record
+    if latest:
+        print("\ntoken usage by role (latest archive of each harness session)")
+        by_role: dict[str, list[dict]] = {}
+        for record in latest.values():
+            by_role.setdefault(str(record.get("role", "?")), []).append(record)
+        for role, items in sorted(by_role.items()):
+            total = sum(int(r.get("total") or 0) for r in items)
+            runs_seen = {(r.get("project"), r.get("run")) for r in items}
+            models = sorted({m for r in items for m in (r.get("models") or [])})
+            print(f"  {role:<14} {len(items)} session(s) in {len(runs_seen)} run(s): "
+                  f"{tokens_h(total)} total, {tokens_h(total // len(items))} per session, "
+                  f"{sum(int(r.get('calls') or 0) for r in items)} calls, "
+                  f"{tokens_h(sum(int(r.get('output') or 0) for r in items))} output"
+                  + (f" ({', '.join(models)})" if models else ""))
     by_role: dict[str, list[dict]] = {}
     for record in agent:
         by_role.setdefault(str(record.get("role", "?")), []).append(record)
@@ -10389,6 +11100,15 @@ def cmd_feedback(a: argparse.Namespace) -> None:
         observed = str(dispatch.get("model_observed", "") or "")
         a.model = observed if observed not in ("", "unobserved") else str(
             dispatch.get("model_requested", "") or "")
+    # The calling harness session points at the full conversation behind the
+    # report, so the report can be checked against what actually happened.
+    ref = getattr(a, "harness_session_ref", None) or {}
+    if ref and not a.harness:
+        a.harness = " ".join(v for v in (ref["harness"], ref.get("version", "")) if v)
+    transcript = ""
+    if ref:
+        usage, _files, _rows = session_usage(ref)
+        transcript = str(usage.get("transcript", ""))
     meta = {"id": fid, "author_role": a.role or "unknown",
             "category": a.category or "other",
             "run": a.run, "task": a.task or "-", "round": a.round or "-",
@@ -10399,6 +11119,10 @@ def cmd_feedback(a: argparse.Namespace) -> None:
             "evidence_paths": a.evidence or "-",
             "confidence": a.confidence or "low",
             "observed_at": stamp()}
+    if ref:
+        meta.update({"session": f"{ref['harness']}:{ref['session_id']}",
+                     "session_cwd": ref.get("cwd", "") or "-",
+                     "transcript": transcript or "-"})
     text = render(meta, body + "\n")
     try:
         feedback_dir(d).mkdir(parents=True, exist_ok=True)
@@ -10409,7 +11133,9 @@ def cmd_feedback(a: argparse.Namespace) -> None:
     log_feedback({"origin": a.origin, "run": a.run, "id": fid, "role": meta["author_role"],
                   "category": meta["category"], "task": meta["task"], "round": meta["round"],
                   "model": meta["model"], "harness": meta["harness"],
-                  "prompt_digest": meta["prompt_digest"], "body": body})
+                  "prompt_digest": meta["prompt_digest"], "body": body,
+                  **({"session_id": ref["session_id"], "cwd": ref.get("cwd", ""),
+                      "transcript": transcript} if ref else {})})
     print(f"recorded observation {fid} ({meta['category']})")
 
 
@@ -13195,9 +13921,9 @@ def write_checkpoint(d: Path, owner: str, semantic_handoff: str = "no") -> Path:
         rnd, _ = state_of(d, owner)
     except (OSError, ValueError):
         rnd = 0
-    detail, changed = "", []
+    coverage, detail, changed = COVERAGE_UNAVAILABLE, "", []
     try:
-        _cov, detail, changed, _outside = assignment_evidence(d, owner)
+        coverage, detail, changed, _outside = assignment_evidence(d, owner)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
@@ -13218,6 +13944,9 @@ def write_checkpoint(d: Path, owner: str, semantic_handoff: str = "no") -> Path:
         "round": rnd,
         "diff_identity": digest_of(("\n".join(sorted(changed))).encode()),
         "diff_detail": detail,
+        # Measured work decides whether a replacement resumes or starts fresh;
+        # unmeasured evidence is never read as "nothing was done".
+        "work": ("changed" if changed else "none") if coverage == COVERAGE_AVAILABLE else "unknown",
         "last_verification": str((frozen or {}).get("digest", "")) or "none",
         "session_history": session_history,
         "model_history": dispatch.get("model_history", []) if dispatch else [],
@@ -13350,8 +14079,12 @@ def cmd_resume(a: argparse.Namespace) -> None:
             machine_feedback(d, "recovery", a.owner,
                              f"round moved to a replacement session: {a.reason or 'no reason given'}")
             print(f"resumed {a.owner} round {rnd} -> session {a.session}")
-            print(f"checkpoint {checkpoint.name} is mechanical (semantic_handoff: no); "
-                  "the replacement discovers from the task, scope, and diff")
+            if resumable_checkpoint(d, a.owner, rnd) is None:
+                print(f"checkpoint {checkpoint.name} measured no work; the replacement "
+                      "starts the round fresh")
+            else:
+                print(f"checkpoint {checkpoint.name} is mechanical (semantic_handoff: no); "
+                      "the replacement discovers from the task, scope, and diff")
             if prompt_file is not None:
                 print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
                       "the replacement")
@@ -13710,6 +14443,7 @@ def main() -> None:
     q.add_argument("--kind", required=True,
                    help=f"one of: {', '.join(sorted(ROUTE_TABLE))}")
     q.add_argument("--owner", default="", help="the affected task, when there is one")
+    q.add_argument("--note", default="", help="with --kind blocked: the answer you already gave")
     q.set_defaults(fn=cmd_route)
 
     q = sub.add_parser("migrate", help="migrate a run to five-role-v1 explicitly")
@@ -13763,6 +14497,13 @@ def main() -> None:
     q.add_argument("--confidence", default="low",
                    choices=["low", "medium", "high"])
     q.set_defaults(fn=cmd_feedback)
+
+    q = sub.add_parser("usage", help="token usage per role from each harness session transcript")
+    q.add_argument("run")
+    q.add_argument("--archive", action="store_true",
+                   help="copy each transcript to the user-level state directory and log its usage")
+    q.add_argument("--json", action="store_true", help="print machine-readable rows")
+    q.set_defaults(fn=cmd_usage)
 
     q = sub.add_parser("improvements", help="list and advance the improvement backlog")
     q.add_argument("--add", action="store_true", help="record a cross-run finding")
@@ -14071,6 +14812,7 @@ def main() -> None:
     q.set_defaults(fn=cmd_help)
 
     a = p.parse_args()
+    note_command_session(a)
     a.fn(a)
 
 

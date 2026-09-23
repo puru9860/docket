@@ -337,7 +337,17 @@ docket feedback --digest              # friction by role, category, and recurrin
 docket feedback --digest --since 2026-10-01
 ```
 
-`DOCKET_FEEDBACK_LOG=path` moves the log and `DOCKET_FEEDBACK_LOG=off` disables it; feedback never blocks a run.
+Docket also notes each role's harness session (Claude Code, Codex, or OpenCode) whenever the role runs its own docket commands, so token usage per role and the full conversation behind any report can be reviewed later:
+
+```bash
+docket usage R01              # tokens per role and session, read from each harness transcript
+docket usage R01 --archive    # also keep a copy of every transcript and log its usage
+```
+
+The final aggregate verdict archives automatically, into `~/.local/state/docket/sessions/` beside the log, with private permissions because transcripts can hold secrets.
+The digest then reports token usage by role across runs.
+
+`DOCKET_FEEDBACK_LOG=path` moves the log and `DOCKET_FEEDBACK_LOG=off` disables it and the archive; `DOCKET_SESSION_CAPTURE=off` stops noting sessions; feedback never blocks a run.
 
 ## Terminal layout
 

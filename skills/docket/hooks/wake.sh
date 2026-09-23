@@ -39,4 +39,5 @@ cd "$ROOT" || exit 0
 DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
 
 # Watch only this session's role. The CLI atomically claims matching events.
-exec "$DOCKET" watch --armed --role "$DOCKET_ROLE" --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"
+DOCKET_WATCH_HOOK=1 exec "$DOCKET" watch --armed --role "$DOCKET_ROLE" \
+  --timeout "${DOCKET_WATCH_TIMEOUT:-28800}"

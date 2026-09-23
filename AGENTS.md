@@ -141,6 +141,14 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
   wakes the checker instead of the coordinator.
 - `docket resume` refuses a recorded model the current plan policy no longer approves.
   Pass `--model` with an approved one; a resume is a new launch, not a continuation.
+- A blocked implementor round wakes the orchestrator, not the reviewer, until the
+  orchestrator runs `docket route --kind blocked`. It may own the answer; the route
+  record is what hands the verdict to the reviewer.
+- A `docket resume` of a round whose worker changed nothing renders the initial
+  prompt, not the resume one. Its checkpoint measured no work to rediscover.
+- `docket usage` shows no session for a role that never ran a docket command inside
+  its harness, and ignores harness variables whose process is not an ancestor.
+  Guessing the newest session would attribute another session's tokens.
 - A task assigned with an unmet `--depends-on` has no task baseline until it is
   dispatched. That is deliberate: its baseline must include the dependency's approved
   work, and it is still captured once, before its own dispatch, and never recaptured.

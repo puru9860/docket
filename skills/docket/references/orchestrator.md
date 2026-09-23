@@ -156,6 +156,8 @@ verification resolves, so the wake always has verified work to route to the
 reviewer. With explicit closed batches, readiness follows closed membership and
 explicit dependencies instead. Blockers, scope collisions, replacement handoffs,
 and stall incidents remain immediate.
+A blocked implementor round wakes you first, so you can answer what is yours to answer; only the reviewer can settle the round.
+Hand it over with `docket route <run> --kind blocked --owner T01 --note TEXT`, which wakes the reviewer durably, instead of prompting its session.
 Do not wait on `herdr agent wait`, `herdr agent prompt ... --wait`, or a `sleep` loop.
 They return when an agent goes idle or a timer fires, not when the lifecycle needs you, and every return is a full-context model turn.
 On Codex a blocking call is sliced into polls, so raise `background_terminal_max_timeout` and poll with a long `yield_time_ms`, as the signalling table says.

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -18,6 +21,10 @@ from pathlib import Path
 # can be demonstrated failing against the previous implementation before it ships.
 DOCKET = Path(os.environ.get("DOCKET_BIN") or Path(__file__).parents[1] / "bin" / "docket")
 HOOK = Path(__file__).parents[1] / "hooks" / "wake.sh"
+# Variables a harness gives the commands it runs. A suite run inside a harness
+# strips them so docket never notes that harness's own session as a test role.
+HARNESS_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+               "OPENCODE_PID", "OPENCODE")
 
 
 def _docket_constant(name: str) -> str:
@@ -55,8 +62,10 @@ class DocketCLI(unittest.TestCase):
         self._feedback_log = os.environ.get("DOCKET_FEEDBACK_LOG")
         self._feedback_tmp = tempfile.TemporaryDirectory()
         os.environ["DOCKET_FEEDBACK_LOG"] = str(Path(self._feedback_tmp.name) / "feedback.jsonl")
+        self._harness_env = {k: os.environ.pop(k) for k in HARNESS_ENV if k in os.environ}
 
     def tearDown(self) -> None:
+        os.environ.update(self._harness_env)
         if self._feedback_log is None:
             os.environ.pop("DOCKET_FEEDBACK_LOG", None)
         else:
@@ -8394,6 +8403,36 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("T01-scope.mdx", out)
         self.assertIn("docket diff demo T01", out)
 
+    def test_resume_of_an_untouched_round_starts_it_fresh(self) -> None:
+        """A replacement for a worker that changed nothing gets the initial prompt."""
+        self.repo()
+        self.cli("init", "demo", "--harness", "claude", "--topology", "split",
+                 "--workflow", "five-role-v1", "--evidence-mode", "git",
+                 "--root", f"root={self.root}")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.assign_simple(run, "T01")
+        for sid in ("w1", "w2", "w3"):
+            self.cli("session", "demo", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        resumed = self.cli("resume", "demo", "T01", "--session", "w2",
+                           "--reason", "never started")
+        self.assertIn("measured no work", resumed.stdout)
+        first = json.loads((run / ".checkpoints" / "T01-01.json").read_text())
+        self.assertEqual("none", first["work"])
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: initial", out)
+        self.assertNotIn("mechanical checkpoint", out)
+        (self.root / "src" / "t01.py").write_text("started = True\n")
+        resumed = self.cli("resume", "demo", "T01", "--session", "w3",
+                           "--reason", "killed mid-work")
+        self.assertIn("is mechanical", resumed.stdout)
+        second = json.loads((run / ".checkpoints" / "T01-02.json").read_text())
+        self.assertEqual("changed", second["work"])
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: resume", out)
+        self.assertIn("T01-02.json", out)
+
     def test_t61_required_documents_describe_quick_roles_and_mandatory_contract(self) -> None:
         """Architecture and playbooks name quick roles and mandatory sections without em dashes."""
         repo = Path(DOCKET).parents[3]
@@ -9545,6 +9584,31 @@ class DocketCLI(unittest.TestCase):
         self.cli("verify", "batched", "T01", "--result", "pass", "--as", "verifier")
         self.assertEqual(["batch:B1:ready:1"], self.derived_keys("batched", "orchestrator"))
 
+    def test_a_routed_block_wakes_the_checker_to_decide_it(self) -> None:
+        """A block wakes the coordinator; routing it hands the verdict to the checker durably."""
+        run = self.init5_in("rb", mode="quick")
+        self.assign_simple_in(run, "rb", "T01")
+        self.cli("dispatch", "rb", "T01", "--session", "w1", "--register")
+        early = self.cli("route", "rb", "--kind", "blocked", "--owner", "T01", ok=False)
+        self.assertIn("round 1 is draft, not blocked", early.stderr)
+        self.fill_task_report(run / "T01-report-01.mdx", blocked=True)
+        self.cli("submit", "rb", "T01", "--blocked", "--as", "implementor")
+        self.assertEqual(["T01:1:blocked"], self.derived_keys("rb", "coordinator"))
+        self.assertIn("`docket route rb --kind blocked --owner T01` wakes the checker",
+                      self.cli("events", "rb", "--role", "coordinator", "--peek").stdout)
+        self.assertEqual([], self.derived_keys("rb", "checker"))
+        routed = self.cli("route", "rb", "--kind", "blocked", "--owner", "T01",
+                          "--note", "keep the default port")
+        self.assertIn("routed T01 round 1 to the checker", routed.stdout)
+        self.assertEqual([], self.derived_keys("rb", "coordinator"))
+        self.assertEqual(["T01:1:blocked-routed"], self.derived_keys("rb", "checker"))
+        self.assertIn("orchestrator answer: keep the default port",
+                      self.cli("events", "rb", "--role", "checker", "--peek").stdout)
+        self.cli("decide", "rb", "T01", "--waive", "--reason", "accepted as documented",
+                 "--as", "checker")
+        self.assertEqual([], self.derived_keys("rb", "checker"))
+        self.assertTrue(self.derived_keys("rb", "coordinator")[0].startswith("all:decided:"))
+
     def test_every_open_lifecycle_state_wakes_a_supervisor(self) -> None:
         """No owner and state combination is left with every supervising role asleep."""
         standard = ("planner", "orchestrator", "verifier", "reviewer")
@@ -9927,6 +9991,256 @@ class DocketCLI(unittest.TestCase):
 
 
     # ---------------- feedback embedded in every run
+
+    def fake_claude_session(self) -> tuple[dict[str, str], Path]:
+        """A Claude Code config dir holding one transcript and one subagent transcript."""
+        sid = "0c1d2e3f-aaaa-bbbb-cccc-000000000001"
+        home = Path(self._feedback_tmp.name) / "claude-home"
+        transcript = home / "projects" / "-work-project" / f"{sid}.jsonl"
+        subagent = transcript.parent / sid / "subagents" / "agent-1.jsonl"
+        subagent.parent.mkdir(parents=True)
+
+        def turn(mid: str, model: str, counts: tuple[int, int, int, int], at: str) -> str:
+            usage = dict(zip(("input_tokens", "cache_creation_input_tokens",
+                              "cache_read_input_tokens", "output_tokens"), counts))
+            return json.dumps({"type": "assistant", "timestamp": at, "cwd": "/work/project",
+                               "message": {"id": mid, "model": model, "usage": usage}})
+        transcript.write_text("\n".join([
+            json.dumps({"type": "user", "timestamp": "2026-09-23T01:00:00Z",
+                        "cwd": "/work/project", "message": {"role": "user", "content": "go"}}),
+            turn("m1", "claude-opus-5-5", (10, 100, 1000, 5), "2026-09-23T01:00:05Z"),
+            # One API message spans several transcript lines; it is counted once.
+            turn("m1", "claude-opus-5-5", (10, 100, 1000, 5), "2026-09-23T01:00:06Z"),
+            turn("m2", "claude-opus-5-5", (20, 0, 1100, 7), "2026-09-23T01:00:10Z"),
+            turn("m3", "<synthetic>", (0, 0, 0, 0), "2026-09-23T01:00:11Z"),
+        ]) + "\n")
+        subagent.write_text(turn("s1", "claude-haiku-4-5", (1, 0, 50, 2),
+                                 "2026-09-23T01:00:08Z") + "\n")
+        env = {"CLAUDE_CODE_SESSION_ID": sid, "CLAUDE_PID": str(os.getpid()),
+               "CLAUDE_CONFIG_DIR": str(home),
+               "CLAUDE_CODE_EXECPATH": "/opt/claude/versions/9.9.9"}
+        return env, transcript
+
+    def test_role_sessions_are_noted_with_usage_and_archived_transcripts(self) -> None:
+        """A role's harness session is noted once; usage and archives come from its transcript."""
+        run = self.init5()
+        env, transcript = self.fake_claude_session()
+        sid = env["CLAUDE_CODE_SESSION_ID"]
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        self.cli_env(env, "feedback", "demo", "--add", "--role", "orchestrator",
+                     "--category", "waiting", "--body", "none")
+        ledger = [json.loads(line) for line in
+                  (run / ".harness-sessions.jsonl").read_text().splitlines()]
+        self.assertEqual([("orchestrator", "-", "claude", sid, "9.9.9")],
+                         [(e["role"], e["owner"], e["harness"], e["session_id"], e["version"])
+                          for e in ledger])
+        observation = next(run.rglob("F01.mdx")).read_text()
+        self.assertIn(f"session: claude:{sid}", observation)
+        self.assertIn("harness: claude 9.9.9", observation)
+        self.assertIn(f"transcript: {transcript}", observation)
+        self.assertIn(f"session_cwd: {self.root}", observation)
+
+        [row] = json.loads(self.cli_env(env, "usage", "demo", "--json").stdout)
+        self.assertEqual((3, 31, 100, 2150, 14, 2295),
+                         tuple(row[k] for k in ("calls", "input", "cache_write", "cache_read",
+                                                "output", "total")))
+        self.assertEqual(["claude-opus-5-5", "claude-haiku-4-5"], row["models"])
+        self.assertEqual("/work/project", row["harness_cwd"])
+        self.assertEqual("", row["archive"])
+
+        shown = self.cli_env(env, "usage", "demo", "--archive").stdout
+        self.assertIn("orchestrator", shown)
+        self.assertIn("2.3k", shown)
+        self.assertIn("archived 1 session(s)", shown)
+        archive = Path(self._feedback_tmp.name) / "sessions"
+        [kept] = list(archive.rglob("transcript.jsonl.gz"))
+        self.assertEqual(transcript.read_bytes(), gzip.decompress(kept.read_bytes()))
+        self.assertEqual(1, len(list(archive.rglob("agent-1.jsonl.gz"))))
+        self.assertEqual(2295, json.loads((kept.parent / "usage.json").read_text())["total"])
+        self.assertEqual(0o700, stat.S_IMODE(kept.parent.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(kept.stat().st_mode))
+        log = Path(os.environ["DOCKET_FEEDBACK_LOG"]).read_text().splitlines()
+        usage = [r for r in map(json.loads, log) if r.get("origin") == "usage"]
+        self.assertEqual([("orchestrator", sid, 2295)],
+                         [(r["role"], r["session_id"], r["total"]) for r in usage])
+        digest = self.cli("feedback", "--digest").stdout
+        self.assertIn("token usage by role", digest)
+        self.assertIn("orchestrator   1 session(s) in 1 run(s): 2.3k total", digest)
+        self.assertIn("agent reports: 1 (1 said none)", digest)
+
+    def test_inherited_harness_variables_note_no_session(self) -> None:
+        """Variables inherited from a harness that is not an ancestor are ignored."""
+        run = self.init5()
+        ledger = run / ".harness-sessions.jsonl"
+        for env in ({"CLAUDE_CODE_SESSION_ID": "stale-session", "CLAUDE_PID": "4194000"},
+                    {"OPENCODE_PID": "4194001"},
+                    {"CLAUDE_CODE_SESSION_ID": "live", "CLAUDE_PID": str(os.getpid()),
+                     "DOCKET_SESSION_CAPTURE": "off"}):
+            self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+            self.assertFalse(ledger.exists(), env)
+        self.assertIn("no harness session noted yet", self.cli("usage", "demo").stdout)
+
+    def test_codex_session_is_noted_through_its_process(self) -> None:
+        """A Codex thread is noted from its variable, proven by a codex ancestor process."""
+        run = self.init5()
+        tid = "01a0cc39-0000-7471-b60c-92c1c2dd9522"
+        home = Path(self._feedback_tmp.name) / "codex-home"
+        rollout = (home / "sessions" / "2026" / "09" / "23"
+                   / f"rollout-2026-09-23T08-49-49-{tid}.jsonl")
+        rollout.parent.mkdir(parents=True)
+
+        def count(total: tuple[int, int, int, int, int]) -> dict:
+            keys = ("input_tokens", "cached_input_tokens", "output_tokens",
+                    "reasoning_output_tokens", "total_tokens")
+            return {"type": "event_msg", "timestamp": "2026-09-23T03:00:05Z",
+                    "payload": {"type": "token_count",
+                                "info": {"total_token_usage": dict(zip(keys, total))}}}
+        rollout.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "session_meta", "timestamp": "2026-09-23T03:00:00Z",
+             "payload": {"id": tid, "cwd": "/work/project"}},
+            {"type": "turn_context", "payload": {"model": "gpt-x"}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
+            count((1000, 800, 50, 10, 1050)),
+            count((3000, 2500, 120, 30, 3120)),
+        ]) + "\n")
+        wrapper = Path(self._feedback_tmp.name) / "bin" / "codex"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(sys.executable)
+        env = {**os.environ, "CODEX_THREAD_ID": tid, "CODEX_HOME": str(home),
+               "CODEX_VERSION": "0.1.0"}
+        launch = ("import subprocess, sys; sys.exit(subprocess.run([sys.executable, "
+                  f"{str(DOCKET)!r}, 'arm', 'demo', '--role', 'orchestrator']).returncode)")
+        subprocess.run([str(wrapper), "-c", launch], cwd=self.root, env=env, check=True,
+                       capture_output=True, text=True)
+        [entry] = [json.loads(line) for line in
+                   (run / ".harness-sessions.jsonl").read_text().splitlines()]
+        self.assertEqual(("codex", tid, "0.1.0"),
+                         (entry["harness"], entry["session_id"], entry["version"]))
+        [row] = json.loads(self.cli_env({"CODEX_HOME": str(home)}, "usage", "demo",
+                                        "--json").stdout)
+        self.assertEqual((2, 500, 2500, 120, 30, 3120, ["gpt-x"], "/work/project"),
+                         tuple(row[k] for k in ("calls", "input", "cache_read", "output",
+                                                "reasoning", "total", "models",
+                                                "harness_cwd")))
+        self.assertEqual(str(rollout), row["transcript"])
+
+    def test_codex_watch_says_how_long_one_poll_may_be(self) -> None:
+        """Under Codex the watcher names the one-hour poll; hooks and other harnesses get nothing."""
+        self.init5()
+        self.cli("arm", "demo", "--role", "orchestrator")
+        wrapper = Path(self._feedback_tmp.name) / "bin" / "codex"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(sys.executable)
+        launch = ("import subprocess, sys; sys.exit(subprocess.run([sys.executable, "
+                  f"{str(DOCKET)!r}, 'watch', 'demo', '--role', 'orchestrator', "
+                  "'--timeout', '1']).returncode)")
+
+        home = Path(self._feedback_tmp.name) / "codex-home"
+        home.mkdir()
+
+        def watched(extra: dict[str, str]) -> str:
+            env = {**os.environ, "CODEX_THREAD_ID": "01a0cc39-0000-7471-b60c-92c1c2dd9522",
+                   "CODEX_HOME": str(home), **extra}
+            return subprocess.run([str(wrapper), "-c", launch], cwd=self.root, env=env,
+                                  capture_output=True, text=True).stderr
+        default = watched({})
+        self.assertIn("caps a poll at 300000 ms, so pass yield_time_ms: 300000", default)
+        self.assertIn("background_terminal_max_timeout = 3600000", default)
+        (home / "config.toml").write_text('model = "x"\nbackground_terminal_max_timeout = 3600000\n')
+        raised = watched({})
+        self.assertIn("allows one-hour polls", raised)
+        self.assertIn("pass yield_time_ms: 3600000", raised)
+        self.assertNotIn("yield_time_ms", watched({"DOCKET_WATCH_HOOK": "1"}))
+        plain = self.cli("watch", "demo", "--role", "orchestrator", "--timeout", "1", ok=False)
+        self.assertNotIn("yield_time_ms", plain.stderr)
+
+    def test_opencode_session_is_the_one_running_this_command(self) -> None:
+        """OpenCode names no session, so docket finds the one whose shell call it is."""
+        run = self.init5()
+        data = Path(self._feedback_tmp.name) / "xdg-data"
+        db = data / "opencode" / "opencode.db"
+        db.parent.mkdir(parents=True)
+        now = int(time.time() * 1000)
+        con = sqlite3.connect(db)
+        con.executescript(
+            "create table session (id text primary key, parent_id text, directory text, "
+            "version text, time_updated integer);"
+            "create table message (id text primary key, session_id text, "
+            "time_created integer, data text);"
+            "create table part (id text primary key, message_id text, session_id text, "
+            "time_updated integer, data text);")
+
+        def running(command: str) -> str:
+            return json.dumps({"type": "tool", "tool": "bash",
+                               "state": {"status": "running", "input": {"command": command}}})
+        con.executemany("insert into session values (?, ?, ?, ?, ?)", [
+            ("ses_other", None, "/elsewhere", "1.0.0", now),
+            ("ses_mine", None, "/work/project", "1.18.32", now),
+            ("ses_child", "ses_mine", "/work/project", "1.18.32", now)])
+        con.executemany("insert into message values (?, ?, ?, ?)", [
+            ("msg_u", "ses_mine", now - 3, json.dumps({"role": "user", "time": {"created": now}})),
+            ("msg_a", "ses_mine", now - 2, json.dumps({
+                "role": "assistant", "providerID": "deepseek", "modelID": "flash",
+                "cost": 0.01, "time": {"created": now},
+                "tokens": {"total": 1300, "input": 100, "output": 50, "reasoning": 150,
+                           "cache": {"read": 1000, "write": 0}}})),
+            ("msg_c", "ses_child", now - 1, json.dumps({
+                "role": "assistant", "providerID": "deepseek", "modelID": "flash",
+                "tokens": {"input": 10, "output": 5, "reasoning": 0,
+                           "cache": {"read": 100, "write": 0}}}))])
+        con.executemany("insert into part values (?, ?, ?, ?, ?)", [
+            ("prt_o", "msg_o", "ses_other", now,
+             running("docket feedback elsewhere --add --role implementor")),
+            ("prt_m", "msg_a", "ses_mine", now,
+             running(f"{DOCKET} feedback demo --add --role implementor --task T01"))])
+        con.commit()
+        con.close()
+        fake = Path(self._feedback_tmp.name) / "bin" / "opencode"
+        fake.parent.mkdir()
+        fake.write_text("#!/bin/sh\n[ \"$1\" = export ] || exit 1\n"
+                        "printf '{\"info\": {\"id\": \"%s\"}, \"messages\": []}\\n' \"$2\"\n")
+        fake.chmod(0o755)
+        env = {"OPENCODE_PID": str(os.getpid()), "XDG_DATA_HOME": str(data),
+               "PATH": f"{fake.parent}{os.pathsep}{os.environ['PATH']}"}
+        self.cli_env(env, "feedback", "demo", "--add", "--role", "implementor", "--task", "T01",
+                     "--category", "other", "--body", "none")
+        [entry] = [json.loads(line) for line in
+                   (run / ".harness-sessions.jsonl").read_text().splitlines()]
+        self.assertEqual(("implementor", "T01", "opencode", "ses_mine", "1.18.32"),
+                         (entry["role"], entry["owner"], entry["harness"], entry["session_id"],
+                          entry["version"]))
+        [row] = json.loads(self.cli_env(env, "usage", "demo", "--archive", "--json").stdout)
+        self.assertEqual((2, 110, 55, 150, 1100, 1415, ["deepseek/flash"], "/work/project"),
+                         tuple(row[k] for k in ("calls", "input", "output", "reasoning",
+                                                "cache_read", "total", "models",
+                                                "harness_cwd")))
+        self.assertAlmostEqual(0.01, row["cost"])
+        kept = Path(row["archive"])
+        self.assertEqual({"info": {"id": "ses_mine"}, "messages": []},
+                         json.loads(gzip.decompress((kept / "opencode-export.json.gz")
+                                                    .read_bytes())))
+        self.assertTrue((kept / "subagents" / "ses_child.json.gz").is_file())
+        # Without a working export the database rows are kept instead.
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        [row] = json.loads(self.cli_env(env, "usage", "demo", "--archive", "--json").stdout)
+        rows = json.loads(gzip.decompress(
+            (Path(row["archive"]) / "opencode-session.json.gz").read_bytes()))
+        self.assertEqual(["ses_mine", "ses_child"], [s["id"] for s in rows["sessions"]])
+
+    def test_final_aggregate_verdict_archives_every_noted_session(self) -> None:
+        """Settling the run keeps each noted session's transcript before retention drops it."""
+        run = self.setup_aggregate_run()
+        env, _transcript = self.fake_claude_session()
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        self.assign("orch", executor="orchestrator")
+        self.fill_orch_report(run / "orch-report-01.mdx")
+        self.cli("submit", "demo", "orch", "--skip-verify")
+        decided = self.cli_env({"CLAUDE_CONFIG_DIR": env["CLAUDE_CONFIG_DIR"]},
+                               "decide", "demo", "orch", "--approve")
+        self.assertIn("archived 1 harness session(s)", decided.stdout)
+        archive = Path(self._feedback_tmp.name) / "sessions"
+        self.assertEqual(1, len(list(archive.rglob("transcript.jsonl.gz"))))
 
     def test_every_role_prompt_asks_for_feedback_and_it_accumulates(self) -> None:
         """Roles record what docket cost them; records reach the user-level log and digest."""

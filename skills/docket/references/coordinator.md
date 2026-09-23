@@ -24,7 +24,7 @@ Verified work wakes the checker directly, so you are woken only for these:
 | Wake | What to do |
 | --- | --- |
 | `correction-ready` | `docket dispatch R01 T01 --session impl-1 --agent impl-1 --register`, then send the new prompt file to the implementor |
-| `blocked` | answer a planning question yourself; a waiver or changes belong to the checker, so prompt the checker to decide that round |
+| `blocked` | answer what is yours to answer (a task decision, a sequencing change), then `docket route R01 --kind blocked --owner T01 --note TEXT`: it wakes the checker, which owns the waiver or changes |
 | scope collision, handoff ready, stall | sequence the work, or `docket resume R01 T01 --session NEW --register` with the handoff |
 | `all:decided` | write the aggregate report, below |
 | `unfinished-*` or a correction for the aggregate | run the command the wake names |
@@ -37,6 +37,8 @@ docket submit R01 orch --as coordinator
 ```
 
 Fill every section of `orch-report-01.mdx` between those two commands; the checker then decides the aggregate.
+Its approval archives every role's harness transcript with its token usage.
+When you are done, record what docket cost you with `docket feedback R01 --add --role coordinator`, then run `docket usage R01 --archive` so the archive includes your own final turns.
 
 ```bash
 docket prompt <run> <owner> --role coordinator

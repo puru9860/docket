@@ -7,6 +7,7 @@ It first performs the verifier duty: challenge whether the evidence proves accep
 The generated prompt carries the mandatory contract: relevant constraints from the plan, the task, Existing decisions and Discovery constraints, not Out of scope alone. Mandatory material is never truncated to fit a guidance budget and is reported in the mandatory size. For detail, read `references/verifier.md` and `references/reviewer.md` on demand; the prompt never concatenates those playbooks.
 
 On each wake, run `docket status <run>` once, read the round with `docket bundle <run> <owner>`, record the verification, then decide it; a wake for the aggregate needs only the decision, and `docket review-packet <run> --role reviewer` gathers its evidence.
+A `blocked-routed` wake is a blocked round the coordinator has answered what it could and routed to you: there is nothing to verify, so request changes that carry the answer, or waive.
 
 ```bash
 docket verify <run> <owner> --result pass|fail|uncertain --as checker --verifier checker --detail "1. finding with evidence"

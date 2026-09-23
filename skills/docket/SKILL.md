@@ -80,7 +80,8 @@ harness. Never wait with `herdr agent wait`, `--wait`, or a `sleep` loop: they r
 on idle and timers, and every return is a full-context turn. When woken, run
 `docket status R01` once, act, and wait again. `docket help coordinator` covers
 corrections and the final aggregate report. When the run ends, record what docket
-cost you: `docket feedback R01 --add --role coordinator --category <kind> --body TEXT`.
+cost you: `docket feedback R01 --add --role coordinator --category <kind> --body TEXT`,
+then `docket usage R01 --archive` keeps every role's transcript and token usage.
 
 ## Read your playbook
 
