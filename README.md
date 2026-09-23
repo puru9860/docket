@@ -351,6 +351,24 @@ docket usage R01 --archive    # also keep a copy of every transcript and log its
 The final aggregate verdict archives automatically, into `~/.local/state/docket/sessions/` beside the log, with private permissions because transcripts can hold secrets.
 The digest then reports token usage by role across runs.
 
+### Per-model learning
+
+Every time a task's work is rejected, docket records a case about the model that did it: a submit refused by the gate, a failed verification, requested changes (with the checker's numbered required changes), a block, or an escalation.
+Verdicts are recorded too, so every rate has a denominator.
+Review them periodically and turn what recurs into a short profile for that model:
+
+```bash
+docket models                              # scorecard per model: first-pass rate, rounds, rejects, tokens
+docket models --review deepseek/deepseek-flash   # evidence packet: new cases since the last review
+docket models --adopt profile.md           # install the reviewed profile for that model
+docket models --import                     # once per project: backfill cases from existing runs
+```
+
+Hand the review packet to a strong session ("review this docket model packet and draft the profile"); it ends with the exact format and rules.
+A rule is kept only when cases from at least two tasks support it, and raw cases never enter prompts.
+An adopted profile lives in `~/.config/docket/model-profiles/` (`DOCKET_MODEL_PROFILES` moves it), survives skill updates, and is carried by every later prompt for a task assigned with that exact `--model`.
+Prompts record the profile revision they carried, so the next review shows each model's first-pass rate per profile revision, and the feedback digest says when a model has enough new cases to review.
+
 `DOCKET_FEEDBACK_LOG=path` moves the log and `DOCKET_FEEDBACK_LOG=off` disables it and the archive; `DOCKET_SESSION_CAPTURE=off` stops noting sessions; feedback never blocks a run.
 
 ## Terminal layout

@@ -63,9 +63,16 @@ class DocketCLI(unittest.TestCase):
         self._feedback_tmp = tempfile.TemporaryDirectory()
         os.environ["DOCKET_FEEDBACK_LOG"] = str(Path(self._feedback_tmp.name) / "feedback.jsonl")
         self._harness_env = {k: os.environ.pop(k) for k in HARNESS_ENV if k in os.environ}
+        # Profiles the user adopted must never shape a test's prompts.
+        self._profiles = os.environ.get("DOCKET_MODEL_PROFILES")
+        os.environ["DOCKET_MODEL_PROFILES"] = str(Path(self._feedback_tmp.name) / "profiles")
 
     def tearDown(self) -> None:
         os.environ.update(self._harness_env)
+        if self._profiles is None:
+            os.environ.pop("DOCKET_MODEL_PROFILES", None)
+        else:
+            os.environ["DOCKET_MODEL_PROFILES"] = self._profiles
         if self._feedback_log is None:
             os.environ.pop("DOCKET_FEEDBACK_LOG", None)
         else:
@@ -10388,6 +10395,94 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("archived 1 harness session(s)", decided.stdout)
         archive = Path(self._feedback_tmp.name) / "sessions"
         self.assertEqual(1, len(list(archive.rglob("transcript.jsonl.gz"))))
+
+    def test_reject_cases_become_a_reviewed_profile_for_that_model(self) -> None:
+        """Cases accumulate per model; a reviewed profile then rides every later prompt."""
+        run = self.init5_in("ml", mode="quick")
+
+        def through_a_correction(owner: str, finding: str, gate: bool = False) -> None:
+            self.assign_simple_in(run, "ml", owner)
+            self.cli("dispatch", "ml", owner, "--session", f"w-{owner}", "--register")
+            self.cli("set-model", "ml", owner, "--actual", "acme/coder-1 (Acme Coder)")
+            report = run / f"{owner}-report-01.mdx"
+            if gate:
+                report.write_text(report.read_text() + "\nTODO: finish\n")
+                self.cli("submit", "ml", owner, "--as", "implementor", ok=False)
+                report.write_text(report.read_text().replace("\nTODO: finish\n", "\n"))
+            for rnd in (1, 2):
+                self.fill_task_report(run / f"{owner}-report-{rnd:02d}.mdx",
+                                      files=f"- `src/{owner.lower()}.py:1` - implemented.")
+                self.cli("submit", "ml", owner, "--as", "implementor")
+                if rnd == 1:
+                    self.cli("verify", "ml", owner, "--result", "fail", "--as", "checker",
+                             "--detail", finding)
+                    self.request_changes(run, "ml", owner, reviewer="checker")
+            self.cli("verify", "ml", owner, "--result", "pass", "--as", "checker",
+                     "--detail", "1. fixed")
+            self.cli("decide", "ml", owner, "--approve", "--as", "checker", "--reason", "holds")
+
+        through_a_correction("T01", "1. empty input raises instead of returning 0", gate=True)
+        through_a_correction("T02", "1. empty input crashes the parser")
+        scorecard = self.cli("models").stdout
+        self.assertIn("acme/coder-1: 2 task(s), 0/2 first-pass, 2.0 rounds to accept, "
+                      "rejects: decision 2, gate 1, verification 2", scorecard)
+        self.assertIn("review due: acme/coder-1 has 5 new reject case(s)", scorecard)
+        self.assertIn("run `docket models --review acme/coder-1`",
+                      self.cli("feedback", "--digest").stdout)
+        packet = self.cli("models", "--review", "acme/coder-1").stdout
+        self.assertIn("## 5 reject case(s) since the start", packet)
+        self.assertIn("empty input crashes the parser", packet)
+        self.assertIn("### Submit refused by the gate (1)", packet)
+        self.assertIn("profile: model-acme-coder-1", packet)
+        self.assertIn("evidence_tasks: 2", packet)
+        through = re.search(r"^reviewed_through: (\S+)$", packet, re.M).group(1)
+
+        draft = Path(self._feedback_tmp.name) / "draft.md"
+        draft.write_text("---\nprofile: acme\nmodels: acme/coder-1\nversion: 1\ncard: false\n"
+                         f"reviewed_through: {through}\n---\n\n- Handle empty input first.\n")
+        refused = self.cli("models", "--adopt", str(draft), ok=False)
+        self.assertIn("profile must be model-<slug>", refused.stderr)
+        draft.write_text(draft.read_text().replace("profile: acme", "profile: model-acme-coder-1"))
+        adopted = self.cli("models", "--adopt", str(draft))
+        self.assertIn("adopted model-acme-coder-1 version 1", adopted.stdout)
+        self.assertTrue((Path(os.environ["DOCKET_MODEL_PROFILES"]) / "model-acme-coder-1.md")
+                        .is_file())
+
+        self.assign_simple_in(run, "ml", "T03")
+        carried = self.cli("prompt", "ml", "T03", "--role", "implementor",
+                           "--model", "acme/coder-1").stdout
+        self.assertIn("[model-acme-coder-1]", carried)
+        self.assertIn("Handle empty input first.", carried)
+        other = self.cli("prompt", "ml", "T03", "--role", "implementor",
+                         "--model", "acme/coder-2").stdout
+        self.assertNotIn("Handle empty input first.", other)
+        self.assertIn("## 0 reject case(s) since " + through,
+                      self.cli("models", "--review", "acme/coder-1").stdout)
+        self.assertIn("profile: model-acme-coder-1 v1", self.cli("models").stdout)
+        log = [json.loads(line) for line in
+               Path(os.environ["DOCKET_FEEDBACK_LOG"]).read_text().splitlines()]
+        self.assertEqual(["model-acme-coder-1"],
+                         [r["profile"] for r in log if r.get("origin") == "profile"])
+
+    def test_runs_from_before_outcomes_can_be_imported_once(self) -> None:
+        """Existing verdicts and findings backfill the log; a second import adds nothing."""
+        run = self.init5_in("old", mode="quick")
+        self.assign_simple_in(run, "old", "T01")
+        self.cli("dispatch", "old", "T01", "--session", "w1", "--register")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace("requested_model: ", "requested_model: acme/old-1", 1))
+        self.fill_task_report(run / "T01-report-01.mdx", files="- `src/t01.py:1` - done.")
+        self.cli("submit", "old", "T01", "--as", "implementor")
+        self.cli("verify", "old", "T01", "--result", "fail", "--as", "checker",
+                 "--detail", "1. off by one")
+        self.request_changes(run, "old", "T01", reviewer="checker")
+        Path(os.environ["DOCKET_FEEDBACK_LOG"]).unlink()
+        first = self.cli("models", "--import").stdout
+        self.assertIn("imported 2 outcome case(s) from old", first)
+        self.assertIn("imported 0 outcome case(s) from old", self.cli("models", "--import", "old").stdout)
+        self.assertIn("acme/old-1: 1 task(s), no decided task yet, 0.0 rounds to accept, "
+                      "rejects: decision 1, verification 1", self.cli("models").stdout)
+        self.assertIn("off by one", self.cli("models", "--review", "acme/old-1").stdout)
 
     def test_every_role_prompt_asks_for_feedback_and_it_accumulates(self) -> None:
         """Roles record what docket cost them; records reach the user-level log and digest."""

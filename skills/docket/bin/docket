@@ -4247,6 +4247,8 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
     if problems:
         # A refused submit is the implementor's own check before handoff:
         # nothing was returned to it, so it is recorded, never charged.
+        record_outcome(d, a.owner, meta.get("round", "?"), "gate", "refused",
+                       "\n".join(problems), rep.name)
         machine_feedback(d, "verification", a.owner,
                          "submit refused by the gate: " + problems[0].splitlines()[0],
                          role=a.as_role or "implementor")
@@ -4325,6 +4327,9 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
         "completed": "completed; recorded without a redundant handoff",
         "submitted": "submitted for review",
     }[meta["status"]]
+    if meta["status"] == "blocked":
+        record_outcome(d, a.owner, meta.get("round", "?"), "submit", "blocked",
+                       sections(parse(rep.read_text())[1]).get("Decisions needed", ""), rep.name)
     print(f"\n{rep.name}: {verdict}")
 
 
@@ -4645,6 +4650,13 @@ def adopt_pending_payload(
 
 
 def announce_transition(a: argparse.Namespace, d: Path, rnd: int, verdict: str, dec: Path) -> None:
+    try:
+        dsecs = sections(parse(dec.read_text())[1])
+    except (OSError, ValueError):
+        dsecs = {}
+    record_outcome(d, a.owner, rnd, "decision", verdict,
+                   dsecs.get("Required changes", "") if verdict == "changes-requested"
+                   else dsecs.get("Reason", ""), dec.name)
     if verdict in ("approved", "waived"):
         print(f"{a.owner} round {rnd} {verdict} -> {dec.name}")
         if a.owner == "orch":
@@ -9074,6 +9086,7 @@ def open_escalation(d: Path, owner: str, record: dict, why: str) -> dict:
     record["escalated"] = entry["id"]
     publish_json(corrections_path(d, owner), record)
     publish_json(path, entry)
+    record_outcome(d, owner, state_of(d, owner)[0], "escalation", "opened", why, path.name)
     machine_feedback(d, "review", owner, f"correction budget exhausted: {why}")
     return entry
 
@@ -9183,6 +9196,8 @@ def cmd_verify(a: argparse.Namespace) -> None:
                 "opened_correction": "requested" if opening else "no",
                 **artifact_policy_fields(d)}
         publish(path, render(meta, body))
+        record_outcome(d, a.owner, rnd, "verification", a.result,
+                       sections(body).get("Findings", ""), path.name)
         if a.result == "fail":
             if refused_policy:
                 die("verifier-triggered corrections need `verifier_correction: allowed` in "
@@ -9369,6 +9384,8 @@ def open_verifier_correction(a: argparse.Namespace, d: Path, rnd: int,
         publish(vpath, render(vmeta, vbody))
     commit_transition(a, d, rnd, "changes-requested", rep, report_meta, report_body,
                       dec, decision_meta, decision_body)
+    record_outcome(d, a.owner, rnd, "decision", "changes-requested",
+                   sections(decision_body).get("Required changes", ""), dec.name)
     print(f"{a.owner} round {rnd} needs changes (verifier-triggered) -> {dec.name}")
 
 
@@ -9564,6 +9581,9 @@ RENDERER_SOURCE_FUNCTIONS = (
     "ready_handoff",
     "latest_checkpoint",
     "resumable_checkpoint",
+    "user_profiles_dir",
+    "profile_path",
+    "normalized_model",
     "decision_required_lines",
     "contract_path",
     "load_contract",
@@ -9616,9 +9636,29 @@ def profiles_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "references" / "model-profiles"
 
 
+def user_profiles_dir() -> Path:
+    """Reviewed per-model profiles the user adopted, kept outside the skill.
+
+    A skill update replaces the skill's own tree, so learned per-model
+    instructions live in the user's config and apply in every project.
+    `DOCKET_MODEL_PROFILES` names another directory.
+    """
+    override = os.environ.get("DOCKET_MODEL_PROFILES", "").strip()
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip() or str(Path.home() / ".config")
+    return Path(base) / "docket" / "model-profiles"
+
+
+def profile_path(name: str) -> Path:
+    """Where a profile's bytes live: the user's adopted copy wins over the skill's."""
+    user = user_profiles_dir() / f"{name}.md"
+    return user if user.is_file() else profiles_dir() / f"{name}.md"
+
+
 def read_profile(name: str) -> tuple[dict[str, str], str]:
     """One reviewed profile: flat frontmatter plus guidance body."""
-    path = profiles_dir() / f"{name}.md"
+    path = profile_path(name)
     if not path.is_file():
         return {}, ""
     try:
@@ -9642,7 +9682,7 @@ def list_cards() -> list[str]:
 
 
 def profile_revision(name: str) -> str:
-    path = profiles_dir() / f"{name}.md"
+    path = profile_path(name)
     try:
         data = path.read_bytes()
     except OSError:
@@ -9658,10 +9698,11 @@ def match_model_profile(model: str) -> str:
     only when it equals the whole requested model string. A name that merely
     contains another name never selects.
     """
-    want = (model or "").strip().lower()
+    want = normalized_model(model).lower()
     if not want:
         return ""
-    for path in sorted(profiles_dir().glob("*.md")):
+    user = sorted(user_profiles_dir().glob("*.md")) if user_profiles_dir().is_dir() else []
+    for path in [*user, *sorted(profiles_dir().glob("*.md"))]:
         try:
             meta, _ = parse(path.read_text())
         except (OSError, ValueError):
@@ -10368,6 +10409,8 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         "renderer_revision": renderer_revision(),
         "source_revisions": source_revisions,
         "profile_revisions": profile_revisions,
+        "model_profile": (profile_revision(chosen_profile)
+                          if chosen_profile and chosen_profile in chosen_names else ""),
         "selected_guidance": selected_guidance,
         "rejected_guidance": rejected,
         "guidance_tokens": guidance_tokens,
@@ -11155,6 +11198,356 @@ def cmd_usage(a: argparse.Namespace) -> None:
         print("nothing archived: the user-level feedback log is off, or no transcript was found")
 
 
+
+# ------------------------------------------------------------ per-model learning
+#
+# Every rejection of an executor's work is a case about the model that did it:
+# a refused submit, a failed verification, requested changes, a block, an
+# escalation. Verdicts are recorded too, so rates have a denominator. Cases
+# accumulate in the user-level log across projects; a periodic review turns the
+# recurring ones into a short per-model profile that every later prompt for
+# that model carries. Raw cases never enter prompts, only reviewed rules.
+
+REJECT_CASES = (("gate", "refused"), ("verification", "fail"),
+                ("decision", "changes-requested"), ("submit", "blocked"),
+                ("escalation", "opened"))
+
+
+def normalized_model(value: str) -> str:
+    """A model id without a display suffix: `x/y (Some Name)` becomes `x/y`."""
+    return re.split(r"\s+\(", (value or "").strip(), maxsplit=1)[0].strip()
+
+
+def task_model(d: Path, owner: str) -> tuple[str, str, str]:
+    """(model, harness, model profile revision) that executed owner's current round."""
+    dispatch = read_dispatch(d, owner) or {}
+    observed = str(dispatch.get("model_observed", "") or "")
+    model = observed if observed not in ("", "unobserved", "unknown") else ""
+    harness = ""
+    try:
+        tmeta, _ = parse((d / f"{owner}-task.mdx").read_text())
+        model = model or str(tmeta.get("actual_model", "") or tmeta.get("requested_model", ""))
+        harness = str(tmeta.get("harness", "") or "")
+    except (OSError, ValueError):
+        pass
+    model = model or str(dispatch.get("model_requested", "") or "")
+    return (normalized_model(model) or "unknown", harness or "-",
+            str(dispatch.get("model_profile", "") or ""))
+
+
+def record_outcome(d: Path, owner: str, rnd: object, kind: str, result: str,
+                   text: str = "", pointer: str = "") -> None:
+    """Append one outcome case about the model that executed owner. Never raises."""
+    if owner == "orch":
+        return
+    try:
+        model, harness, profile = task_model(d, owner)
+        log_feedback({"origin": "outcome", "run": d.name, "task": owner, "round": str(rnd),
+                      "kind": kind, "result": result, "model": model, "harness": harness,
+                      "model_profile": profile or "-", "executor": task_executor(d, owner),
+                      "text": re.sub(r"<!--.*?-->", "", text or "", flags=re.S).strip()[:4000],
+                      "pointer": pointer})
+    except (OSError, ValueError, SystemExit):
+        return
+
+
+def import_run_outcomes(d: Path) -> int:
+    """Backfill outcome cases from a run's verification and decision artifacts.
+
+    Runs from before outcomes were recorded still hold the verdicts and
+    findings; importing them gives the first review real history. A case
+    already in the log is never recorded twice.
+    """
+    log = feedback_log_path()
+    try:
+        project = str(root())
+    except SystemExit:
+        project = ""
+    known = {(r.get("project"), r.get("run"), r.get("task"), r.get("pointer"))
+             for r in outcome_records(log) if r.get("origin") == "outcome"}
+    added = 0
+    for owner in (o for o in owners(d) if o != "orch"):
+        try:
+            tmeta, _ = parse((d / f"{owner}-task.mdx").read_text())
+        except (OSError, ValueError):
+            tmeta = {}
+        artifacts = [("verification", p) for p in _ordered(d.glob(f"{owner}-verification-*.mdx"))]
+        artifacts += [("decision", p) for p in _ordered(d.glob(f"{owner}-decision-*.mdx"))]
+        for kind, path in artifacts:
+            if (project, d.name, owner, path.name) in known:
+                continue
+            try:
+                meta, body = parse(path.read_text())
+            except (OSError, ValueError):
+                continue
+            result = str(meta.get("result" if kind == "verification" else "verdict", ""))
+            if kind == "decision" and meta.get("applied") != "yes":
+                continue
+            if not result:
+                continue
+            rnd = str(meta.get("round", "?"))
+            try:
+                rmeta, _ = parse((d / f"{owner}-report-{int(rnd):02d}.mdx").read_text())
+            except (OSError, ValueError):
+                rmeta = {}
+            model = normalized_model(str(rmeta.get("actual_model", "") or tmeta.get("actual_model", "")
+                                         or rmeta.get("requested_model", "")
+                                         or tmeta.get("requested_model", "")))
+            secs = sections(body)
+            text = (secs.get("Findings", "") if kind == "verification" else
+                    secs.get("Required changes", "") if result == "changes-requested"
+                    else secs.get("Reason", ""))
+            log_feedback({"origin": "outcome", "run": d.name, "task": owner, "round": rnd,
+                          "kind": kind, "result": result, "model": model or "unknown",
+                          "harness": str(tmeta.get("harness", "") or "-"),
+                          "model_profile": "-", "executor": task_executor(d, owner),
+                          "text": re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()[:4000],
+                          "pointer": path.name, "imported": True,
+                          "at_source": stamp(path.stat().st_mtime)})
+            added += 1
+    return added
+
+
+def outcome_records(path: Path | None, since: str = "") -> list[dict]:
+    if path is None or not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("origin") in ("outcome", "usage", "profile") \
+                and (not since or str(record.get("at", "")) >= since):
+            out.append(record)
+    return out
+
+
+def is_reject(record: dict) -> bool:
+    return (record.get("kind"), record.get("result")) in REJECT_CASES
+
+
+def model_scorecard(records: list[dict], model: str) -> dict[str, object]:
+    """Tasks, first-pass rate, rounds to accept, reject counts, and tokens for one model."""
+    tasks: dict[tuple, dict] = {}
+    rejects: dict[str, int] = {}
+    for r in records:
+        if r.get("origin") != "outcome" or r.get("model") != model:
+            continue
+        key = (r.get("project"), r.get("run"), r.get("task"))
+        task = tasks.setdefault(key, {"changes": 0, "accepted": 0, "profile": ""})
+        if is_reject(r):
+            rejects[str(r.get("kind"))] = rejects.get(str(r.get("kind")), 0) + 1
+        if r.get("kind") == "decision":
+            if r.get("result") == "changes-requested":
+                task["changes"] += 1
+            elif r.get("result") in ("approved", "waived"):
+                task["accepted"] = int(str(r.get("round", "0")) or 0) if \
+                    str(r.get("round", "")).isdigit() else 1
+                task["profile"] = str(r.get("model_profile", "-"))
+    decided = [t for t in tasks.values() if t["accepted"]]
+    tokens = sum(int(r.get("total") or 0) for r in records
+                 if r.get("origin") == "usage" and model in (r.get("models") or []))
+    by_profile: dict[str, list[dict]] = {}
+    for t in decided:
+        by_profile.setdefault(t["profile"] or "-", []).append(t)
+    return {
+        "tasks": len(tasks), "decided": len(decided),
+        "first_pass": sum(1 for t in decided if not t["changes"]),
+        "rounds": (sum(t["accepted"] for t in decided) / len(decided)) if decided else 0.0,
+        "rejects": rejects, "tokens": tokens,
+        "by_profile": {name: (len(items), sum(1 for t in items if not t["changes"]))
+                       for name, items in by_profile.items()},
+    }
+
+
+def adopted_profile(model: str) -> tuple[str, dict[str, str]]:
+    """The user's adopted profile name and frontmatter for a model, if any."""
+    name = match_model_profile(model)
+    if not name or not (user_profiles_dir() / f"{name}.md").is_file():
+        return "", {}
+    return name, read_profile(name)[0]
+
+
+def model_slug(model: str) -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", normalized_model(model).lower()).strip("-") or "model"
+
+
+def pending_reviews(records: list[dict]) -> list[tuple[str, int, str]]:
+    """(model, new reject cases, reviewed_through) for models with cases since review."""
+    out = []
+    for model in sorted({str(r.get("model")) for r in records
+                         if r.get("origin") == "outcome" and r.get("model") not in ("", "unknown")}):
+        _, meta = adopted_profile(model)
+        through = str(meta.get("reviewed_through", "") or "")
+        fresh = [r for r in records if r.get("origin") == "outcome" and r.get("model") == model
+                 and is_reject(r) and str(r.get("at", "")) > through]
+        if fresh:
+            out.append((model, len(fresh), through))
+    return out
+
+
+def cmd_models(a: argparse.Namespace) -> None:
+    """Per-model scorecards, a review packet of new reject cases, or adopting a profile."""
+    if a.adopt:
+        adopt_model_profile(Path(a.adopt).expanduser())
+        return
+    if a.import_runs is not None:
+        runs_root = root() / STATE_DIR / "runs"
+        names = a.import_runs
+        if not names and runs_root.is_dir():
+            names = sorted(path.name for path in runs_root.iterdir() if path.is_dir())
+        total = 0
+        for name in names:
+            added = import_run_outcomes(need_run(name))
+            total += added
+            print(f"imported {added} outcome case(s) from {name}")
+        print(f"imported {total} case(s) in all; `docket models` shows the scorecards")
+        return
+    log = Path(a.log).expanduser() if a.log else feedback_log_path()
+    records = outcome_records(log, a.since)
+    if a.review:
+        print(model_review_packet(records, normalized_model(a.review), a.since))
+        return
+    models = sorted({str(r.get("model")) for r in records
+                     if r.get("origin") == "outcome" and r.get("model")})
+    if not models:
+        print("no outcome cases recorded yet: they accumulate as tasks are verified and decided")
+        return
+    print(f"per-model outcomes from {log}" + (f" since {a.since}" if a.since else ""))
+    for model in models:
+        card = model_scorecard(records, model)
+        name, meta = adopted_profile(model)
+        rejects = ", ".join(f"{k} {v}" for k, v in sorted(card["rejects"].items())) or "none"
+        rate = (f"{card['first_pass']}/{card['decided']} first-pass"
+                if card["decided"] else "no decided task yet")
+        print(f"  {model}: {card['tasks']} task(s), {rate}, "
+              f"{card['rounds']:.1f} rounds to accept, rejects: {rejects}, "
+              f"{tokens_h(card['tokens'])} tokens; profile: "
+              + (f"{name} v{meta.get('version', '?')}" if name else "none"))
+    due = [item for item in pending_reviews(records) if item[1] >= 3]
+    for model, count, _ in due:
+        print(f"  review due: {model} has {count} new reject case(s); "
+              f"run `docket models --review {model}`")
+
+
+def model_review_packet(records: list[dict], model: str, since: str) -> str:
+    """Everything a reviewing session needs to update one model's profile."""
+    name, meta = adopted_profile(model)
+    through = since or str(meta.get("reviewed_through", "") or "")
+    card = model_scorecard(records, model)
+    cases = [r for r in records if r.get("origin") == "outcome" and r.get("model") == model
+             and is_reject(r) and str(r.get("at", "")) > through]
+    lines = [f"# Model review: {model}", ""]
+    if name:
+        lines.append(f"Current profile: {user_profiles_dir() / (name + '.md')} (version "
+                     f"{meta.get('version', '?')}, reviewed through {through or 'never'}):")
+        lines += ["", read_profile(name)[1].strip(), ""]
+    else:
+        lines += ["No profile yet for this model.", ""]
+    lines.append(f"Scorecard: {card['tasks']} task(s), {card['first_pass']}/{card['decided']} "
+                 f"accepted without a correction, {card['rounds']:.1f} rounds to accept, "
+                 f"{tokens_h(card['tokens'])} tokens.")
+    for profile, (n, first) in sorted(card["by_profile"].items()):
+        lines.append(f"- with profile {profile}: {first}/{n} first-pass")
+    lines += ["", f"## {len(cases)} reject case(s) since {through or 'the start'}", ""]
+    labels = {"decision": "Changes requested", "verification": "Verification failed",
+              "gate": "Submit refused by the gate", "submit": "Blocked",
+              "escalation": "Correction budget escalated"}
+    tasks_seen = set()
+    for kind in ("decision", "verification", "gate", "submit", "escalation"):
+        group = [r for r in cases if r.get("kind") == kind]
+        if not group:
+            continue
+        lines += [f"### {labels[kind]} ({len(group)})", ""]
+        for r in group:
+            tasks_seen.add((r.get("project"), r.get("run"), r.get("task")))
+            where = f"{Path(str(r.get('project', ''))).name}/{r.get('run')}/{r.get('task')}"
+            text = re.sub(r"\s+", " ", str(r.get("text", ""))).strip()
+            lines.append(f"- {where} round {r.get('round')} ({str(r.get('at', ''))[:10]}): "
+                         f"{text[:600] or '(no text recorded)'}")
+            lines.append(f"  evidence: {r.get('project')}/.docket/runs/{r.get('run')}/"
+                         f"{r.get('pointer')}")
+        lines.append("")
+    newest = max((str(r.get("at", "")) for r in cases), default=through)
+    version = int(str(meta.get("version", "0")) or 0) + 1 if name else 1
+    lines += [
+        "## How to update the profile",
+        "",
+        f"These cases come from {len(tasks_seen)} task(s). Distill what recurs into at most "
+        "eight short imperative rules for this model, each about a behavior it should change.",
+        "Keep a rule only when cases from at least two different tasks support it; a single "
+        "run is not a pattern. Keep existing rules the scorecard shows helping, drop the ones "
+        "that did not, and leave out project names, paths, and case details.",
+        "Write the profile to a file with this frontmatter and a bulleted body, then adopt it:",
+        "",
+        "```",
+        "---",
+        f"profile: {name or 'model-' + model_slug(model)}",
+        f"models: {model}",
+        f"version: {version}",
+        "card: false",
+        f"reviewed_through: {newest or stamp()}",
+        f"evidence_cases: {len(cases)}",
+        f"evidence_tasks: {len(tasks_seen)}",
+        "---",
+        "",
+        f"# {model}",
+        "",
+        "- One behavior rule per line.",
+        "```",
+        "",
+        "`docket models --adopt FILE` validates it and installs it for every later prompt "
+        "to this model.",
+    ]
+    return "\n".join(lines)
+
+
+def adopt_model_profile(path: Path) -> None:
+    """Validate a reviewed profile and install it in the user's profile tree."""
+    try:
+        meta, body = parse(path.read_text())
+    except (OSError, ValueError) as exc:
+        die(f"cannot read {path}: {exc}")
+    name = str(meta.get("profile", "") or "")
+    models = [m.strip() for m in str(meta.get("models", "")).split(",") if m.strip()]
+    problems = []
+    if not re.fullmatch(r"model-[a-z0-9._-]+", name):
+        problems.append("profile must be model-<slug>, so it never shadows a task card")
+    if not models:
+        problems.append("models must name the exact model id(s) it applies to")
+    if meta.get("card", "") == "true":
+        problems.append("card must be false: a model profile applies by model, not by topic")
+    if not str(meta.get("reviewed_through", "") or "").strip():
+        problems.append("reviewed_through must name the newest case the review covered")
+    rules = [line for line in body.splitlines() if line.strip().startswith("- ")]
+    if not rules:
+        problems.append("the body needs at least one '- ' rule")
+    if estimate_tokens(body) > PROFILE_TOKEN_BUDGET // 2:
+        problems.append(f"the body is about {estimate_tokens(body)} tokens; keep it under "
+                        f"{PROFILE_TOKEN_BUDGET // 2} so task cards still fit the guidance budget")
+    target = user_profiles_dir() / f"{name}.md"
+    if target.is_file():
+        old, _ = parse(target.read_text())
+        if int(str(meta.get("version", "0")) or 0) <= int(str(old.get("version", "0")) or 0):
+            problems.append(f"version must be above the adopted version {old.get('version')}")
+    if problems:
+        die(f"cannot adopt {path.name}:\n  - " + "\n  - ".join(problems))
+    history = user_profiles_dir() / "history"
+    history.mkdir(parents=True, exist_ok=True)
+    if target.is_file():
+        old, _ = parse(target.read_text())
+        shutil.copy2(target, history / f"{name}-v{old.get('version', '0')}.md")
+    publish(target, path.read_text())
+    revision = profile_revision(name)
+    log_feedback({"origin": "profile", "profile": name, "models": models,
+                  "revision": revision, "reviewed_through": meta.get("reviewed_through", ""),
+                  "evidence_cases": meta.get("evidence_cases", ""),
+                  "evidence_tasks": meta.get("evidence_tasks", "")})
+    print(f"adopted {name} version {meta.get('version')} ({revision}) for "
+          f"{', '.join(models)}; every prompt dispatched to it from now on carries it")
+
+
 def cmd_feedback_digest(a: argparse.Namespace) -> None:
     """Summarize the user-level feedback log: where docket costs roles effort."""
     path = Path(a.log).expanduser() if a.log else feedback_log_path()
@@ -11177,7 +11570,8 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
         return str(record.get("body", "")).strip().lower().rstrip(".") in ("none", "")
 
     usage = [r for r in records if r.get("origin") == "usage"]
-    records = [r for r in records if r.get("origin") != "usage"]
+    due = [item for item in pending_reviews(records) if item[1] >= 3]
+    records = [r for r in records if r.get("origin") not in ("usage", "outcome", "profile")]
     agent = [r for r in records if r.get("origin") != "machine"]
     machine = [r for r in records if r.get("origin") == "machine"]
     projects = {str(r.get("project", "")) for r in records}
@@ -11186,6 +11580,11 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
           f"{len(projects)} project(s) - {path}")
     print(f"  agent reports: {len(agent)} ({sum(1 for r in agent if quiet(r))} said none); "
           f"machine observations: {len(machine)}")
+    if due:
+        print("\nmodel profiles due for review")
+        for model, count, through in due:
+            print(f"  {model}: {count} new reject case(s) since "
+                  f"{through or 'no review yet'}; run `docket models --review {model}`")
     latest: dict[tuple[str, str, str, str], dict] = {}
     for record in usage:
         key = tuple(str(record.get(k, "")) for k in ("project", "run", "harness", "session_id"))
@@ -13983,6 +14382,7 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                                     "replaced_by": fresh_digest})
                     existing["prompt_history"] = history
                     existing["prompt_digest"] = fresh_digest
+                    existing["model_profile"] = str(prompt_info.get("model_profile", "") or "")
                     existing["prompt_role"] = role
                     publish_json(dispatch_path(d, a.owner), existing)
                     prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, fresh_digest)
@@ -14073,6 +14473,7 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 "model_observed": "unobserved",
                 "model_history": [{"at": stamp(), "kind": "requested", "model": model or "unknown"}],
                 "prompt_digest": prompt_digest,
+                "model_profile": str(prompt_info.get("model_profile", "") or ""),
                 "prompt_role": role,
                 "state": "dispatched",
                 "dispatched_at": stamp(),
@@ -14262,6 +14663,7 @@ def cmd_resume(a: argparse.Namespace) -> None:
             try:
                 resumed_prompt, prompt_info = compose_prompt(d, a.run, a.owner, role, model=model)
                 dispatch["prompt_digest"] = str(prompt_info.get("digest", ""))
+                dispatch["model_profile"] = str(prompt_info.get("model_profile", "") or "")
                 prompt_file = write_prompt_file(d, a.owner, role, rnd, resumed_prompt,
                                                 dispatch["prompt_digest"])
             except SystemExit:
@@ -14704,6 +15106,17 @@ def main() -> None:
     q.add_argument("--confidence", default="low",
                    choices=["low", "medium", "high"])
     q.set_defaults(fn=cmd_feedback)
+
+    q = sub.add_parser("models", help="per-model outcomes, review packets, and profiles")
+    q.add_argument("--review", default="", metavar="MODEL",
+                   help="print the evidence packet for updating one model's profile")
+    q.add_argument("--adopt", default="", metavar="FILE",
+                   help="validate a reviewed profile and install it for that model")
+    q.add_argument("--import", dest="import_runs", nargs="*", default=None, metavar="RUN",
+                   help="backfill cases from runs' artifacts (every run here when none named)")
+    q.add_argument("--since", default="", help="only cases at or after this date")
+    q.add_argument("--log", default="", help="read this log instead of the user-level one")
+    q.set_defaults(fn=cmd_models)
 
     q = sub.add_parser("escalation", help="grant an exhausted correction chain more rounds")
     q.add_argument("run")

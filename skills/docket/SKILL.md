@@ -85,6 +85,8 @@ on idle and timers, and every return is a full-context turn. When woken, run
 corrections and the final aggregate report. When the run ends, record what docket
 cost you: `docket feedback R01 --add --role coordinator --category <kind> --body TEXT`,
 then `docket usage R01 --archive` keeps every role's transcript and token usage.
+`assign --model` also selects that model's learned profile; `docket models` shows
+which models are due for `docket models --review MODEL` (see the README).
 
 ## Read your playbook
 

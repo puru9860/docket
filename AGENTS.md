@@ -141,6 +141,9 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
   wakes the checker instead of the coordinator.
 - `docket resume` refuses a recorded model the current plan policy no longer approves.
   Pass `--model` with an approved one; a resume is a new launch, not a continuation.
+- A model with many recorded reject cases still gets no model guidance until a
+  reviewed profile is adopted with `docket models --adopt`. Raw cases never enter
+  prompts; only reviewed rules backed by at least two tasks do.
 - An exhausted correction budget wakes the planner (the coordinator in quick), not
   the reviewer that hit it. The budget is plan policy; only its owner may grant
   more rounds with `docket escalation`.
