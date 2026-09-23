@@ -317,6 +317,10 @@ The watcher is inert unless `watch.conf` exists, so an idle project costs nothin
 run in the hook's own foreground process tree - never with shell `&` - so the harness can
 tear it down with the session. See `docket help signalling`.
 
+On Codex, merge `hooks/codex-hooks.json.example` into `~/.codex/hooks.json` and trust it once in `/hooks`.
+It is a synchronous Stop hook: when a supervisor's turn ends, `docket watch` waits inside the hook at no model cost, and a wake is handed back as the next prompt.
+Like the Claude hook it is inert unless `watch.conf` and `DOCKET_ROLE` exist, so a Codex implementor is unaffected.
+
 Harnesses without an equivalent wake hook wait with one blocking `docket watch` instead.
 Every return re-enters the model with its whole context, so the wait window is the cost lever.
 On Codex, a blocking call is sliced into polls: set `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` so one poll can cover an hour rather than the default five minutes, and never wait in 30-second slices.

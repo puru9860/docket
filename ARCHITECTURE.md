@@ -1002,6 +1002,13 @@ So `hooks/wake.sh` runs `docket watch --armed`, which sleeps at zero token cost 
 2 with a banner on stderr when something is actionable. This design is
 [firstmate's](https://github.com/kunchenguid/firstmate); see the README acknowledgements.
 
+On Codex the same script is a synchronous `Stop` hook in `~/.codex/hooks.json`, trusted
+once in `/hooks`: exit 2 blocks the stop and hands stderr to the session as its next
+prompt, so the wait happens inside the hook at no model cost. Measured on Codex 0.155.1,
+a supervisor's stop entered the hook, a pending wake returned one second later as a
+`hook_prompt`, and the next stop waited again. `DOCKET_WATCH_HOOK=1` tells `docket watch`
+it runs inside a hook, which suppresses the Codex poll hint meant for a manual watcher.
+
 Three rules keep it correct:
 
 - **Foreground only.** The watcher runs in the hook's own process tree. Never `&`,

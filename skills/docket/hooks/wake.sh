@@ -6,6 +6,10 @@
 # on every Stop; on exit 2 it wakes the session even while idle and shows stderr as
 # a system reminder.
 #
+# Codex runs the same script as a synchronous Stop hook from ~/.codex/hooks.json
+# (see codex-hooks.json.example; trust it once in /hooks). Exit 2 blocks the stop
+# and hands stderr, the wake banner, to the session as its next prompt.
+#
 # It runs `docket watch` in the FOREGROUND of this hook's own process tree, never
 # with shell '&'. Claude owns the process group, so the hook's timeout and session
 # teardown kill the watcher along with it. Backgrounding it here would orphan the

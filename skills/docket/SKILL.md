@@ -68,8 +68,8 @@ A new Codex worker can stop at a directory-trust screen and a "Hooks need review
 
 Start each supervising session you own the same way: the checker in quick, the
 orchestrator in standard (which starts the verifier and reviewer itself). For a
-Claude Code session add `--env DOCKET_ROLE=<role>` to `pane split` so its wake hook
-fires. Send it this prompt, with the role filled in:
+Claude Code or Codex session add `--env DOCKET_ROLE=<role>` to `pane split` so its
+wake hook fires. Send it this prompt, with the role filled in:
 
 ```text
 You are the <role> for docket run R01. Run `docket help <role>` and follow it.
