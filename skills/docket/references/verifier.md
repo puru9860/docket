@@ -7,6 +7,7 @@ In quick runs the checker session performs this verification duty and then the r
 The verification artifact records the combined policy, and the checker never claims an independent verifier opinion.
 The merge uses no `--skip-verify`, no blanket `verifier_exempt`, and no legacy completion shortcut. A skipped verification may still be recorded with a reason, but no approval may stand over it in any mode; only a waiver accepts such work without claiming it passed.
 A standard preset run keeps verification and review in separate sessions under `independent-verifier-reviewer`.
+Never run a git command that writes the index, refs, or files of the checkout under review (`git add`, `git add -N`, `git reset`, `git stash`); reproduce in a copy, and read the evidence through `docket bundle` and `docket diff`.
 
 1. Read the task contract, the submitted report body, the frozen bundle named
    by the report (`docket bundle <run> <owner>`), and the captured

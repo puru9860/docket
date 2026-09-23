@@ -329,9 +329,17 @@ exact round and evidence resolves its verifier event, so the event is no
 longer derived as pending; a new round or a re-review that freezes a second
 bundle for the same round derives a new event with a new identity. Local corrections - gate
 repairs, verifier returns, reviewer returns - share one budget per chain
-(`correction_limit`, default 2). Exhaustion writes one durable escalation
-under `.escalations/` and refuses another round; it never auto-approves,
-auto-waives, or opens endless rounds. An approval packet names the exact task
+(`correction_limit`, default 2). One return to the implementor is charged once:
+a verification fail is charged only when it opens the correction itself, since a
+fail left for the reviewer returns nothing until the reviewer's changes do, and
+a retried changes request is charged by its decision artifact. Exhaustion writes
+one durable escalation under `.escalations/` and refuses another round; it never
+auto-approves, auto-waives, or opens endless rounds. The budget is plan policy,
+so the escalation wakes the plan owner (the planner, or the coordinator in
+quick), not the reviewer that hit it: `docket escalation <run> <owner> --grant N
+--reason TEXT` extends that chain, and the reviewer is then woken with
+`budget-granted` to apply its refused changes. An accepting verdict closes any
+escalation it leaves open. An approval packet names the exact task
 revision, bundle digest, and verification artifact it binds. A closed
 milestone batch under `five-role-v1` is review-ready only when every
 submitted member has a resolved verification for its current round and
@@ -1266,7 +1274,7 @@ Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
 | gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | verification | `task_env`, `parse_framework_counts`, `run_verification` |
 | transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
-| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `guard_correction_budget`, `open_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
+| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `cmd_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
 | prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
 | feedback | `cmd_feedback`, `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
 | dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `resumable_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |

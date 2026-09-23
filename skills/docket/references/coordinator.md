@@ -26,6 +26,7 @@ Verified work wakes the checker directly, so you are woken only for these:
 | `correction-ready` | `docket dispatch R01 T01 --session impl-1 --agent impl-1 --register`, then send the new prompt file to the implementor |
 | `blocked` | answer what is yours to answer (a task decision, a sequencing change), then `docket route R01 --kind blocked --owner T01 --note TEXT`: it wakes the checker, which owns the waiver or changes |
 | scope collision, handoff ready, stall | sequence the work, or `docket resume R01 T01 --session NEW --register` with the handoff |
+| `escalated` | a task used its correction budget: grant rounds that are worth it with `docket escalation R01 T01 --grant 1 --reason TEXT` (the checker is then woken to apply its refused changes), re-plan the task, or leave it for the checker to waive |
 | `all:decided` | write the aggregate report, below |
 | `unfinished-*` or a correction for the aggregate | run the command the wake names |
 

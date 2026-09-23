@@ -7,6 +7,8 @@ It first performs the verifier duty: challenge whether the evidence proves accep
 The generated prompt carries the mandatory contract: relevant constraints from the plan, the task, Existing decisions and Discovery constraints, not Out of scope alone. Mandatory material is never truncated to fit a guidance budget and is reported in the mandatory size. For detail, read `references/verifier.md` and `references/reviewer.md` on demand; the prompt never concatenates those playbooks.
 
 On each wake, run `docket status <run>` once, read the round with `docket bundle <run> <owner>`, record the verification, then decide it; a wake for the aggregate needs only the decision, and `docket review-packet <run> --role reviewer` gathers its evidence.
+Read the evidence through docket (`docket bundle`, `docket diff`, `docket review-packet`); never run a git command that writes the index, refs, or files of the checkout under review (`git add`, `git add -N`, `git reset`, `git stash`, `git commit`), since that checkout is the evidence and `docket decide` already refuses a round whose source moved.
+A changes request refused for an exhausted correction budget opens an escalation that wakes the coordinator, never you; once it grants more rounds you get a `budget-granted` wake to apply the same changes, and if the work is acceptable as it stands, waive it instead.
 A `blocked-routed` wake is a blocked round the coordinator has answered what it could and routed to you: there is nothing to verify, so request changes that carry the answer, or waive.
 
 ```bash

@@ -33,8 +33,9 @@ If `docket` is not on PATH, use `~/.agents/skills/docket/bin/docket`.
 
 ```bash
 mkdir -p .docket
-docket init R01 --title "Short name" --objective "What done means for the whole run."
-docket assign R01 T01 --harness opencode --file src/x.py --verify 'tests/test.sh' \
+docket init R01 --title "Short name" --objective "What done means for the whole run." \
+  --approach "The shape of the solution and why."
+docket assign R01 T01 --harness opencode --model provider/model --file src/x.py --verify 'tests/test.sh' \
   --title "Task name" --goal "What must be true when done." \
   --criterion "A mechanically checkable criterion" --criterion "Another one"
 docket dispatch R01 T01 --session impl-1 --agent impl-1 --register
@@ -57,11 +58,12 @@ Then start the worker and hand it that file (herdr shown; any terminal works):
 herdr pane split --current --direction right --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
 herdr agent start impl-1 --kind opencode --pane <pane_id> -- --auto     # see harness flags below
 herdr agent prompt impl-1 "$(cat <prompt file>)"                        # no --wait
-docket set-model R01 T01 --actual <model label the pane shows>
+docket set-model R01 T01 --actual <model label the pane shows> [--effort LEVEL]
 ```
 
 Harness flags after `--`: opencode `--auto --model provider/model`, codex
 `--yolo -m MODEL`, claude `--dangerously-skip-permissions --model MODEL`.
+herdr agent names are global across tabs, so prefix them with the run (`r01-impl-1`).
 
 Start each supervising session you own the same way: the checker in quick, the
 orchestrator in standard (which starts the verifier and reviewer itself). For a

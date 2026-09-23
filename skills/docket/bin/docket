@@ -1379,6 +1379,30 @@ def private_git_env(d: Path, record: dict[str, object], index: str) -> dict[str,
     return env
 
 
+def moved_paths(d: Path, owner: str, before: dict[str, str], after: dict[str, str],
+                limit: int = 12) -> str:
+    """The paths that differ between two source captures, for a refusal to name."""
+    records, _ = baseline_roots(d, owner)
+    by_alias = {str(r.get("alias", "")): r for r in records}
+    names: list[str] = []
+    for alias in sorted(set(before) | set(after)):
+        old, new = before.get(alias, ""), after.get(alias, "")
+        if old == new:
+            continue
+        record = by_alias.get(alias)
+        changed: list[str] = []
+        if record and old and new:
+            env = private_git_env(d, record, "moved.index")
+            code, out, _ = private_git(env, Path(str(record.get("path", "."))), "diff-tree",
+                                       "-r", "--name-only", "-z", old, new)
+            if code == 0:
+                changed = [n for n in out.decode(errors="surrogateescape").split("\0") if n]
+        prefix = f"{alias}:" if len(by_alias) > 1 else ""
+        names.extend(prefix + name for name in changed) if changed else names.append(f"{alias}:")
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
 def private_git(
     env: dict[str, str], cwd: Path, *args: str,
     stdin: bytes | None = None, timeout: int = 600,
@@ -1906,6 +1930,10 @@ def verification_run_env(declared: list[str] | None) -> tuple[dict[str, str], li
     are ever captured, so unrelated ambient state is never recorded.
     """
     run_env = dict(os.environ)
+    # A verify command must not write into the checkout it is measured
+    # against; Python bytecode caches are the commonest such write. A task
+    # that declares the variable keeps its own value.
+    run_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     for item in declared or []:
         key, value = split_env_item(item)
         if key and value is not None:
@@ -2165,12 +2193,12 @@ def freeze_task_bundle(
         before = {item["alias"]: item["tree"] for item in verified_source}
         after = {item["alias"]: item["tree"] for item in source["roots"]}
         if before != after:
-            moved = sorted(alias for alias in set(before) | set(after)
-                           if before.get(alias) != after.get(alias))
             return None, (
                 "the checkout changed while the verification ran, so the captured result does "
-                f"not describe the source being frozen ({', '.join(moved)}). Nothing was frozen "
-                "and nothing was handed off: re-run `docket submit` on a settled workspace"
+                f"not describe the source being frozen: {moved_paths(d, owner, before, after)}. "
+                "Nothing was frozen "
+                "and nothing was handed off: stop whatever writes those paths during the verify "
+                "command, then re-run `docket submit` on a settled workspace"
             )
 
     delta: dict[str, object] = {"coverage": COVERAGE_UNAVAILABLE, "reason": "no earlier bundle", "roots": []}
@@ -2493,12 +2521,12 @@ def freeze_aggregate_bundle(
         before = {item["alias"]: item["tree"] for item in verified_source}
         after = {item["alias"]: item["tree"] for item in source["roots"]}
         if before != after:
-            moved = sorted(alias for alias in set(before) | set(after)
-                           if before.get(alias) != after.get(alias))
             return None, (
                 "the checkout changed while the verification ran, so the captured result does "
-                f"not describe the source being frozen ({', '.join(moved)}). Nothing was frozen "
-                "and nothing was handed off: re-run `docket submit` on a settled workspace"
+                f"not describe the source being frozen: {moved_paths(d, 'orch', before, after)}. "
+                "Nothing was frozen "
+                "and nothing was handed off: stop whatever writes those paths during the verify "
+                "command, then re-run `docket submit` on a settled workspace"
             )
 
     manifest: dict[str, object] = {
@@ -3363,10 +3391,11 @@ def cmd_init(a: argparse.Namespace) -> None:
     # plan otherwise needs before anything can be assigned.
     if (a.title or "").strip():
         text = text.replace("# Plan: <title>", f"# Plan: {a.title.strip()}", 1)
-    if (a.objective or "").strip():
-        meta, body = parse(text)
-        body = set_section(body, "Objective", a.objective.strip())
-        text = render(meta, body)
+    for section, value in (("Objective", a.objective), ("Approach", a.approach)):
+        if (value or "").strip():
+            meta, body = parse(text)
+            body = set_section(body, section, value.strip())
+            text = render(meta, body)
     publish(plan, text)
     print(f"created {plan.relative_to(root())}")
     print(f"mode: {policy['mode']} - workflow {policy['workflow']}, "
@@ -5011,7 +5040,7 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
             if is_empty(required) or PLACEHOLDER.search(required):
                 die(f"{dec.name} needs specific required changes before the transition can be applied")
             if is_five_role(d) and a.owner != "orch":
-                note_correction(d, a.owner, "reviewer_returns")
+                note_correction(d, a.owner, "reviewer_returns", token=dec.name)
                 guard_correction_budget(d, a.owner, f"reviewer changes on round {rnd}")
         else:
             for name in ("Required changes", "Answers to decisions needed"):
@@ -5877,21 +5906,26 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
             if unfinished:
                 key, message, urnd, revision = unfinished
                 emit(key, message, o, urnd, revision)
-        escalations = d / ".escalations"
-        if escalations.is_dir():
-            for path in sorted(escalations.glob("*.json")):
-                try:
-                    entry = json.loads(path.read_text())
-                except (OSError, ValueError):
-                    continue
-                if not isinstance(entry, dict) or entry.get("state") != "open":
-                    continue
-                owner = str(entry.get("owner", ""))
-                iid = str(entry.get("id", owner))
-                emit(f"{owner}:escalated:{iid}",
-                     f"{owner} exhausted local corrections; review the escalation packet",
-                     owner, state_of(d, owner)[0],
-                     f"sha256:{hashlib.sha256(iid.encode()).hexdigest()}")
+        # A granted chain leaves the refused correction for the reviewer to
+        # apply; its draft decision is still unapplied for the current round.
+        for entry in open_escalations(d, ("granted",)):
+            owner = str(entry.get("owner", ""))
+            grnd, gst = state_of(d, owner)
+            if gst != "submitted":
+                continue
+            draft = d / f"{owner}-decision-{grnd:02d}.mdx"
+            try:
+                dmeta, _ = parse(draft.read_text())
+            except (OSError, ValueError):
+                continue
+            if str(dmeta.get("applied", "")) == "yes":
+                continue
+            iid = str(entry.get("id", owner))
+            emit(f"{owner}:{grnd}:budget-granted:{iid}",
+                 f"{owner} was granted {entry.get('granted', 1)} more correction round(s): apply "
+                 f"the refused changes with `docket decide {d.name} {owner} --changes"
+                 f"{decide_as(d)}`",
+                 owner, grnd, f"sha256:{hashlib.sha256((iid + draft.name).encode()).hexdigest()}")
         return out
 
     return out
@@ -5947,6 +5981,9 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
     if role == "planner":
         if topology(d) == "combined":
             return []
+        if is_five_role(d):
+            for key, message, owner, ernd, revision in escalation_events(d):
+                emit(key, message, owner, ernd, revision)
         if not is_five_role(d):
             rnd, st = state_of(d, "orch")
             if st == "submitted":
@@ -5976,6 +6013,11 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
                  f"sha256:{hashlib.sha256(iid.encode()).hexdigest()}")
         return out
 
+    # Combined topology puts the plan in the orchestrator's session, so the
+    # plan owner's escalations are its to answer.
+    if topology(d) == "combined" and is_five_role(d):
+        for key, message, owner, ernd, revision in escalation_events(d):
+            emit(key, message, owner, ernd, revision)
     scope = []
     orchestrator_tasks = []
     for o in owners(d):
@@ -6373,6 +6415,11 @@ def codex_wait_hint(role: str) -> str:
             f"pass yield_time_ms: {cap} to every write_stdin and wait on this command. Add "
             f"background_terminal_max_timeout = {CODEX_HOUR_POLL_MS} at the top of "
             f"{codex_home() / 'config.toml'} for one turn per idle hour.")
+
+
+def stated(text: str) -> str:
+    """A plan section's text without template placeholders, or '' when only those remain."""
+    return re.sub(r"<!--.*?-->", "", text or "", flags=re.S).strip()
 
 
 def cmd_watch(a: argparse.Namespace) -> None:
@@ -8804,7 +8851,25 @@ def read_corrections(d: Path, owner: str) -> dict:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # Verifier returns are derived from the verifications they name, so a
+    # charge for a fail that never opened a correction (an older build charged
+    # every fail) stops counting against the budget.
+    counted = data.get("counted") if isinstance(data.get("counted"), list) else []
+    named = [str(t) for t in counted if re.fullmatch(rf"{re.escape(owner)}-verification-\d+\.mdx",
+                                                    str(t))]
+    if named:
+        opened = 0
+        for name in named:
+            try:
+                meta, _ = parse((d / name).read_text())
+            except (OSError, ValueError):
+                opened += 1
+                continue
+            opened += str(meta.get("opened_correction", "")) != "no"
+        data["verifier_returns"] = opened
+    return data
 
 
 def correction_attempts(record: dict) -> int:
@@ -8842,8 +8907,100 @@ def note_correction(d: Path, owner: str, kind: str, token: str = "") -> dict:
     return record
 
 
+def correction_budget(d: Path, owner: str, record: dict | None = None) -> int:
+    """The plan's correction limit plus any rounds the plan owner granted this chain."""
+    record = read_corrections(d, owner) if record is None else record
+    try:
+        granted = int(record.get("granted", 0) or 0)
+    except (TypeError, ValueError):
+        granted = 0
+    return correction_limit_of(d) + max(0, granted)
+
+
 def clear_corrections(d: Path, owner: str) -> None:
     corrections_path(d, owner).unlink(missing_ok=True)
+    # An accepting verdict settles the chain, so an escalation it left open
+    # would otherwise wake the plan owner for work that is already accepted.
+    directory = d / ".escalations"
+    for path in sorted(directory.glob(f"{owner}-r*.json")) if directory.is_dir() else []:
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(entry, dict) and entry.get("state") in ("open", "granted"):
+            entry["state"] = "closed"
+            entry["closed_at"] = stamp()
+            entry["closed_by"] = "accepting verdict"
+            publish_json(path, entry)
+
+
+def open_escalations(d: Path, states: tuple[str, ...] = ("open",)) -> list[dict]:
+    """Escalation records in the given states, oldest first."""
+    directory = d / ".escalations"
+    found = []
+    for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(entry, dict) and entry.get("state") in states:
+            entry["_path"] = str(path)
+            found.append(entry)
+    return found
+
+
+def plan_owner_role(d: Path) -> str:
+    return "coordinator" if mode_of(d) == MODE_QUICK else "planner"
+
+
+def escalation_events(d: Path) -> list[tuple[str, str, str, int, str]]:
+    """(key, message, owner, round, revision) for chains only the plan owner can extend."""
+    out = []
+    for entry in open_escalations(d):
+        owner = str(entry.get("owner", ""))
+        iid = str(entry.get("id", owner))
+        attempts = entry.get("attempts") if isinstance(entry.get("attempts"), dict) else {}
+        used = sum(int(v or 0) for v in attempts.values())
+        out.append((f"{owner}:escalated:{iid}",
+                    f"{owner} exhausted its local correction budget ({used} attempts, limit "
+                    f"{entry.get('limit', '?')}): grant more rounds with `docket escalation "
+                    f"{d.name} {owner} --grant 1 --reason TEXT`, re-plan the task, or leave it "
+                    "for a waiver",
+                    owner, state_of(d, owner)[0],
+                    f"sha256:{hashlib.sha256(iid.encode()).hexdigest()}"))
+    return out
+
+
+def cmd_escalation(a: argparse.Namespace) -> None:
+    """Grant an exhausted correction chain more rounds; only the plan owner may."""
+    d = need_run(a.run)
+    owner_role = plan_owner_role(d)
+    role = a.as_role or owner_role
+    if role != owner_role:
+        die(f"only the {owner_role} extends a correction budget in {a.run}; the budget is "
+            "plan policy, and the role that hit it cannot raise it")
+    if a.grant < 1:
+        die("--grant N needs N of at least 1")
+    reason = (a.reason or "").strip()
+    if not reason:
+        die("--reason is required: a granted budget records why more rounds are worth it")
+    with owner_lock(d, a.owner):
+        record = read_corrections(d, a.owner)
+        opened = [e for e in open_escalations(d) if e.get("owner") == a.owner]
+        if not record or not opened:
+            die(f"{a.owner} has no open escalation to grant")
+        entry = opened[-1]
+        path = Path(entry.pop("_path"))
+        record["granted"] = int(record.get("granted", 0) or 0) + a.grant
+        record["escalated"] = ""
+        entry.update({"state": "granted", "granted": a.grant, "granted_by": role,
+                      "reason": reason, "resolved_at": stamp()})
+        publish_json(corrections_path(d, a.owner), record)
+        publish_json(path, entry)
+    reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+    print(f"granted {a.owner} {a.grant} more correction round(s): "
+          f"{correction_attempts(record)} used of {correction_budget(d, a.owner, record)}; "
+          f"the {reviewer} is woken to apply the correction it was refused")
 
 
 def escalation_path(d: Path, owner: str, start_round: int) -> Path:
@@ -8874,7 +9031,7 @@ def open_escalation(d: Path, owner: str, record: dict, why: str) -> dict:
         "why": why,
         "attempts": {k: record.get(k, 0) for k in
                      ("gate_repairs", "verifier_returns", "reviewer_returns")},
-        "limit": correction_limit_of(d),
+        "limit": correction_budget(d, owner, record),
         "findings": findings,
         "decisions": decisions,
         "opened_at": stamp(),
@@ -8892,14 +9049,14 @@ def guard_correction_budget(d: Path, owner: str, opening: str,
     record = read_corrections(d, owner)
     if not record:
         return
-    if correction_attempts(record) <= correction_limit_of(d):
+    if correction_attempts(record) <= correction_budget(d, owner, record):
         return
     if callable(on_exhausted):
         on_exhausted()
     entry = open_escalation(d, owner, record,
                             f"local correction budget exceeded by {opening}")
     die(f"{owner} exceeded its local correction budget "
-        f"({correction_attempts(record)} attempts, limit {correction_limit_of(d)}): "
+        f"({correction_attempts(record)} attempts, limit {correction_budget(d, owner, record)}): "
         f"escalation {entry['id']} is open. This never auto-approves, auto-waives, "
         "or opens another round; a reviewer must decide from the escalation packet.")
 
@@ -8996,8 +9153,10 @@ def cmd_verify(a: argparse.Namespace) -> None:
                 die("verifier-triggered corrections need `verifier_correction: allowed` in "
                     f"plan.mdx; the failure is recorded in {path.name} and the round stays "
                     "submitted for the reviewer to decide")
-            note_correction(d, a.owner, "verifier_returns", token=path.name)
             if opening:
+                # A fail that leaves the round for the reviewer returns nothing to
+                # the implementor yet; the reviewer's changes are the one return.
+                note_correction(d, a.owner, "verifier_returns", token=path.name)
                 guard_correction_budget(
                     d, a.owner, f"verification attempt {attempt}",
                     on_exhausted=lambda: mark_verification_correction(path, "escalated"))
@@ -9376,6 +9535,7 @@ RENDERER_SOURCE_FUNCTIONS = (
     "read_contract",
     "unwrap_markdown",
     "prompt_steps",
+    "stated",
 )
 
 RENDERER_SOURCE_CONSTANTS = (
@@ -9918,8 +10078,8 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         contract_lines = [
             f"run: {run} aggregate: orch role: {role}",
             f"objective: {objective}",
-            f"approach: {plan_secs.get('Approach', '').strip() or 'none'}",
-            f"risks: {plan_secs.get('Risks', '').strip() or 'none'}",
+            f"approach: {stated(plan_secs.get('Approach', '')) or 'none'}",
+            f"risks: {stated(plan_secs.get('Risks', '')) or 'none'}",
             f"hard constraints: {plan_secs.get('Out of scope', '').strip() or 'none stated'}",
             f"plan revision: {digest_of(plan.read_bytes())}",
         ]
@@ -10264,8 +10424,9 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         return ["Implement inside the task's `files:` and run its verify command.", *finish]
     if role != "implementor":
         return []
-    handoff = (f"Before your context runs out, run `docket handoff {run} {owner}`, fill the "
-               f"checkpoint, then `docket handoff {run} {owner} --submit`.")
+    handoff = (f"Only if you must stop before submitting (your context is running out), run "
+               f"`docket handoff {run} {owner}`, fill the checkpoint, then "
+               f"`docket handoff {run} {owner} --submit`; a submitted round needs no handoff.")
     build = (f"Run `docket preflight {run} {owner}`, implement only inside the accepted "
              "files, and run the verify command.")
     if stage == "correction":
@@ -13760,6 +13921,12 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             if old_gen == new_gen:
                 print(f"already dispatched: {a.owner} round {rnd} -> session {a.session} "
                       f"({existing.get('dispatch')})")
+                if a.agent and a.agent != str(existing.get("agent", "") or ""):
+                    # The terminal agent was renamed (a harness name clash, a
+                    # relaunch); the binding keeps pointing at who does the work.
+                    existing["agent"] = a.agent
+                    publish_json(dispatch_path(d, a.owner), existing)
+                    print(f"agent: {a.agent}")
                 existing_digest = str(existing.get("prompt_digest", "") or "")
                 # The same writer re-dispatching after the task or plan changed gets
                 # the prompt re-rendered and rebound, so the record never keeps
@@ -14355,6 +14522,8 @@ def main() -> None:
     q.add_argument("--title", default="", help="plan title")
     q.add_argument("--objective", default="",
                    help="what done means for the whole run; fills the plan Objective")
+    q.add_argument("--approach", default="",
+                   help="the shape of the solution and why; fills the plan Approach")
     q.set_defaults(fn=cmd_init)
 
     q = sub.add_parser("assign", help="open a task and its first report")
@@ -14497,6 +14666,15 @@ def main() -> None:
     q.add_argument("--confidence", default="low",
                    choices=["low", "medium", "high"])
     q.set_defaults(fn=cmd_feedback)
+
+    q = sub.add_parser("escalation", help="grant an exhausted correction chain more rounds")
+    q.add_argument("run")
+    q.add_argument("owner")
+    q.add_argument("--grant", type=int, required=True, metavar="N",
+                   help="how many more local correction rounds the chain may use")
+    q.add_argument("--reason", default="", help="why more rounds are worth it")
+    q.add_argument("--as", dest="as_role", default="", help="the plan owner's role")
+    q.set_defaults(fn=cmd_escalation)
 
     q = sub.add_parser("usage", help="token usage per role from each harness session transcript")
     q.add_argument("run")

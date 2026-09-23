@@ -2168,8 +2168,31 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(1, rejected.returncode)
         self.assertIn("could not be frozen as review evidence", rejected.stderr)
         self.assertIn("changed while the verification ran", rejected.stderr)
+        self.assertIn("being frozen: src/a.py.", rejected.stderr)
         self.assertIn("status: draft", report.read_text())
         self.assertEqual([], self.ledger())
+
+    def test_a_python_verify_command_writes_no_bytecode_into_the_checkout(self) -> None:
+        """Importing the code under test must not move the checkout the result describes."""
+        self.repo()
+        run = self.init(evidence_mode="git")
+        self.cli(
+            "assign", "demo", "T01", "--executor", "orchestrator", "--harness", "claude",
+            "--file", "src",
+            "--verify", "python3 -c 'import sys; sys.path.insert(0, \"src\"); import a'",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        ambient = os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+        try:
+            self.cli("submit", "demo", "T01")
+        finally:
+            if ambient is not None:
+                os.environ["PYTHONDONTWRITEBYTECODE"] = ambient
+        self.assertFalse((self.root / "src" / "__pycache__").exists())
+        self.assertIn("status: completed", report.read_text())
 
     def test_documents_only_bundles_record_unavailable_patch_coverage(self) -> None:
         """A run without Git evidence still freezes a round, and still says so plainly."""
@@ -4400,6 +4423,74 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(1, len(list((run / ".escalations").glob("*.json"))))
         self.assertIn("submitted", (run / "T02-report-03.mdx").read_text())
 
+    def test_quick_budget_counts_one_return_and_the_coordinator_can_extend_it(self) -> None:
+        """A checker's fail plus changes is one return; an exhausted chain wakes the coordinator."""
+        run = self.init5_in("eg", mode="quick")
+        self.assign_simple_in(run, "eg", "T01")
+        self.cli("dispatch", "eg", "T01", "--session", "w1", "--register")
+        report = run / "T01-report-01.mdx"
+        report.write_text(report.read_text() + "\nTODO: finish\n")
+        self.cli("submit", "eg", "T01", "--as", "implementor", ok=False)
+        report.write_text(report.read_text().replace("\nTODO: finish\n", "\n"))
+
+        def submit(rnd: int) -> None:
+            self.fill_task_report(run / f"T01-report-{rnd:02d}.mdx",
+                                  files="- `src/t01.py:1` - implemented T01.")
+            self.cli("submit", "eg", "T01", "--as", "implementor")
+
+        def request_changes(rnd: int, ok: bool = True) -> subprocess.CompletedProcess[str]:
+            self.cli("decide", "eg", "T01", "--changes", "--as", "checker")
+            dec = run / f"T01-decision-{rnd:02d}.mdx"
+            dec.write_text(dec.read_text().replace(
+                "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+                self.REQUIREMENT))
+            return self.cli("decide", "eg", "T01", "--changes", "--as", "checker", ok=ok)
+
+        def corrections() -> dict:
+            return json.loads((run / ".corrections" / "T01.json").read_text())
+
+        submit(1)
+        self.cli("verify", "eg", "T01", "--result", "fail", "--as", "checker",
+                 "--detail", "1. oracle mismatch")
+        self.assertEqual(0, corrections()["verifier_returns"])
+        # An older build charged every fail; that stale charge no longer counts.
+        stale = corrections()
+        stale.update({"verifier_returns": 1, "counted": ["T01-verification-01.mdx"]})
+        (run / ".corrections" / "T01.json").write_text(json.dumps(stale))
+        request_changes(1)
+        self.assertEqual((1, 0, 1), tuple(corrections()[k] for k in
+                                          ("gate_repairs", "verifier_returns", "reviewer_returns")))
+        submit(2)
+        self.cli("verify", "eg", "T01", "--result", "fail", "--as", "checker",
+                 "--detail", "1. still mismatched")
+        refused = request_changes(2, ok=False)
+        self.assertIn("escalation T01-r01 is open", refused.stderr)
+        self.assertEqual(["T01:escalated:T01-r01"], self.derived_keys("eg", "coordinator"))
+        self.assertIn("docket escalation eg T01 --grant 1 --reason TEXT",
+                      self.cli("events", "eg", "--role", "coordinator", "--peek").stdout)
+        self.assertNotIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        denied = self.cli("escalation", "eg", "T01", "--grant", "1", "--reason", "one more",
+                          "--as", "checker", ok=False)
+        self.assertIn("only the coordinator extends a correction budget", denied.stderr)
+        granted = self.cli("escalation", "eg", "T01", "--grant", "1",
+                           "--reason", "the UTF-8 fix is worth one more round")
+        self.assertIn("granted T01 1 more correction round(s): 3 used of 3", granted.stdout)
+        self.assertEqual([], self.derived_keys("eg", "coordinator"))
+        self.assertIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        self.cli("decide", "eg", "T01", "--changes", "--as", "checker")
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx", "T01-report-03.mdx"],
+                         self.rounds(run, "T01"))
+        self.assertEqual(2, corrections()["reviewer_returns"])
+        self.assertNotIn("T01:2:budget-granted:T01-r01", self.derived_keys("eg", "checker"))
+        submit(3)
+        self.cli("verify", "eg", "T01", "--result", "pass", "--as", "checker",
+                 "--detail", "1. fixed")
+        self.cli("decide", "eg", "T01", "--approve", "--as", "checker",
+                 "--reason", "the correction holds")
+        entry = json.loads((run / ".escalations" / "T01-r01.json").read_text())
+        self.assertEqual("closed", entry["state"])
+        self.assertNotIn("T01:escalated:T01-r01", self.derived_keys("eg", "coordinator"))
+
     def test_m8_stale_revision_blocks_verdict(self) -> None:
         """A verdict never falls back to whatever the workspace holds now."""
         run = self.init5()
@@ -4477,29 +4568,29 @@ class DocketCLI(unittest.TestCase):
             "events", "demo", "--role", "reviewer", "--peek").stdout.splitlines()
             if "batch:M1:ready:" in l]
         self.assertEqual(1, len(reviewer_keys))
-        # Exhausting corrections routes a durable escalation to the reviewer.
-        # The verifier failure already spent one of the two local attempts, so
-        # one reviewer correction opens and the next one escalates.
+        # Exhausting corrections opens a durable escalation for the planner,
+        # who owns the budget. A verifier failure left for the reviewer is not
+        # itself a return, so two reviewer corrections open and the third
+        # escalates.
         self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier")
-        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
-        dec = run / "T01-decision-01.mdx"
-        dec.write_text(dec.read_text().replace(
-            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
-            self.REQUIREMENT))
-        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
-        self.fill_task_report(run / "T01-report-02.mdx")
-        self.cli("submit", "demo", "T01", "--as", "implementor")
-        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
-        dec = run / "T01-decision-02.mdx"
-        dec.write_text(dec.read_text().replace(
-            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
-            self.REQUIREMENT))
-        self.assertNotEqual(0, self.cli(
-            "decide", "demo", "T01", "--changes", "--as", "reviewer", ok=False).returncode)
-        escalated = [l.strip().split()[-1] for l in self.cli(
-            "events", "demo", "--role", "reviewer", "--peek").stdout.splitlines()
-            if ":escalated:" in l]
-        self.assertEqual(["T01:escalated:T01-r01"], escalated)
+        for rnd in (1, 2, 3):
+            self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+            dec = run / f"T01-decision-{rnd:02d}.mdx"
+            dec.write_text(dec.read_text().replace(
+                "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+                self.REQUIREMENT))
+            applied = self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer",
+                               ok=rnd < 3)
+            if rnd < 3:
+                self.fill_task_report(run / f"T01-report-{rnd + 1:02d}.mdx")
+                self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.assertNotEqual(0, applied.returncode)
+        def escalated(role: str) -> list[str]:
+            return [l.strip().split()[-1] for l in self.cli(
+                "events", "demo", "--role", role, "--peek").stdout.splitlines()
+                if ":escalated:" in l]
+        self.assertEqual(["T01:escalated:T01-r01"], escalated("planner"))
+        self.assertEqual([], escalated("reviewer"))
 
     # --------------------------------- prompts, feedback, improvements
 
@@ -9584,6 +9675,17 @@ class DocketCLI(unittest.TestCase):
         self.cli("verify", "batched", "T01", "--result", "pass", "--as", "verifier")
         self.assertEqual(["batch:B1:ready:1"], self.derived_keys("batched", "orchestrator"))
 
+    def test_redispatch_records_a_renamed_agent(self) -> None:
+        """Re-dispatching the same session under a new agent name updates the binding."""
+        run = self.init5_in("ra", mode="quick")
+        self.assign_simple_in(run, "ra", "T01")
+        self.cli("dispatch", "ra", "T01", "--session", "w1", "--agent", "impl-1", "--register")
+        again = self.cli("dispatch", "ra", "T01", "--session", "w1", "--agent", "r01-impl-1",
+                         "--register")
+        self.assertIn("agent: r01-impl-1", again.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(("w1", "r01-impl-1"), (record["session"], record["agent"]))
+
     def test_a_routed_block_wakes_the_checker_to_decide_it(self) -> None:
         """A block wakes the coordinator; routing it hands the verdict to the checker durably."""
         run = self.init5_in("rb", mode="quick")
@@ -9714,16 +9816,29 @@ class DocketCLI(unittest.TestCase):
         self.assertNotIn("T01:1:unfinished-approved",
                          self.derived_keys("legacy", "orchestrator"))
 
+    def test_aggregate_prompt_leaves_out_plan_placeholders(self) -> None:
+        """An unfilled plan section reads as none in the aggregate prompt, not as a comment."""
+        self.cli("init", "bare", "--evidence-mode", "documents-only", "--objective", "Ship it.")
+        run = self.root / ".docket" / "runs" / "bare"
+        self.assertIn("<!-- TODO: the shape of the solution", (run / "plan.mdx").read_text())
+        self.cli("assign", "bare", "orch", "--executor", "orchestrator",
+                 "--verify", 'printf "ok\n"')
+        prompt = self.cli("prompt", "bare", "orch", "--role", "coordinator").stdout
+        self.assertIn("approach: none", prompt)
+        self.assertNotIn("TODO", prompt)
+
     def test_a_run_starts_in_three_commands(self) -> None:
         """init, assign with intent, and dispatch --register reach a bound, sendable prompt."""
         init = self.cli("init", "fast", "--evidence-mode", "documents-only",
-                        "--title", "Guard input", "--objective", "Empty input is rejected.")
+                        "--title", "Guard input", "--objective", "Empty input is rejected.",
+                        "--approach", "One guard at the entry point.")
         self.assertIn("mode: quick", init.stdout)
         run = self.root / ".docket" / "runs" / "fast"
         plan = (run / "plan.mdx").read_text()
         self.assertIn("# Plan: Guard input", plan)
         self.assertIn("Empty input is rejected.", plan)
-        self.assertNotIn("<!-- TODO: what", plan)
+        self.assertIn("## Approach\n\nOne guard at the entry point.", plan)
+        self.assertEqual([], [line for line in plan.splitlines() if "<!-- TODO" in line])
         assigned = self.cli("assign", "fast", "T01", "--harness", "opencode",
                             "--file", "src/a.py", "--verify", 'printf "T01 ok\\n"',
                             "--title", "Empty guard", "--goal", "Empty input raises.",
