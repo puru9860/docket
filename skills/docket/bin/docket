@@ -37,6 +37,10 @@ MODE_STANDARD = "standard"
 MODE_QUICK = "quick"
 MODE_CUSTOM = "custom"
 MODES = (MODE_STANDARD, MODE_QUICK)
+# A bare `docket init` selects this preset. Quick is the default because most runs
+# have one clear outcome, and three sessions start and wait far more cheaply than
+# five; `--mode standard` keeps an independent verifier behind every decision.
+MODE_NEW_RUN_DEFAULT = MODE_QUICK
 RECORDED_MODES = (MODE_STANDARD, MODE_QUICK, MODE_CUSTOM)
 REVIEW_INDEPENDENT = "independent-verifier-reviewer"
 REVIEW_COMBINED_CHECKER = "combined-checker"
@@ -994,6 +998,49 @@ def require_baseline(d: Path, owner: str, scope: list[str], kind: str = "task") 
     )
 
 
+def pin_final_dependencies(d: Path, owner: str) -> list[tuple[str, str]]:
+    """Record each approved `depends_on` task as a final consumed input.
+
+    The dependent is built on that approved work, so its frozen rounds should
+    say which bundle it was: a dependency that later freezes different evidence
+    then withdraws the dependent's review readiness instead of going unnoticed.
+    Only a draft round records inputs, and an existing pin is never rewritten.
+    """
+    if owner == "orch" or state_of(d, owner)[1] not in ("unassigned", "draft"):
+        return []
+    entries = read_deps(d, owner)
+    recorded = {str(entry.get("on", "")) for entry in entries}
+    pinned: list[tuple[str, str]] = []
+    for dep in task_depends_on(d, owner):
+        if dep in recorded or state_of(d, dep)[1] not in FINAL_STATES:
+            continue
+        latest = latest_bundle(d, dep)
+        if not latest or consumable_problems(d, dep, latest, True):
+            continue
+        entries.append({
+            "on": dep, "kind": "final", "state": state_of(d, dep)[1],
+            "round": str(latest.get("round", "")), "bundle": str(latest.get("digest", "")),
+            "recorded_at": stamp(),
+        })
+        pinned.append((dep, str(latest.get("digest", ""))))
+    if pinned:
+        write_deps(d, owner, sorted(entries, key=lambda item: item.get("on", "")))
+    return pinned
+
+
+def task_scope_hint(d: Path, owner: str) -> list[str]:
+    """The paths a task was assigned with: accepted files, else its file hints."""
+    task = d / f"{owner}-task.mdx"
+    try:
+        meta = parse(task.read_text())[0]
+    except (OSError, ValueError):
+        return []
+    try:
+        return shlex.split(str(meta.get("files", "") or meta.get("file_hints", "") or ""))
+    except ValueError:
+        return []
+
+
 def update_snapshot_scope(d: Path, owner: str, scope: list[str]) -> None:
     """Expand/change claimed paths without rebasing away implementation changes."""
     target = snapshot_path(d, owner)
@@ -1117,6 +1164,9 @@ def assignment_evidence(d: Path, owner: str) -> tuple[str, str, list[str], list[
         return COVERAGE_UNAVAILABLE, f"plan.mdx declares an unknown evidence_mode: {mode}", [], []
     snap = snapshot_path(d, owner)
     if not snap.is_file():
+        if owner != "orch" and task_depends_on(d, owner) and not read_dispatch(d, owner):
+            return (COVERAGE_UNAVAILABLE, f"{owner}'s baseline is captured when it is "
+                    "dispatched, after its dependencies are approved", [], [])
         return COVERAGE_UNAVAILABLE, f"no assignment snapshot at {snap.name}", [], []
     try:
         data = json.loads(snap.read_text())
@@ -3079,7 +3129,7 @@ effort_history:
 
 ## Acceptance
 
-<!-- Copy every criterion from the task. Check a box only when it genuinely passes. -->
+<!-- Keep every criterion exactly as the task states it. Check a box only when it genuinely passes. -->
 
 - [ ] <!-- TODO -->
 
@@ -3268,16 +3318,21 @@ def init_policy(a: argparse.Namespace) -> dict[str, str]:
         if requested_workflow and requested_workflow != WORKFLOW_FIVE_ROLE:
             die("standard mode requires workflow five-role-v1")
         if requested_topology and requested_topology != "split":
-            die("standard mode requires topology split; use the low-level workflow and "
-                "topology flags without --mode for a custom configuration")
+            die("standard mode requires topology split. For one coordinator session "
+                "combining planning and orchestration use --mode quick, the default; for "
+                "a custom configuration use --workflow and --topology without --mode")
         workflow, selected_topology = WORKFLOW_FIVE_ROLE, "split"
     else:
         if agents:
             die("--agents is only valid with --mode standard or --mode quick")
-        workflow = requested_workflow or WORKFLOW_NEW_RUN_DEFAULT
-        selected_topology = requested_topology or "split"
-        selected_mode = (MODE_STANDARD if not requested_workflow and not requested_topology
-                         else MODE_CUSTOM)
+        if not requested_workflow and not requested_topology:
+            selected_mode = MODE_NEW_RUN_DEFAULT
+            workflow = WORKFLOW_NEW_RUN_DEFAULT
+            selected_topology = "combined" if selected_mode == MODE_QUICK else "split"
+        else:
+            workflow = requested_workflow or WORKFLOW_NEW_RUN_DEFAULT
+            selected_topology = requested_topology or "split"
+            selected_mode = MODE_CUSTOM
     review_policy = (REVIEW_COMBINED_CHECKER if selected_mode == MODE_QUICK
                      else ("legacy-completion" if workflow == WORKFLOW_LEGACY_DECODE
                            else REVIEW_INDEPENDENT))
@@ -3300,9 +3355,18 @@ def cmd_init(a: argparse.Namespace) -> None:
     (base / "docs").mkdir(parents=True)
     plan = base / "plan.mdx"
     evidence = a.evidence_mode or ("git" if git_root() else DOCUMENTS_ONLY)
-    publish(plan, template("plan").format(
+    text = template("plan").format(
         run=a.run, harness=a.harness, evidence_mode=evidence, **policy,
-    ))
+    )
+    # Stating the intent at creation saves the open-and-edit round trip a fresh
+    # plan otherwise needs before anything can be assigned.
+    if (a.title or "").strip():
+        text = text.replace("# Plan: <title>", f"# Plan: {a.title.strip()}", 1)
+    if (a.objective or "").strip():
+        meta, body = parse(text)
+        body = set_section(body, "Objective", a.objective.strip())
+        text = render(meta, body)
+    publish(plan, text)
     print(f"created {plan.relative_to(root())}")
     print(f"mode: {policy['mode']} - workflow {policy['workflow']}, "
           f"topology {policy['topology']}, sessions {policy['role_sessions']}")
@@ -3323,7 +3387,11 @@ def cmd_init(a: argparse.Namespace) -> None:
             print(f"{root()} is not inside a Git checkout, so no root was declared.")
             print(f"Declare every checkout before assigning:\n"
                   f"  docket roots {a.run} --declare app=./app lib=./lib")
-    print(f"\nNext: fill in the plan, then `docket status {a.run}`.")
+    if (a.objective or "").strip():
+        print(f"\nNext: assign the first task with `docket assign {a.run} T01 --goal TEXT "
+              "--criterion TEXT ...`.")
+    else:
+        print(f"\nNext: fill in the plan, then `docket status {a.run}`.")
 
 
 def cmd_assign(a: argparse.Namespace) -> None:
@@ -3337,6 +3405,12 @@ def cmd_assign(a: argparse.Namespace) -> None:
         a.file.extend(shlex.split(a.files))
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
+    criteria = [c.strip() for c in (a.criterion or []) if c.strip()]
+    if a.owner == "orch" and ((a.title or "").strip() or (a.goal or "").strip() or criteria
+                              or a.out_of_scope or a.decision):
+        die("--title, --goal, --criterion, --out-of-scope, and --decision describe a task; "
+            "the aggregate's intent is the plan Objective (`docket init --objective`)")
+    assign_deps: list[str] = []
     if a.owner != "orch":
         raw_deps = [e.strip() for e in (a.depends_on or []) if e.strip()]
         assign_deps = sorted({item.strip() for entry in raw_deps
@@ -3351,29 +3425,62 @@ def cmd_assign(a: argparse.Namespace) -> None:
     # its own immutable baseline here. Discovery only reads, so a capsule submitted
     # later refines scope, never the baseline underneath it.
     require_baseline(d, "run", [], kind="run")
-    if a.owner != "orch":
+    # A task gated on a dependency that is not approved yet takes its baseline
+    # at dispatch instead: the dependency's approved work then belongs to the
+    # starting point rather than showing up as this task's own out-of-scope
+    # change. It is still captured once, whole, and before its own dispatch.
+    deferred = [dep for dep in (assign_deps if a.owner != "orch" else [])
+                if state_of(d, dep)[1] not in ("approved", "completed")]
+    if a.owner != "orch" and not deferred:
         require_baseline(d, a.owner, a.file)
     task = d / f"{a.owner}-task.mdx"
     policy_fields = artifact_policy_fields(d)
     if not task.exists() and a.owner != "orch":
         delegated = a.executor == "implementor"
-        publish(
-            task,
-            template("task").format(
-                run=a.run, owner=a.owner, complexity=a.complexity,
-                executor=a.executor, harness=a.harness, model=a.model,
-                effort=a.effort,
-                scope_status="discovery" if delegated else "ready",
-                file_hints=" ".join(a.file), verify_hint=a.verify,
-                files="" if delegated else " ".join(a.file),
-                verify="" if delegated else a.verify,
-                verify_timeout=a.verify_timeout,
-                env=", ".join(sorted({e.strip() for e in a.env if e.strip()})),
-                depends_on=", ".join(sorted({e.strip() for e in a.depends_on if e.strip()})),
-                **policy_fields,
-            ),
+        text = template("task").format(
+            run=a.run, owner=a.owner, complexity=a.complexity,
+            executor=a.executor, harness=a.harness, model=a.model,
+            effort=a.effort,
+            scope_status="discovery" if delegated else "ready",
+            file_hints=" ".join(a.file), verify_hint=a.verify,
+            files="" if delegated else " ".join(a.file),
+            verify="" if delegated else a.verify,
+            verify_timeout=a.verify_timeout,
+            env=", ".join(sorted({e.strip() for e in a.env if e.strip()})),
+            depends_on=", ".join(sorted({e.strip() for e in a.depends_on if e.strip()})),
+            **policy_fields,
         )
+        # Intent stated on the command line lands in the task directly, so a
+        # simple task is dispatchable without opening and editing the template.
+        # The same intent gate still decides whether it is complete.
+        if (a.title or "").strip():
+            text = text.replace(f"# Task {a.owner}: <title>",
+                                f"# Task {a.owner}: {a.title.strip()}", 1)
+        out_of_scope = [c.strip() for c in (a.out_of_scope or []) if c.strip()]
+        decisions = [c.strip() for c in (a.decision or []) if c.strip()]
+        if (a.goal or "").strip() or criteria or out_of_scope or decisions:
+            meta, body = parse(text)
+            if (a.goal or "").strip():
+                body = set_section(body, "Goal", a.goal.strip())
+            if criteria:
+                body = set_section(body, "Acceptance criteria",
+                                   "\n".join(f"- [ ] {item}" for item in criteria))
+            if out_of_scope:
+                body = set_section(body, "Out of scope",
+                                   "\n".join(f"- {item}" for item in out_of_scope))
+            if decisions:
+                body = set_section(body, "Existing decisions",
+                                   "\n".join(f"- {item}" for item in decisions))
+            text = render(meta, body)
+        publish(task, text)
         print(f"created {task.relative_to(root())}")
+        if deferred:
+            print(f"{a.owner} depends on {', '.join(deferred)}, not approved yet: its baseline "
+                  "is captured when it is dispatched, so that work is not counted as its own")
+        if (a.goal or "").strip() or criteria:
+            problems = task_intent_problems(d, a.owner)
+            print(f"{task.name}: " + ("task intent is ready to dispatch" if not problems
+                                      else "still needs " + "; ".join(problems)))
         if len(a.file) > 8:
             print(f"note: {len(a.file)} allowed paths is a guessed breadth, not a scope "
                   "verdict; start with one coherent behavior and 3-6 acceptance "
@@ -3393,6 +3500,7 @@ def cmd_assign(a: argparse.Namespace) -> None:
         fields["verify"] = a.verify
         fields["verify_timeout"] = a.verify_timeout
     publish(rep, template(report_template).format(**fields))
+    seed_report_acceptance(d, a.owner, rep)
     print(f"created {rep.relative_to(root())}")
     if a.owner != "orch" and a.executor == "implementor":
         capsule = scope_path(d, a.owner)
@@ -3401,6 +3509,42 @@ def cmd_assign(a: argparse.Namespace) -> None:
             **policy_fields,
         ))
         print(f"created {capsule.relative_to(root())}")
+
+
+def seed_report_acceptance(d: Path, owner: str, rep: Path | None = None) -> bool:
+    """Copy the task's acceptance criteria into a report still holding the template.
+
+    The gate requires the report's criteria to match the task's exactly, and a
+    worker retyping them is the commonest way to fail it; seeded unchecked
+    boxes leave the worker only the honest part, checking what passes. Only an
+    untouched placeholder is replaced, so nothing a worker wrote is overwritten.
+    """
+    if owner == "orch":
+        return False
+    rep = rep or latest(reports(d, owner))
+    task = d / f"{owner}-task.mdx"
+    if rep is None or not rep.is_file() or not task.is_file():
+        return False
+    try:
+        meta, body = parse(rep.read_text())
+        _, task_body = parse(task.read_text())
+    except (OSError, ValueError):
+        return False
+    if meta.get("status", "draft") != "draft":
+        return False
+    criteria = [item for item in
+                raw_checkbox_lines(sections(task_body).get("Acceptance criteria", ""))
+                if "<!--" not in item]
+    current = sections(body).get("Acceptance", "")
+    written = [item for item in checkbox_items(current) if "<!--" not in item]
+    if not criteria or "- [ ] <!-- TODO -->" not in current or written:
+        return False
+    comment = re.search(r"<!--.*?-->", current.replace("- [ ] <!-- TODO -->", ""), re.S)
+    seeded = "\n".join(f"- [ ] {item}" for item in criteria)
+    body = set_section(body, "Acceptance",
+                       (comment.group(0) + "\n\n" if comment else "") + seeded)
+    publish(rep, render(meta, body))
+    return True
 
 
 def required_section_problems(body: str, required: list[str]) -> list[str]:
@@ -4064,6 +4208,9 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
     if problems:
         if is_five_role(d) and a.owner != "orch":
             note_correction(d, a.owner, "gate_repairs")
+        machine_feedback(d, "verification", a.owner,
+                         "submit refused by the gate: " + problems[0].splitlines()[0],
+                         role=a.as_role or "implementor")
         print(f"\nREJECTED: {rep.name} is not ready to submit\n", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
@@ -4178,6 +4325,91 @@ def owner_lock(d: Path, owner: str):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def owner_lock_held(d: Path, owner: str) -> bool:
+    """Whether a live process holds the owner's transition lock right now.
+
+    Read-only: a missing lock file means nobody holds it, and it is never
+    created here, so inspection stays free of writes.
+    """
+    path = d / ".locks" / f"{owner}.lock"
+    if not path.is_file():
+        return False
+    try:
+        with path.open("r") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
+def unfinished_decision(d: Path, owner: str) -> tuple[int, str, str]:
+    """An interrupted decision transition: (round, verdict, identity), or (0, "", "").
+
+    Derived from the artifacts first and the journal second, as `applied_steps`
+    does: a report left changes-requested with no next round, or an applied
+    decision over a report still submitted or blocked, is unfinished whatever
+    the journal says. A transition whose lock is held is still running, not
+    interrupted, and yields nothing.
+    """
+    try:
+        rnd, status = state_of(d, owner)
+    except (OSError, ValueError):
+        return 0, "", ""
+    if not rnd or owner_lock_held(d, owner):
+        return 0, "", ""
+    journal = read_transition(d, owner)
+    txn = str(journal.get("transition", "")) if journal.get("state") == "in-progress" else ""
+    if status == "changes-requested":
+        return rnd, "changes-requested", txn or f"{owner}-report-{rnd:02d}"
+    dec = d / f"{owner}-decision-{rnd:02d}.mdx"
+    if status in ("submitted", "blocked") and dec.is_file():
+        try:
+            dmeta, _ = parse(dec.read_text())
+        except (OSError, ValueError):
+            dmeta = {}
+        if dmeta.get("applied") == "yes" and dmeta.get("verdict"):
+            return rnd, str(dmeta["verdict"]), txn or str(dmeta.get("transition", dec.name))
+    if txn:
+        try:
+            journal_round = int(journal.get("round", 0) or 0)
+        except (TypeError, ValueError):
+            journal_round = 0
+        verdict = str(journal.get("verdict", ""))
+        if journal_round == rnd or (verdict == "reopen-waived" and journal_round):
+            return journal_round, verdict, txn
+    return 0, "", ""
+
+
+DECIDE_FLAGS = {"approved": "--approve", "waived": "--waive",
+                "changes-requested": "--changes", "reopen-waived": "--reopen"}
+
+
+def unfinished_decision_event(d: Path, run: str, owner: str) -> tuple[str, str, int, str] | None:
+    """The (key, message, round, revision) waking whoever finishes an interrupted decision."""
+    rnd, verdict, txn = unfinished_decision(d, owner)
+    if not verdict:
+        return None
+    flag = DECIDE_FLAGS.get(verdict, f"--{verdict}")
+    label = "aggregate report" if owner == "orch" else owner
+    return (f"{owner}:{rnd}:unfinished-{verdict}",
+            f"{label} round {rnd} has an interrupted {verdict} decision; repeat "
+            f"`docket decide {run} {owner} {flag}{decide_as(d)}` to finish it exactly as "
+            "recorded",
+            rnd, f"sha256:{hashlib.sha256(txn.encode()).hexdigest()}")
+
+
+def decide_as(d: Path) -> str:
+    """The `--as` suffix a decision command needs in this run, or nothing for legacy."""
+    if not is_five_role(d):
+        return ""
+    acting = authority_for(d, "decide:changes")
+    return f" --as {acting[0]}" if acting else ""
+
+
 def transition_id(run: str, owner: str, rnd: int, verdict: str, digest: str) -> str:
     """Durable identity of one decision transition, stable across restarts."""
     seed = "|".join([run, owner, str(rnd), verdict, digest])
@@ -4250,6 +4482,7 @@ def open_next_round(d: Path, a: argparse.Namespace, rnd: int, report_meta: dict[
         )
         text = render(nm, nb)
     publish(nxt, text)
+    seed_report_acceptance(d, a.owner, nxt)
     return nxt
 
 
@@ -5507,10 +5740,12 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
         for o in owners(d):
             if o == "orch":
                 continue
-            task = d / f"{o}-task.mdx"
-            tm = parse(task.read_text())[0] if task.is_file() else {}
-            if tm.get("executor", "implementor") != "implementor":
+            if not (d / f"{o}-task.mdx").is_file():
                 continue
+            # Every submitted task round needs verifier scrutiny, including an
+            # executor: orchestrator task: approval still requires a passing
+            # verification for the exact frozen bundle, so skipping these
+            # owners leaves them submitted with no route to review.
             rnd, st = state_of(d, o)
             if st != "submitted":
                 continue
@@ -5541,11 +5776,21 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
         for o in owners(d):
             if o == "orch":
                 continue
-            task = d / f"{o}-task.mdx"
-            tm = parse(task.read_text())[0] if task.is_file() else {}
-            if tm.get("executor", "implementor") != "implementor":
+            if not (d / f"{o}-task.mdx").is_file():
                 continue
             ornd, ost = state_of(d, o)
+            # The orchestrator executed this task itself, so it already knows
+            # about the block; the decision it needs belongs to the reviewer,
+            # exactly as for a blocked aggregate.
+            if ost == "blocked" and task_executor(d, o) == "orchestrator":
+                rep = d / f"{o}-report-{ornd:02d}.mdx"
+                rev = evidence_digest(rep.read_text()) if rep.is_file() else ""
+                emit(f"{o}:{ornd}:blocked",
+                     f"{o} is BLOCKED at round {ornd} and needs a decision",
+                     o, ornd, rev)
+                continue
+            # As above, a failed verification on an executor: orchestrator
+            # task still routes to the reviewer for required changes.
             if ost != "submitted" or o in exempt:
                 continue
             if not round_failed_verification(d, o, ornd):
@@ -5555,12 +5800,25 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
             matched = matching_verifications(d, o, ornd, digest, contract_rev)
             if not matched:
                 continue
-            if str(matched[-1][1].get("opened_correction", "")) == "yes":
-                continue
-            _, _, fvbody = matched[-1]
+            _, fvmeta, fvbody = matched[-1]
             findings = sections(fvbody).get("Findings", "").strip()
             revision = "sha256:" + hashlib.sha256(
                 f"{digest}:{contract_rev}:{findings}".encode()).hexdigest()
+            # A completed verifier correction leaves the report
+            # changes-requested, so a round still submitted here whose failure
+            # asked for a correction is an interrupted one. It must stay
+            # visible: nothing else wakes for it. Once its decision transition
+            # has begun, the unfinished-decision event below speaks for it,
+            # and while the owner lock is held the correction is still running.
+            if str(fvmeta.get("opened_correction", "")) in ("yes", "requested"):
+                if owner_lock_held(d, o) or unfinished_decision(d, o)[1]:
+                    continue
+                emit(f"{o}:{ornd}:verification-failed",
+                     f"{o} round {ornd} failed verification and its verifier-opened "
+                     "correction was interrupted; repeat the verifier's --open-correction "
+                     "command to finish it, or decide the required changes",
+                     o, ornd, revision)
+                continue
             emit(f"{o}:{ornd}:verification-failed",
                  f"{o} round {ornd} failed verification; decide the required changes",
                  o, ornd, revision)
@@ -5573,6 +5831,13 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
             bid = str(batch.get("batch"))
             emit(f"batch:{bid}:ready:{batch.get('generation', 1)}",
                  f"milestone batch {bid} ready for capable review", "", 0, revision)
+        if mode_of(d) == MODE_QUICK:
+            closed = [b for b in list_batches(d) if b.get("state") == "closed"]
+            derived = {str(e["key"]) for e in out}
+            for key, message, revision in review_readiness_events(
+                    d, review_scope_states(d), closed):
+                if key not in derived:
+                    emit(key, message, "", 0, revision)
         for batch in list_batches(d):
             if batch.get("state") != "closed":
                 continue
@@ -5582,6 +5847,14 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
             bid = str(batch.get("batch"))
             emit(f"batch:{bid}:frontier:{batch.get('generation', 1)}",
                  f"review frontier {bid} ready with {','.join(frontier)}", "", 0, revision)
+        # Every decision transition is the reviewer's to finish in five-role,
+        # including a verifier-opened correction, and an interrupted one leaves
+        # a state no other event describes.
+        for o in owners(d):
+            unfinished = unfinished_decision_event(d, d.name, o)
+            if unfinished:
+                key, message, urnd, revision = unfinished
+                emit(key, message, o, urnd, revision)
         escalations = d / ".escalations"
         if escalations.is_dir():
             for path in sorted(escalations.glob("*.json")):
@@ -5664,6 +5937,12 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
                 rev = evidence_digest(rep.read_text()) if rep.is_file() else ""
                 emit(f"orch:{rnd}:blocked", f"orchestrator is BLOCKED at round {rnd} and needs a decision",
                      "orch", rnd, rev)
+            # A legacy split planner decides the aggregate, so an interrupted
+            # aggregate decision is its to finish.
+            unfinished = unfinished_decision_event(d, d.name, "orch")
+            if unfinished:
+                key, message, urnd, revision = unfinished
+                emit(key, message, "orch", urnd, revision)
         for amendment in list_amendments(d):
             if amendment.get("status") != "pending":
                 continue
@@ -5676,13 +5955,47 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
         return out
 
     scope = []
+    orchestrator_tasks = []
     for o in owners(d):
         if o == "orch":
             continue
-        task = d / f"{o}-task.mdx"
-        tm = parse(task.read_text())[0] if task.is_file() else {}
-        if tm.get("executor", "implementor") == "implementor":
+        executor = task_executor(d, o)
+        if executor == "implementor":
             scope.append(o)
+        elif executor == "orchestrator":
+            orchestrator_tasks.append(o)
+
+    def emit_correction_ready(owner: str, message: str) -> None:
+        """Wake the role that can dispatch the owner into its correction round.
+
+        The wake lasts only until that round is dispatched: once a live
+        dispatch record binds the correction round, the work is in a worker's
+        hands and asking for re-dispatch again would only burn a supervisor
+        turn.
+        """
+        rnd, st = state_of(d, owner)
+        if st != "draft" or not rnd:
+            return
+        decs = _ordered(d.glob(f"{owner}-decision-*.mdx"))
+        if not decs:
+            return
+        try:
+            dmeta, _ = parse(decs[-1].read_text())
+        except (OSError, ValueError):
+            dmeta = {}
+        try:
+            dec_round = int(dmeta.get("round", 0) or 0)
+        except (TypeError, ValueError):
+            dec_round = 0
+        if str(dmeta.get("verdict", "")) != "changes-requested" or rnd <= dec_round:
+            return
+        if round_dispatched(d, owner, rnd):
+            return
+        try:
+            dec_rev = digest_of(decs[-1].read_bytes())
+        except OSError:
+            dec_rev = ""
+        emit(f"{owner}:{rnd}:correction-ready", message, owner, rnd, dec_rev)
 
     for o in scope:
         rnd, st = state_of(d, o)
@@ -5707,26 +6020,56 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
             rev = evidence_digest(rep.read_text()) if rep.is_file() else ""
             emit(f"{o}:{rnd}:blocked", f"{o} is BLOCKED at round {rnd} and needs a decision",
                  o, rnd, rev)
-        if st == "draft" and rnd:
-            decs = _ordered(d.glob(f"{o}-decision-*.mdx"))
-            if decs:
-                try:
-                    dmeta, _ = parse(decs[-1].read_text())
-                except (OSError, ValueError):
-                    dmeta = {}
-                try:
-                    dec_round = int(dmeta.get("round", 0) or 0)
-                except (TypeError, ValueError):
-                    dec_round = 0
-                if str(dmeta.get("verdict", "")) == "changes-requested" and rnd > dec_round:
-                    try:
-                        dec_rev = digest_of(decs[-1].read_bytes())
-                    except OSError:
-                        dec_rev = ""
-                    emit(f"{o}:{rnd}:correction-ready",
-                         f"{o} round {rnd} needs re-dispatch to an implementor "
-                         f"for the requested correction",
-                         o, rnd, dec_rev)
+        emit_correction_ready(
+            o, f"{o} round {rnd} needs re-dispatch to an implementor for the requested correction")
+
+    # An executor: orchestrator task has no implementor scope to enter the
+    # ordinary delegated-task projection above, and neither does the aggregate.
+    # Each correction still needs an actionable wake for the orchestrator, which
+    # owns that execution; nothing else re-enters it once the reviewer or the
+    # planner has asked for changes.
+    for o in orchestrator_tasks:
+        rnd = state_of(d, o)[0]
+        emit_correction_ready(
+            o, f"{o} round {rnd} needs re-dispatch to the orchestrator for the requested "
+            "correction")
+    orch_rnd = state_of(d, "orch")[0]
+    emit_correction_ready(
+        "orch", f"aggregate report round {orch_rnd} needs the requested correction "
+        "from the orchestrator")
+
+    # A task gated on dependencies becomes dispatchable only when they are
+    # approved, and nothing else re-enters the orchestrator at that moment: the
+    # dependent is still a draft, so neither review readiness nor all-decided
+    # forms. The wake lasts until the round is dispatched.
+    for o in scope + orchestrator_tasks:
+        rnd, st = state_of(d, o)
+        if st != "draft" or not rnd:
+            continue
+        gates = set(task_depends_on(d, o))
+        for batch in list_batches(d):
+            if o in [str(m) for m in (batch.get("members") or [])]:
+                gates.update(str(dep) for dep in ((batch.get("depends_on") or {}).get(o) or []))
+        if not gates or dispatch_dependencies_unmet(d, o) or round_dispatched(d, o, rnd):
+            continue
+        if derive_stage(d, o) != "initial":
+            # Corrections and handoffs already carry their own wakes.
+            continue
+        met = ", ".join(sorted(gates))
+        signature = ";".join(f"{dep}:{state_of(d, dep)[1]}" for dep in sorted(gates))
+        emit(f"{o}:{rnd}:dispatch-ready",
+             f"{o} is ready to dispatch: its dependencies ({met}) are approved",
+             o, rnd, f"sha256:{hashlib.sha256(signature.encode()).hexdigest()}")
+
+    # A legacy orchestrator decides its delegated task rounds itself, so an
+    # interrupted task decision is its to finish. Five-role routes these to the
+    # reviewer, who holds decision authority there.
+    if not is_five_role(d):
+        for o in scope + orchestrator_tasks:
+            unfinished = unfinished_decision_event(d, d.name, o)
+            if unfinished:
+                key, message, urnd, revision = unfinished
+                emit(key, message, o, urnd, revision)
 
     for incident in list_incidents(d):
         if incident.get("state") != "open":
@@ -5747,37 +6090,16 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
 
     closed_batches = [b for b in list_batches(d) if b.get("state") == "closed"]
     terminal = {"approved", "waived", "completed"}
-    states = [(o, *state_of(d, o)) for o in scope]
+    # The same tracked set gates review readiness and the all-decided wake.
+    states = review_scope_states(d)
     if states and not any(st == "blocked" for _, _, st in states):
-        if not closed_batches and any(st == "submitted" for _, _, st in states) and all(
-            st == "submitted" or st in terminal for _, _, st in states
-        ):
-            failed = [o for o, rnd, st in states
-                      if st == "submitted" and is_five_role(d)
-                      and round_failed_verification(d, o, rnd)]
-            if failed:
-                # A failed verification routes to the reviewer separately; the
-                # batch must not describe the failed round as ready for review.
-                pass
-            else:
-                signature = ";".join(f"{o}:{rnd}:{st}" for o, rnd, st in states)
-                digest = hashlib.sha256(signature.encode()).hexdigest()[:12]
-                submitted = [f"{o} round {rnd}" for o, rnd, st in states if st == "submitted"]
-                emit(f"review-batch:{digest}",
-                     f"review batch ready with {len(submitted)} submitted task report(s): "
-                     + ", ".join(submitted),
-                     "", 0, f"sha256:{hashlib.sha256(signature.encode()).hexdigest()}")
-        for batch in closed_batches:
-            ready, revision = batch_ready(d, batch)
-            if not ready:
-                continue
-            bid = str(batch.get("batch"))
-            gen = batch.get("generation", 1)
-            members = ",".join(str(m) for m in (batch.get("members") or []))
-            emit(f"batch:{bid}:ready:{gen}",
-                 f"review batch {bid} ready with {members}"
-                 + (" (milestone)" if batch.get("milestone") else ""),
-                 "", 0, revision)
+        # In quick the checker holds the review duty itself, so verified work
+        # wakes the checker directly; routing it through the coordinator would
+        # spend a coordinator turn, and usually a checker prompt, on news the
+        # checker acts on anyway.
+        if mode_of(d) != MODE_QUICK:
+            for key, message, revision in review_readiness_events(d, states, closed_batches):
+                emit(key, message, "", 0, revision)
         orch_status = state_of(d, "orch")[1]
         if all(st in terminal for _, _, st in states) and orch_status not in {
             "submitted", "completed", "approved", "waived",
@@ -5788,12 +6110,12 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
             agg_stale = stale_aggregate(d)
             if agg_stale:
                 emit(f"all:decided:stale-aggregate:{sig12}",
-                     f"all {len(scope)} delegated tasks decided, but the aggregate bundle is stale; "
+                     f"all {len(states)} delegated tasks decided, but the aggregate bundle is stale; "
                      f"resubmit the orchestrator report to freeze a new one",
                      "", 0, revision)
             else:
                 emit(f"all:decided:{sig12}",
-                     f"all {len(scope)} delegated tasks decided - complete the aggregate report",
+                     f"all {len(states)} delegated tasks decided - complete the aggregate report",
                      "", 0, revision)
 
     # Notify of reopened tasks that invalidate existing aggregate evidence.
@@ -5806,6 +6128,80 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
                  f"it is stale and must be resubmitted",
                  o, int(rnd or 0), str(journal.get("evidence_digest", "")))
     return out
+
+
+def review_scope_states(d: Path) -> list[tuple[str, int, str]]:
+    """(owner, round, status) for every task whose review readiness is tracked.
+
+    Delegated tasks always count. Under five-role-v1 an orchestrator-owned task
+    is verified and decided like delegated work, so it counts too; legacy runs
+    complete those tasks on submission and keep their original projection.
+    """
+    five = is_five_role(d)
+    out: list[tuple[str, int, str]] = []
+    for o in owners(d):
+        if o == "orch":
+            continue
+        executor = task_executor(d, o)
+        if executor == "implementor" or (five and executor == "orchestrator"):
+            out.append((o, *state_of(d, o)))
+    return out
+
+
+def review_readiness_events(d: Path, states: list[tuple[str, int, str]],
+                            closed_batches: list[dict]) -> list[tuple[str, str, str]]:
+    """(key, message, revision) for work that is ready for a review decision.
+
+    Without closed batches, one whole-run batch forms once every tracked task
+    is submitted or terminal. Under five-role-v1 readiness means verified:
+    waking a supervisor at submission leaves it nothing to route and nothing
+    to wait on, so it would poll until the verifier finished. The batch waits
+    for every submitted member to hold a resolved verification (pass,
+    uncertain, or verifier_exempt); a failure routes to the reviewer
+    separately and keeps the batch unready. Verdicts and findings are part of
+    the identity, so a new verification after a failure yields a new wake.
+    """
+    terminal = {"approved", "waived", "completed"}
+    five = is_five_role(d)
+    found: list[tuple[str, str, str]] = []
+    if not states or any(st == "blocked" for _, _, st in states):
+        return found
+    if not closed_batches and any(st == "submitted" for _, _, st in states) and all(
+        st == "submitted" or st in terminal for _, _, st in states
+    ):
+        signature = ";".join(f"{o}:{rnd}:{st}" for o, rnd, st in states)
+        resolved = True
+        if five:
+            fragments = []
+            for o, rnd, st in states:
+                if st != "submitted":
+                    continue
+                fragment = verification_fragment(d, o, rnd)
+                if not fragment:
+                    resolved = False
+                    break
+                fragments.append(fragment)
+            signature = ";".join([signature, *fragments])
+        if resolved:
+            digest = hashlib.sha256(signature.encode()).hexdigest()[:12]
+            submitted = [f"{o} round {rnd}" for o, rnd, st in states if st == "submitted"]
+            kind = "verified" if five else "submitted"
+            found.append((f"review-batch:{digest}",
+                          f"review batch ready with {len(submitted)} {kind} task report(s): "
+                          + ", ".join(submitted),
+                          f"sha256:{hashlib.sha256(signature.encode()).hexdigest()}"))
+    for batch in closed_batches:
+        ready, revision = batch_ready(d, batch)
+        if not ready:
+            continue
+        bid = str(batch.get("batch"))
+        gen = batch.get("generation", 1)
+        members = ",".join(str(m) for m in (batch.get("members") or []))
+        found.append((f"batch:{bid}:ready:{gen}",
+                      f"review batch {bid} ready with {members}"
+                      + (" (milestone)" if batch.get("milestone") else ""),
+                      revision))
+    return found
 
 
 def events(d: Path, role: str) -> list[tuple[str, str]]:
@@ -5991,7 +6387,16 @@ def cmd_watch(a: argparse.Namespace) -> None:
                             ok, _ = event_actionable(d, pending)
                             if not ok:
                                 continue
-                            if not announce_active(d, role, k):
+                            # Only an announcement that never reached the
+                            # harness is owed again. A delivered wake stays
+                            # delivered while its identity holds: the event
+                            # usually persists because another role is still
+                            # working on it, and re-waking the supervisor every
+                            # lease period is exactly the polling this exists
+                            # to prevent. A moved identity retires the record
+                            # in sweep_role, so a changed event still wakes.
+                            if not announce_active(d, role, k) \
+                                    and not announce_delivered(d, role, k):
                                 claimed.append((k, m))
                         for k, _m in claimed:
                             pending = read_pending(d, role, k)
@@ -6037,6 +6442,9 @@ def cmd_watch(a: argparse.Namespace) -> None:
                 + " final completion, or an explicit status request.",
                 file=sys.stderr,
             )
+            sys.stderr.flush()
+            for run, role, _led, k, _m in fresh:
+                mark_announce_delivered(run_dir(run), role, k)
             raise SystemExit(2)
         if time.monotonic() >= deadline:
             raise SystemExit(0)
@@ -6115,6 +6523,24 @@ def announce_active(d: Path, role: str, key: str) -> bool:
     except (TypeError, ValueError):
         return False
     return until > now_s()
+
+
+def announce_delivered(d: Path, role: str, key: str) -> bool:
+    """Whether the watcher handed this announcement to the harness.
+
+    The watcher marks an announcement delivered only after its banner is
+    written and immediately before it exits 2, so a crash anywhere before that
+    leaves the mark absent and the lease-bounded re-announcement still applies.
+    """
+    return bool(read_announce(d, role, key).get("delivered_at"))
+
+
+def mark_announce_delivered(d: Path, role: str, key: str) -> None:
+    record = read_announce(d, role, key)
+    if not record:
+        return
+    record["delivered_at"] = now_s()
+    publish_json(announce_path(d, role, key), record)
 
 
 def sessions_dir() -> Path:
@@ -6396,6 +6822,34 @@ def cmd_session(a: argparse.Namespace) -> None:
     print(f"registered session {sid} for {a.run} {a.role} (generation {generation})")
 
 
+def ensure_session_registration(run: str, sid: str, role: str, name: str) -> dict:
+    """Register a worker session for dispatch unless it is already registered here.
+
+    Unlike `docket session --register`, an existing matching registration is
+    reused rather than advanced, so a retried dispatch stays the same writer.
+    """
+    check_session_id(sid)
+    reg = read_registration(sid)
+    workspace = str(root().resolve())
+    if reg:
+        if str(reg.get("run", "")) != run:
+            die(f"session {sid!r} is registered for run {reg.get('run')!r}; use a new session id")
+        if str(reg.get("role", "")) != role:
+            die(f"session {sid!r} is registered for role {reg.get('role')!r}, not {role!r}")
+        if str(reg.get("workspace", "")) != workspace:
+            die(f"session {sid!r} is registered for workspace {reg.get('workspace')!r}; "
+                f"re-register it here with `docket session {run} --register --session {sid} "
+                f"--name NAME --role {role}`")
+        return reg
+    record: dict[str, object] = {
+        "session": sid, "run": run, "role": role, "workspace": workspace,
+        "generation": 1, "name": name or sid, "registered_at": stamp(),
+    }
+    publish(session_path(sid), json.dumps(record, indent=2, sort_keys=True) + "\n")
+    print(f"registered session {sid} for {run} {role} (generation 1)")
+    return record
+
+
 def inbox_ack(a: argparse.Namespace, d: Path) -> None:
     """Record receipt of a claimed event. Receipt is not completion."""
     with delivery_lock(d, a.role):
@@ -6536,10 +6990,12 @@ def batch_ready(d: Path, batch: dict) -> tuple[bool, str]:
     outside the batch - including future tasks waiting on batch members -
     never block it. A member is ready when submitted or terminal and every
     task it explicitly depends on is terminal. Under five-role-v1 a closed
-    milestone batch is additionally ready only when every submitted member
-    has a resolved verification for its current round and evidence, where
-    resolved means a recorded pass or uncertain verdict, or verifier_exempt
-    coverage. A fail verdict or a correction keeps it unready.
+    batch, milestone or not, is additionally ready only when every submitted
+    member has a resolved verification for its current round and evidence,
+    where resolved means a recorded pass or uncertain verdict, or
+    verifier_exempt coverage. A fail verdict or a correction keeps it unready.
+    Readiness before verification would wake a supervisor with nothing to
+    route and no later event to wait on.
     """
     terminal = {"approved", "waived", "completed"}
     members = [str(m) for m in (batch.get("members") or [])]
@@ -6562,7 +7018,7 @@ def batch_ready(d: Path, batch: dict) -> tuple[bool, str]:
                    + [f"{m}:{states[m]}" for m in sorted(states)]
                    + [f"{m}->{dep}:{dep_states[dep]}" for m in sorted(deps)
                       for dep in sorted(deps[m] or []) if dep in dep_states])
-    if not (is_five_role(d) and batch.get("milestone")):
+    if not is_five_role(d):
         return True, f"sha256:{hashlib.sha256(base_sig.encode()).hexdigest()}"
     ver_parts: list[str] = []
     for member in sorted(members):
@@ -7598,10 +8054,11 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
         check("hook-announce", "passed",
               f"real watch pid {announce.pid} exited 2 with the event in the "
               "role ledger", pid=announce.pid, exit=announce_rc, argv=watch_argv)
-    elif (announce_rc == 0 and announced and announce_active(d, role, key)):
+    elif (announce_rc == 0 and announced
+          and (announce_active(d, role, key) or announce_delivered(d, role, key))):
         check("hook-announce", "passed",
-              "announcement already active under a live lease; verified in the "
-              "ledger and announce records instead of double-announcing",
+              "announcement already active under a live lease or already delivered; "
+              "verified in the ledger and announce records instead of double-announcing",
               pid=announce.pid, exit=announce_rc, argv=watch_argv)
     else:
         check("hook-announce", "failed",
@@ -8168,7 +8625,7 @@ def cmd_help(a: argparse.Namespace) -> None:
     reference = Path(__file__).resolve().parent.parent / "references" / f"{a.role}.md"
     if not reference.is_file():
         die(f"missing playbook: {reference}")
-    body = reference.read_text().strip()
+    body = unwrap_markdown(reference.read_text().strip())
     if contract:
         print(f"# Role: {a.role}\n\n{contract}\n\n{body}")
     else:
@@ -8249,6 +8706,20 @@ FIVE_ROLE_AUTHORITY = {
 }
 
 
+def task_executor(d: Path, owner: str) -> str:
+    """Who executes a task: `implementor` unless its task file says otherwise.
+
+    A report with no task file keeps the historical reading as delegated work.
+    """
+    task = d / f"{owner}-task.mdx"
+    if not task.is_file():
+        return "implementor"
+    try:
+        return parse(task.read_text())[0].get("executor", "implementor") or "implementor"
+    except (OSError, ValueError):
+        return "implementor"
+
+
 def submit_op_for(d: Path, owner: str) -> str:
     task = d / f"{owner}-task.mdx"
     if owner == "orch":
@@ -8288,8 +8759,12 @@ def correction_attempts(record: dict) -> int:
     return total
 
 
-def note_correction(d: Path, owner: str, kind: str) -> dict:
-    """Count one local correction attempt. Only meaningful in five-role runs."""
+def note_correction(d: Path, owner: str, kind: str, token: str = "") -> dict:
+    """Count one local correction attempt. Only meaningful in five-role runs.
+
+    A token names the artifact the attempt belongs to, so retrying an
+    interrupted command that already counted it never charges the budget twice.
+    """
     record = read_corrections(d, owner)
     if not record:
         try:
@@ -8298,7 +8773,13 @@ def note_correction(d: Path, owner: str, kind: str) -> dict:
             rnd = 0
         record = {"owner": owner, "chain_start_round": rnd, "gate_repairs": 0,
                   "verifier_returns": 0, "reviewer_returns": 0, "escalated": ""}
+    counted = record.get("counted")
+    counted = [str(item) for item in counted] if isinstance(counted, list) else []
+    if token and token in counted:
+        return record
     record[kind] = int(record.get(kind, 0) or 0) + 1
+    if token:
+        record["counted"] = counted + [token]
     publish_json(corrections_path(d, owner), record)
     return record
 
@@ -8343,16 +8824,20 @@ def open_escalation(d: Path, owner: str, record: dict, why: str) -> dict:
     record["escalated"] = entry["id"]
     publish_json(corrections_path(d, owner), record)
     publish_json(path, entry)
+    machine_feedback(d, "review", owner, f"correction budget exhausted: {why}")
     return entry
 
 
-def guard_correction_budget(d: Path, owner: str, opening: str) -> None:
+def guard_correction_budget(d: Path, owner: str, opening: str,
+                            on_exhausted: object = None) -> None:
     """Refuse another correction round once the local budget is exceeded."""
     record = read_corrections(d, owner)
     if not record:
         return
     if correction_attempts(record) <= correction_limit_of(d):
         return
+    if callable(on_exhausted):
+        on_exhausted()
     entry = open_escalation(d, owner, record,
                             f"local correction budget exceeded by {opening}")
     die(f"{owner} exceeded its local correction budget "
@@ -8395,42 +8880,158 @@ def cmd_verify(a: argparse.Namespace) -> None:
     if a.owner == "orch":
         die("the aggregate is reviewed directly by the reviewer; "
             "verify its constituent task rounds instead")
-    rep = latest(reports(d, a.owner))
-    if not rep:
-        die(f"no report for {a.owner} in {a.run}")
-    report_meta, _ = parse(rep.read_text())
-    if report_meta.get("status") != "submitted":
-        die(f"{rep.name} is {report_meta.get('status')}, not submitted; "
-            "verification records against the submitted round only")
-    rnd = int(report_meta.get("round", "1"))
-    task_file = d / f"{a.owner}-task.mdx"
-    contract_rev = digest_of(task_file.read_bytes()) if task_file.is_file() else ""
-    frozen, _ = current_bundle(d, a.owner, rnd)
-    bundle_digest = str((frozen or {}).get("digest", ""))
     detail = (a.detail or "").strip() or "none"
     with owner_lock(d, a.owner):
+        rep = latest(reports(d, a.owner))
+        if not rep:
+            die(f"no report for {a.owner} in {a.run}")
+        report_meta, _ = parse(rep.read_text())
+        rnd = int(report_meta.get("round", "1"))
+        status = report_meta.get("status")
+        # An interrupted verifier correction is finished, never re-recorded: a
+        # second verification and a second budget charge for one failure would
+        # be the exact duplication the recorded transition exists to prevent.
+        # Interrupted after the report step, the round already reads
+        # changes-requested with no next round, and only this path finishes it.
+        interrupted = None
+        if status in ("submitted", "changes-requested"):
+            interrupted = interrupted_verifier_correction(d, a.owner, rnd)
+        if status != "submitted" and interrupted is None:
+            die(f"{rep.name} is {status}, not submitted; "
+                "verification records against the submitted round only")
+        if interrupted is not None:
+            finish_verifier_correction(a, d, rnd, interrupted)
+            return
+
+        task_file = d / f"{a.owner}-task.mdx"
+        contract_rev = digest_of(task_file.read_bytes()) if task_file.is_file() else ""
+        frozen, _ = current_bundle(d, a.owner, rnd)
+        bundle_digest = str((frozen or {}).get("digest", ""))
         attempt = len(verification_paths(d, a.owner, rnd)) + 1
         seq = len(verification_paths(d, a.owner)) + 1
         path = d / f"{a.owner}-verification-{seq:02d}.mdx"
+        if a.open_correction and a.result != "fail":
+            die("--open-correction applies only to --result fail. Nothing was recorded")
+        # A correction the policy forbids still leaves the failure on record: the
+        # finding is evidence, and the reviewer decides the required changes.
+        refused_policy = a.open_correction and not verifier_correction_allowed(d)
+        opening = a.result == "fail" and a.open_correction and not refused_policy
+        body = (f"# Verification: {a.owner} round {rnd} attempt {attempt}\n\n"
+                f"## Result\n\n{a.result}\n\n## Findings\n\n{detail}\n")
+        if opening and not verifier_correction_changes(body, path.name):
+            die(f"cannot open a verifier correction for {a.owner} round {rnd}: the findings "
+                "carry no numbered required change and no finding text to derive one from; "
+                "record specific findings with --detail TEXT so the opened round carries "
+                "numbered required changes. Nothing was recorded")
+        # The intent to open a correction is recorded in the same write as the
+        # finding, so an interruption anywhere after it is recognisable and
+        # finishable rather than silently stranded.
         meta = {"run": a.run, "task": a.owner, "owner": a.owner, "round": str(rnd),
                 "attempt": str(attempt), "verifier": a.verifier or "verifier",
                 "result": a.result, "contract_revision": contract_rev,
-                "bundle_digest": bundle_digest, "opened_correction": "no",
+                "bundle_digest": bundle_digest,
+                "opened_correction": "requested" if opening else "no",
                 **artifact_policy_fields(d)}
-        body = (f"# Verification: {a.owner} round {rnd} attempt {attempt}\n\n"
-                f"## Result\n\n{a.result}\n\n## Findings\n\n{detail}\n")
         publish(path, render(meta, body))
         if a.result == "fail":
-            if a.open_correction and not verifier_correction_allowed(d):
-                die(f"verifier-triggered corrections need "
-                    "`verifier_correction: allowed` in plan.mdx; the failure is recorded in "
-                    f"{path.name} and the round stays submitted")
-            note_correction(d, a.owner, "verifier_returns")
-            if a.open_correction:
-                guard_correction_budget(d, a.owner, f"verification attempt {attempt}")
+            if refused_policy:
+                die("verifier-triggered corrections need `verifier_correction: allowed` in "
+                    f"plan.mdx; the failure is recorded in {path.name} and the round stays "
+                    "submitted for the reviewer to decide")
+            note_correction(d, a.owner, "verifier_returns", token=path.name)
+            if opening:
+                guard_correction_budget(
+                    d, a.owner, f"verification attempt {attempt}",
+                    on_exhausted=lambda: mark_verification_correction(path, "escalated"))
+                fault("verify:before-correction")
                 open_verifier_correction(a, d, rnd, path)
                 return
     print(f"recorded {path.name}: {a.result} (report stays submitted)")
+
+
+def mark_verification_correction(vpath: Path, state: str) -> None:
+    """Record how a verification's requested correction stands."""
+    vmeta, vbody = parse(vpath.read_text())
+    if vmeta.get("opened_correction") != state:
+        vmeta["opened_correction"] = state
+        publish(vpath, render(vmeta, vbody))
+
+
+def interrupted_verifier_correction(d: Path, owner: str, rnd: int) -> Path | None:
+    """The verification whose correction began but never opened the next round.
+
+    Called only while the round is still submitted: a finished verifier
+    correction leaves the report changes-requested. Evidence is read from the
+    artifacts first and the journal second, exactly as `applied_steps` does,
+    so a lost journal still leaves the transition finishable.
+    """
+    journal = read_transition(d, owner)
+    if journal.get("state") == "in-progress" and journal.get("verdict") == "changes-requested" \
+            and str(journal.get("round", "")) == str(rnd):
+        jmeta = journal.get("decision_meta")
+        if isinstance(jmeta, dict) and jmeta.get("triggered_by") and jmeta.get("verification"):
+            vpath = d / str(jmeta["verification"])
+            if vpath.is_file():
+                return vpath
+    dec = d / f"{owner}-decision-{rnd:02d}.mdx"
+    if dec.is_file():
+        try:
+            dmeta, _ = parse(dec.read_text())
+        except (OSError, ValueError):
+            dmeta = {}
+        if dmeta.get("applied") == "yes" and dmeta.get("verdict") == "changes-requested" \
+                and dmeta.get("triggered_by") and dmeta.get("verification"):
+            vpath = d / str(dmeta["verification"])
+            if vpath.is_file():
+                return vpath
+    vpath, vmeta, _ = latest_verification(d, owner, rnd)
+    if vpath is not None and vmeta.get("result") == "fail" \
+            and vmeta.get("opened_correction") in ("requested", "yes"):
+        return vpath
+    return None
+
+
+def finish_verifier_correction(a: argparse.Namespace, d: Path, rnd: int, vpath: Path) -> None:
+    """Finish an interrupted verifier correction exactly as it was recorded."""
+    cmd = (f"docket verify {a.run} {a.owner} --result fail --open-correction "
+           f"--as {a.as_role or 'verifier'}")
+    if a.result != "fail" or not a.open_correction:
+        die(f"{a.owner} round {rnd} has an unfinished verifier-triggered correction opened "
+            f"from {vpath.name}; finish it with `{cmd}` (the recorded findings are reused), "
+            "or the reviewer finishes it with "
+            f"`docket decide {a.run} {a.owner} --changes{decide_as(d)}`. Nothing was recorded")
+    _, vbody = parse(vpath.read_text())
+    recorded = sections(vbody).get("Findings", "").strip()
+    supplied = (a.detail or "").strip()
+    if supplied and supplied != recorded:
+        die(f"{vpath.name} already recorded these findings:\n{recorded}\n"
+            "A retry finishes that correction and never replaces it; repeat the command "
+            "without --detail, or state anything new in the next round. Nothing was recorded")
+    note_correction(d, a.owner, "verifier_returns", token=vpath.name)
+    guard_correction_budget(
+        d, a.owner, f"verification {vpath.name}",
+        on_exhausted=lambda: mark_verification_correction(vpath, "escalated"))
+    print(f"resuming the interrupted verifier correction from {vpath.name}")
+    open_verifier_correction(a, d, rnd, vpath)
+
+
+def group_numbered_items(raw_lines: list[str]) -> list[str]:
+    """Fold continuation lines into the numbered item they follow.
+
+    A numbered line (`1. ...`) starts a new item; a following non-blank,
+    non-numbered line - typically an indented constraint - belongs to that
+    item and is carried verbatim, so multiline findings survive into the
+    generated decision and the implementation prompt. Stray prose before the
+    first numbered line is dropped: only numbered items count as required
+    changes, which keeps the correction validation intact.
+    """
+    items: list[str] = []
+    for line in raw_lines:
+        if re.match(r"^\s*\d+[.)]\s+\S", line):
+            items.append(line.strip())
+        elif items:
+            items[-1] += "\n" + line.rstrip()
+    return items
 
 
 def verifier_correction_changes(vbody: str, vname: str) -> list[str] | None:
@@ -8447,46 +9048,73 @@ def verifier_correction_changes(vbody: str, vname: str) -> list[str] | None:
     findings = sections(vbody).get("Findings", "").strip()
     if not findings or findings.lower() == "none":
         return None
-    lines = [line.strip() for line in findings.splitlines() if line.strip()]
+    lines = [line.rstrip() for line in findings.splitlines() if line.strip()]
     if not lines:
         return None
-    numbered = [line for line in lines if re.match(r"^\s*\d+[.)]\s+\S", line)]
+    numbered = group_numbered_items(lines)
     if numbered:
         return numbered
-    return [f"{i}. Address verifier finding in {vname}: {line}"
+    return [f"{i}. Address verifier finding in {vname}: {line.strip()}"
             for i, line in enumerate(lines, 1)]
 
 
 def open_verifier_correction(a: argparse.Namespace, d: Path, rnd: int,
                              vpath: Path) -> None:
-    """Open a correction round from a verifier failure under configured policy."""
+    """Open a correction round from a verifier failure under configured policy.
+
+    Retry-safe in every window: a journalled payload or an applied decision
+    that names this verification is finished exactly as recorded, and only
+    when neither exists is a decision built from the findings. Any other
+    decision or unfinished transition for the round is refused, never
+    overwritten.
+    """
     rep = d / f"{a.owner}-report-{rnd:02d}.mdx"
     report_meta, report_body = parse(rep.read_text())
     dec = d / f"{a.owner}-decision-{rnd:02d}.mdx"
-    if dec.is_file():
-        die(f"{dec.name} already exists; the correction INFO is recorded, not duplicated")
+    journal = read_transition(d, a.owner)
+    recorded = pending_payload(journal, rnd, "changes-requested")
+    decision_meta: dict[str, str] | None = None
+    decision_body = ""
+    if recorded and recorded[0].get("verification") == vpath.name:
+        decision_meta, decision_body = recorded
+    elif journal.get("state") == "in-progress":
+        die(f"{a.owner} has an unfinished {journal.get('verdict')} transition "
+            f"{journal.get('transition')} for round {journal.get('round')}; the reviewer "
+            f"finishes it by repeating that verdict with `docket decide {a.run} {a.owner} "
+            f"{DECIDE_FLAGS.get(str(journal.get('verdict')), '')}{decide_as(d)}`")
+    elif dec.is_file():
+        dmeta, dbody = parse(dec.read_text())
+        if dmeta.get("applied") == "yes" and dmeta.get("verdict") == "changes-requested" \
+                and dmeta.get("verification") == vpath.name:
+            decision_meta, decision_body = dmeta, dbody
+        else:
+            die(f"{dec.name} already exists and was not opened from {vpath.name}; finish "
+                f"that decision with `docket decide {a.run} {a.owner} --changes{decide_as(d)}`")
     vmeta, vbody = parse(vpath.read_text())
-    changes = verifier_correction_changes(vbody, vpath.name)
-    if not changes:
-        die(f"cannot open a verifier correction from {vpath.name}: its Findings "
-            f"section carries no numbered required change and no finding text to "
-            f"derive one from; record specific findings with --detail TEXT so the "
-            f"opened round carries numbered required changes")
-    digest = evidence_digest(report_body)
-    txn = transition_id(a.run, a.owner, rnd, "changes-requested", digest)
-    acting = authority_for(d, "verifier-correction")
-    acting_role = acting[0] if acting else "verifier"
-    decision_meta = {"run": a.run, "task": a.owner, "owner": a.owner,
-                     "round": str(rnd), "verdict": "changes-requested",
-                     "reviewer": acting_role, "triggered_by": acting_role,
-                     "verification": vpath.name, "evidence_digest": digest,
-                     "applied": "yes", "transition": txn,
-                     **artifact_policy_fields(d)}
-    decision_body = (f"# Decision: {a.owner} round {rnd}\n\n## Verdict\n\nchanges-requested\n\n"
-                     f"## Reason\n\nverifier finding in {vpath.name}\n\n"
-                     "## Required changes\n\n" + "\n".join(changes) + "\n")
-    vmeta["opened_correction"] = "yes"
-    publish(vpath, render(vmeta, vbody))
+    if decision_meta is None:
+        changes = verifier_correction_changes(vbody, vpath.name)
+        if not changes:
+            die(f"cannot open a verifier correction from {vpath.name}: its Findings "
+                f"section carries no numbered required change and no finding text to "
+                f"derive one from; record specific findings with --detail TEXT so the "
+                f"opened round carries numbered required changes")
+        digest = evidence_digest(report_body)
+        txn = transition_id(a.run, a.owner, rnd, "changes-requested", digest)
+        acting = authority_for(d, "verifier-correction")
+        acting_role = acting[0] if acting else "verifier"
+        decision_meta = {"run": a.run, "task": a.owner, "owner": a.owner,
+                         "round": str(rnd), "verdict": "changes-requested",
+                         "reviewer": acting_role, "triggered_by": acting_role,
+                         "verification": vpath.name, "evidence_digest": digest,
+                         "applied": "yes", "transition": txn,
+                         **artifact_policy_fields(d)}
+        decision_body = (f"# Decision: {a.owner} round {rnd}\n\n## Verdict\n\n"
+                         "changes-requested\n\n"
+                         f"## Reason\n\nverifier finding in {vpath.name}\n\n"
+                         "## Required changes\n\n" + "\n".join(changes) + "\n")
+    if vmeta.get("opened_correction") != "yes":
+        vmeta["opened_correction"] = "yes"
+        publish(vpath, render(vmeta, vbody))
     commit_transition(a, d, rnd, "changes-requested", rep, report_meta, report_body,
                       dec, decision_meta, decision_body)
     print(f"{a.owner} round {rnd} needs changes (verifier-triggered) -> {dec.name}")
@@ -8641,6 +9269,8 @@ RENDERER_SOURCE_FUNCTIONS = (
     "contract_path",
     "load_contract",
     "read_contract",
+    "unwrap_markdown",
+    "prompt_steps",
 )
 
 RENDERER_SOURCE_CONSTANTS = (
@@ -8744,6 +9374,36 @@ def match_model_profile(model: str) -> str:
     return ""
 
 
+def unwrap_markdown(text: str) -> str:
+    """Join hard-wrapped prose so each paragraph and list item is one line.
+
+    Reference files are wrapped for human editors; a model reads the wrap as
+    noise. Fenced code, table rows, headings, and blank lines are kept byte for
+    byte, so literal commands, fences, and tables survive unchanged.
+    """
+    out: list[str] = []
+    fenced = False
+    joinable = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            fenced = not fenced
+            out.append(line)
+            joinable = False
+            continue
+        if fenced or not stripped or stripped.startswith(("|", "#", "<!--")):
+            out.append(line)
+            joinable = False
+            continue
+        starts_item = re.match(r"^(\s*)([-*+]|\d+[.)])\s+\S", line) is not None
+        if joinable and not starts_item:
+            out[-1] = out[-1].rstrip() + " " + stripped
+            continue
+        out.append(line.rstrip())
+        joinable = True
+    return "\n".join(out)
+
+
 def ranked_cards(task_text: str) -> list[str]:
     """Card names ordered by trigger relevance. No budget applied here."""
     haystack = (task_text or "").lower()
@@ -8751,7 +9411,10 @@ def ranked_cards(task_text: str) -> list[str]:
     for name in list_cards():
         meta, _ = read_profile(name)
         triggers = [t.strip().lower() for t in meta.get("triggers", "").split(",") if t.strip()]
-        hits = sum(1 for t in triggers if t and t in haystack)
+        # A trigger matches at the start of a word, so a stem like `concurren`
+        # still finds `concurrency` while `lock` no longer fires on `block`.
+        hits = sum(1 for t in triggers
+                   if t and re.search(r"(?<![a-z0-9])" + re.escape(t), haystack))
         if hits:
             scored.append((-hits, name))
     scored.sort()
@@ -8761,7 +9424,7 @@ def ranked_cards(task_text: str) -> list[str]:
 def guidance_block(name: str) -> str:
     """One optional guidance block exactly as carried in the prompt."""
     _, body = read_profile(name)
-    return f"[{name}]\n{body.strip()}" if body.strip() else ""
+    return f"[{name}]\n{unwrap_markdown(body.strip())}" if body.strip() else ""
 
 
 def select_guidance(profile_name: str, task_text: str,
@@ -8911,8 +9574,8 @@ def applicable_verification_obligations(claim_text: str) -> tuple[str, str]:
         else:
             lines.append("  why: applies because the submitted contract or report claims "
                          + ", ".join(repr(hit) for hit in hits))
-        lines.append("  duty:")
-        lines.extend(f"    {line}" if line else "" for line in body.splitlines())
+        lines.append("  duty: " + " ".join(
+            line.strip() for line in unwrap_markdown(body).splitlines() if line.strip()))
     lines += ["", "Discovery may reveal another relevant obligation or risk; raise it "
               "even when no deterministic selector predicted it."]
     return "\n".join(lines), digest_of(path.read_bytes())
@@ -8957,7 +9620,12 @@ def latest_checkpoint(d: Path, owner: str) -> Path | None:
 
 
 def decision_required_lines(d: Path, owner: str) -> tuple[Path | None, list[str]]:
-    """Every numbered required change from the latest decision, verbatim."""
+    """Every numbered required change from the latest decision, verbatim.
+
+    Multiline numbered items keep their indented continuation lines folded
+    into the item they follow; a section with no numbered line still yields
+    nothing, so a correction without actionable changes keeps refusing.
+    """
     decs = _ordered(d.glob(f"{owner}-decision-*.mdx"))
     if not decs:
         return None, []
@@ -8967,8 +9635,7 @@ def decision_required_lines(d: Path, owner: str) -> tuple[Path | None, list[str]
         return decs[-1], []
     section = sections(body).get("Required changes", "")
     lines = [line.rstrip() for line in section.splitlines() if line.strip()]
-    numbered = [line for line in lines if re.match(r"^\s*\d+[.)]\s+\S", line)]
-    return decs[-1], numbered
+    return decs[-1], group_numbered_items(lines)
 
 
 def derive_stage(d: Path, owner: str) -> str:
@@ -9015,7 +9682,13 @@ def derive_stage(d: Path, owner: str) -> str:
         if decs and rnd > 1:
             return "correction"
         return "initial"
-    if status in ("blocked", "changes-requested"):
+    if status == "blocked":
+        # An honest block awaits a reviewer verdict (waive or changes), exactly
+        # like a submission awaits review. It carries no decision artifact and
+        # no numbered required changes, so deriving correction would point the
+        # reviewer at a decision that does not exist.
+        return "review"
+    if status == "changes-requested":
         return "correction"
     if status in ("approved", "completed", "waived"):
         return "review"
@@ -9066,9 +9739,13 @@ def rendering_problem(d: Path, run: str, owner: str, role: str, stage: str,
             rnd, status = state_of(d, owner)
         except (OSError, ValueError):
             return f"missing required artifact: {owner}-report-*.mdx for {stage}"
-        if status != "submitted" and status not in ("approved", "completed", "waived"):
+        if status not in ("submitted", "approved", "completed", "waived") \
+                and not (status == "blocked" and stage == "review"):
             return f"missing required artifact: submitted {owner} report for {stage} (found {status})"
-        if stage == "review":
+        if stage == "review" and status != "blocked":
+            # A blocked submission skips verification by design - the reviewer
+            # decides the waiver on the stated question, not on a test run -
+            # so no verification artifact may be demanded for it here.
             paths = _ordered(d.glob(f"{owner}-verification-*.mdx"))
             if not paths:
                 return f"missing required artifact: {owner}-verification-*.mdx for review"
@@ -9137,18 +9814,23 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         except (OSError, ValueError):
             plan_constraints = "none stated"
             plan_risks = "none"
+        # Every stated constraint is mandatory and carried whole; a field nobody
+        # stated is left out rather than rendered as a line of "none".
+        optional_fields = [
+            ("existing decisions", task_secs.get("Existing decisions", "")),
+            ("discovery constraints", task_secs.get("Discovery constraints", "")),
+            ("plan hard constraints", "" if plan_constraints == "none stated" else plan_constraints),
+            ("plan risks", "" if plan_risks == "none" else plan_risks),
+            ("starting hints (advisory only)", task_secs.get("Starting hints", "")),
+        ]
         contract_lines = [
             f"run: {run} task: {owner} role: {role}",
             f"goal: {goal_text or 'none'}",
             "acceptance:",
             *([f"- {item}" for item in criteria] or ["- none"]),
             f"hard constraints: {task_secs.get('Out of scope', '').strip() or 'none stated'}",
-            f"existing decisions: {task_secs.get('Existing decisions', '').strip() or 'none stated'}",
-            f"discovery constraints: {task_secs.get('Discovery constraints', '').strip() or 'none stated'}",
-            f"plan hard constraints: {plan_constraints}",
-            f"plan risks: {plan_risks}",
-            f"starting hints (advisory only): {task_secs.get('Starting hints', '').strip() or 'none'}",
-            f"task revision: {digest_of(task.read_bytes())}",
+            *(f"{label}: {value.strip()}" for label, value in optional_fields
+              if value.strip() and value.strip().lower() not in ("none", "none stated")),
         ]
         task_text = task_body + "\n" + str(task_meta.get("files", "")) + "\n" + str(task_meta.get("verify_hint", ""))
         claim_text = (goal_text + "\n" + "\n".join(criteria)).strip()
@@ -9159,8 +9841,10 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         dmeta, dbody = parse(decs[-1].read_text())
         dec_rev = digest_of(decs[-1].read_bytes())
         dsecs = sections(dbody)
-        decision_lines = [f"latest decision: {decs[-1].name} ({dmeta.get('verdict', '?')})",
-                          f"reason: {dsecs.get('Reason', '').strip() or 'none'}"]
+        decision_lines = [f"latest decision: {decs[-1].name} ({dmeta.get('verdict', '?')})"]
+        reason = dsecs.get("Reason", "").strip()
+        if reason and not is_empty(reason) and reason.lower() != "none":
+            decision_lines.append(f"reason: {reason}")
         _, numbered = decision_required_lines(d, owner)
         for line in numbered:
             decision_lines.append(f"required change: {line.strip()}")
@@ -9211,8 +9895,6 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
                         decision_lines.append(f"bundle_digest: {rmeta.get('bundle_digest')}")
             except (OSError, ValueError):
                 pass
-        decision_lines.append(f"decision revision: {dec_rev}")
-        decision_lines.append(f"task revision: {source_task_rev}")
     model_source = model
     if owner != "orch":
         try:
@@ -9248,14 +9930,21 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
                             "rediscover from the task, the accepted scope capsule, "
                             "and the task-local diff; no draft checkpoint is ready)")
         else:
-            handoff_line = "(none)"
-            # Non-resume stages without any handoff keep the short pointer.
-            handoff_line = "ready handoff: (none)"
+            # Outside resume, a run with no handoff at all has nothing to point at.
+            handoff_line = ""
+    try:
+        run_rel = str(d.relative_to(root()))
+    except ValueError:
+        run_rel = str(d)
     pointers = [
-        f"scope: {(d / f'{owner}-task.mdx').name if owner != 'orch' else 'plan.mdx'} (accepted files), "
-        f"{scope_path(d, owner).name} (capsule)",
-        f"latest decision: {decs[-1].name if decs else '(none yet)'}",
-        handoff_line,
+        f"task: {run_rel}/{owner}-task.mdx; accepted scope: {run_rel}/{scope_path(d, owner).name}"
+        if owner != "orch" else f"plan: {run_rel}/plan.mdx",
+    ]
+    if decs:
+        pointers.append(f"latest decision: {run_rel}/{decs[-1].name}")
+    if handoff_line and role in ("implementor", "orchestrator", "coordinator"):
+        pointers.append(handoff_line)
+    pointers += [
         f"task-local diff: docket diff {run} {owner}",
         f"frozen evidence: docket bundle {run} {owner}",
     ]
@@ -9266,11 +9955,8 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         "",
         contract,
         "",
-        f"workflow: {workflow}",
-        f"mode: {selected_mode}",
+        f"stage: {eff_stage} | workflow: {workflow} | mode: {selected_mode} | "
         f"review_policy: {run_policy(d)['review_policy']}",
-        f"stage: {eff_stage}",
-        f"renderer: {renderer_revision()}",
         workflow_authority(d, workflow, role),
     ]
     parts = [
@@ -9281,7 +9967,9 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         parts.append("# Latest decision\n\n" + "\n".join(decision_lines))
     obligations_revision = ""
     report_revision = ""
-    if role == "verifier":
+    # The quick checker performs the verifier duty, so it carries the same
+    # obligations while its round still awaits verification.
+    if role == "verifier" or (role == "checker" and eff_stage == "verification"):
         latest_report = latest(reports(d, owner))
         if latest_report is not None:
             try:
@@ -9305,7 +9993,22 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
     if guidance_blocks:
         guidance_section = "# Selected guidance\n\n" + "\n\n".join(guidance_blocks)
         parts.append(guidance_section)
-    parts.append("# Resume and evidence pointers\n\n" + "\n".join(f"- {item}" for item in pointers))
+    steps = prompt_steps(d, run, owner, role, eff_stage)
+    if steps:
+        steps.append(
+            f"Last, record what docket itself cost you this round, or `none`: `docket feedback "
+            f"{run} --add --role {role} --task {owner} --round {state_of(d, owner)[0]} --category "
+            "instruction|discovery|verification|recovery|dispatch|routing|review|delivery|other "
+            "--body \"a missing or unclear instruction, a refusal you worked around, a command "
+            "you had to look up, or waiting\"`.")
+        parts.append("# Steps\n\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
+    parts.append("# Pointers\n\n" + "\n".join(f"- {item}" for item in pointers))
+    revisions = [f"renderer: {renderer_revision()}"]
+    if owner != "orch":
+        revisions.append(f"task revision: {source_task_rev}")
+    if dec_rev:
+        revisions.append(f"decision revision: {dec_rev}")
+    parts.append(" | ".join(revisions))
     prompt = "\n\n".join(parts) + "\n"
     mandatory_text = "\n\n".join([p for p in parts if p != guidance_section]) + "\n"
     mandatory_tokens = estimate_tokens(mandatory_text)
@@ -9354,6 +10057,113 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         "budget_tokens": budget_tokens,
     }
     return prompt, info
+
+
+def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[str]:
+    """The exact commands and files one role needs for one stage, in order.
+
+    A prompt that says what to do but not how sends every worker to the
+    playbook first; these steps carry the run's real paths and the `--as`
+    identity its preset requires, so a worker can act on the prompt alone.
+    """
+    try:
+        rel = str(d.relative_to(root()))
+    except ValueError:
+        rel = str(d)
+    try:
+        rnd, status = state_of(d, owner)
+    except (OSError, ValueError):
+        rnd, status = 0, ""
+    five = is_five_role(d)
+
+    def as_role(op: str) -> str:
+        acting = authority_for(d, op) if five else ()
+        return f" --as {acting[0]}" if acting else ""
+
+    report = f"{rel}/{owner}-report-{rnd:02d}.mdx"
+    decide_as = as_role("decide:approve")
+    checker = mode_of(d) == MODE_QUICK and role == "checker"
+    if checker:
+        decide_as += " --reviewer checker"
+    decide = [
+        f"Decide the round: `docket decide {run} {owner} --approve{decide_as} --reason "
+        "\"why it holds\"`; or "
+        f"`docket decide {run} {owner} --changes{decide_as}`, which opens "
+        f"`{rel}/{owner}-decision-{rnd:02d}.mdx` for numbered Required changes, then run "
+        "the same command again to apply it; or "
+        f"`docket decide {run} {owner} --waive --reason TEXT{decide_as}` for a blocker you accept.",
+    ]
+    if role in ("verifier", "reviewer", "checker"):
+        read = (f"Read the frozen round with `docket bundle {run} {owner}`: the patch, the "
+                "report, and the verification as it actually ran.")
+        if owner == "orch":
+            read = (f"Read `docket review-packet {run} --role reviewer` and the aggregate with "
+                    f"`docket bundle {run} orch`.")
+        if role == "reviewer" or owner == "orch" or status == "blocked" \
+                or (checker and stage == "review"):
+            if status == "blocked":
+                return [read, "The round is blocked: answer its Decisions needed question.",
+                        *decide]
+            return [read, "Judge correctness, design, and integration from the contract, "
+                    "inspecting source wherever the evidence leaves doubt.", *decide]
+        verify_as = as_role("verify-record") + (" --verifier checker" if checker else "")
+        steps = [
+            read,
+            "Check every acceptance criterion against observable behavior, with expected "
+            "values you derive independently; apply the obligations above.",
+            f"Record one verdict: `docket verify {run} {owner} --result pass|fail|uncertain"
+            f"{verify_as} --detail \"1. numbered finding with its evidence\"`"
+            + (" (add `--open-correction` to a fail to open the correction round)"
+               if verifier_correction_allowed(d) else "") + ".",
+        ]
+        if checker:
+            steps.append("Then review it as the second duty. " + decide[0])
+        return steps
+    if owner == "orch":
+        if role in ("orchestrator", "coordinator"):
+            return [f"Fill every section of `{report}` from the decided task rounds.",
+                    f"Submit with `docket submit {run} orch{as_role('submit:orchestrator')}`."]
+        return []
+    submit_op = submit_op_for(d, owner)
+    submit_as = as_role(submit_op)
+    finish = [
+        f"Fill `{report}`: summary, files changed, the acceptance boxes (criteria exactly as "
+        "the task states them, each checked only when it genuinely passes), the verify command "
+        "with its real output, and decisions needed.",
+        f"Submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
+        f"write the question under Decisions needed and run `docket submit {run} {owner} "
+        f"--blocked{submit_as}`. Never edit the report after submitting.",
+    ]
+    if submit_op == "submit:orchestrator":
+        if role not in ("orchestrator", "coordinator"):
+            return []
+        return ["Implement inside the task's `files:` and run its verify command.", *finish]
+    if role != "implementor":
+        return []
+    handoff = (f"Before your context runs out, run `docket handoff {run} {owner}`, fill the "
+               f"checkpoint, then `docket handoff {run} {owner} --submit`.")
+    build = (f"Run `docket preflight {run} {owner}`, implement only inside the accepted "
+             "files, and run the verify command.")
+    if stage == "correction":
+        return [
+            "Apply every required change listed above.",
+            f"If a change needs a file outside the accepted scope, amend `{rel}/{owner}-scope.mdx` "
+            f"and rerun `docket scope {run} {owner} --submit` first.",
+            build, *finish, handoff,
+        ]
+    if stage == "resume":
+        return [
+            f"Read the task, the accepted `{rel}/{owner}-scope.mdx`, the handoff or checkpoint "
+            f"named below, and `docket diff {run} {owner}`; rediscover only what they leave open.",
+            build, *finish, handoff,
+        ]
+    return [
+        f"Read `{rel}/{owner}-task.mdx`, then discover the code it touches.",
+        f"Fill `{rel}/{owner}-scope.mdx` (proposed files, the exact verify command, relevant "
+        f"symbols, reasoning) and run `docket scope {run} {owner} --submit` before editing; on a "
+        "collision, stop and report it.",
+        build, *finish, handoff,
+    ]
 
 
 def prompts_dir(d: Path) -> Path:
@@ -9406,12 +10216,135 @@ def next_feedback_id(d: Path) -> str:
     return f"F{num:02d}"
 
 
+def feedback_log_path() -> Path | None:
+    """The user-level feedback log shared by every project, or None when disabled.
+
+    Feedback collected per run stays in that run; this append-only log is what
+    accumulates across runs and projects so bottlenecks can be reviewed
+    periodically with `docket feedback --digest`. `DOCKET_FEEDBACK_LOG` names
+    another file, and `off` disables it.
+    """
+    raw = os.environ.get("DOCKET_FEEDBACK_LOG")
+    if raw is not None:
+        raw = raw.strip()
+        if raw.lower() in ("", "off", "none", "0"):
+            return None
+        return Path(raw).expanduser()
+    base = os.environ.get("XDG_STATE_HOME", "").strip() or str(Path.home() / ".local" / "state")
+    return Path(base) / "docket" / "feedback.jsonl"
+
+
+def log_feedback(entry: dict[str, object]) -> None:
+    """Append one record to the user-level log. Never raises: feedback never blocks."""
+    path = feedback_log_path()
+    if path is None:
+        return
+    try:
+        project = str(root())
+    except SystemExit:
+        project = ""
+    record = {"at": stamp(), "project": project, **entry}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return
+
+
+def machine_feedback(d: Path, category: str, owner: str, body: str,
+                     role: str = "docket") -> None:
+    """Record a bottleneck docket observed itself, at no model cost."""
+    try:
+        rnd = state_of(d, owner)[0] if owner else 0
+    except (OSError, ValueError):
+        rnd = 0
+    log_feedback({"origin": "machine", "run": d.name, "role": role, "category": category,
+                  "task": owner or "-", "round": str(rnd or "-"), "body": body})
+
+
+def cmd_feedback_digest(a: argparse.Namespace) -> None:
+    """Summarize the user-level feedback log: where docket costs roles effort."""
+    path = Path(a.log).expanduser() if a.log else feedback_log_path()
+    if path is None or not path.is_file():
+        print("no feedback recorded yet" + (f" at {path}" if path else " (the log is off)"))
+        return
+    records = []
+    for line in path.read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and (not a.since or str(record.get("at", "")) >= a.since):
+            records.append(record)
+    if not records:
+        print(f"no feedback in {path}" + (f" since {a.since}" if a.since else ""))
+        return
+
+    def quiet(record: dict) -> bool:
+        return str(record.get("body", "")).strip().lower().rstrip(".") in ("none", "")
+
+    agent = [r for r in records if r.get("origin") != "machine"]
+    machine = [r for r in records if r.get("origin") == "machine"]
+    projects = {str(r.get("project", "")) for r in records}
+    runs = {(str(r.get("project", "")), str(r.get("run", ""))) for r in records}
+    print(f"feedback digest: {len(records)} record(s) from {len(runs)} run(s) in "
+          f"{len(projects)} project(s) - {path}")
+    print(f"  agent reports: {len(agent)} ({sum(1 for r in agent if quiet(r))} said none); "
+          f"machine observations: {len(machine)}")
+    by_role: dict[str, list[dict]] = {}
+    for record in agent:
+        by_role.setdefault(str(record.get("role", "?")), []).append(record)
+    if by_role:
+        print("\nfriction by role (reports naming a cost / all reports)")
+        for role, items in sorted(by_role.items()):
+            costly = [r for r in items if not quiet(r)]
+            print(f"  {role:<12} {len(costly)}/{len(items)}")
+    categories: dict[tuple[str, str], int] = {}
+    for record in records:
+        if record.get("origin") != "machine" and quiet(record):
+            continue
+        key = (str(record.get("origin", "agent")), str(record.get("category", "other")))
+        categories[key] = categories.get(key, 0) + 1
+    if categories:
+        print("\nwhere the cost lands (origin/category: count)")
+        for (origin, category), count in sorted(categories.items(), key=lambda kv: -kv[1]):
+            print(f"  {origin}/{category}: {count}")
+    recurring: dict[str, list[dict]] = {}
+    for record in records:
+        if record.get("origin") != "machine" and quiet(record):
+            continue
+        text = re.sub(r"\s+", " ", str(record.get("body", ""))).strip()
+        pattern = re.sub(r"\b(?:T\d+|R\d+|round \d+|\d+)\b", "#", text.lower())[:160]
+        recurring.setdefault(pattern, []).append(record)
+    ranked = sorted(recurring.values(), key=lambda items: (-len(items), str(items[-1].get("at"))))
+    if ranked:
+        print(f"\nrecurring items (top {min(a.top, len(ranked))})")
+        for items in ranked[:a.top]:
+            last = items[-1]
+            roles = ",".join(sorted({str(r.get("role", "?")) for r in items}))
+            body = re.sub(r"\s+", " ", str(last.get("body", ""))).strip()
+            print(f"  {len(items)}x [{last.get('category', 'other')}] ({roles}) "
+                  f"{body[:220]}")
+            print(f"      latest: {last.get('project', '')} {last.get('run', '')} "
+                  f"{last.get('task', '-')} round {last.get('round', '-')} at {last.get('at', '')}")
+
+
 def cmd_feedback(a: argparse.Namespace) -> None:
     """Record or list short, evidence-linked workflow observations.
 
     Feedback is always optional: recording nothing is valid, and a failure to
     record feedback never rolls back a lifecycle operation.
     """
+    if a.digest:
+        cmd_feedback_digest(a)
+        return
+    if not a.run:
+        die("give a run id, or --digest to summarize feedback across runs and projects")
     d = need_run(a.run)
     if a.list:
         found = []
@@ -9447,6 +10380,15 @@ def cmd_feedback(a: argparse.Namespace) -> None:
     if not body:
         die("--add requires --body TEXT")
     fid = next_feedback_id(d)
+    # The dispatch record already knows which prompt and model a task round was
+    # given, so an agent's report is tied to them without restating either.
+    dispatch = read_dispatch(d, a.task) if a.task and re.fullmatch(r"T\d+|orch", a.task) else {}
+    if dispatch and not a.prompt_digest and str(dispatch.get("prompt_role", "")) == (a.role or ""):
+        a.prompt_digest = str(dispatch.get("prompt_digest", ""))
+    if dispatch and not a.model:
+        observed = str(dispatch.get("model_observed", "") or "")
+        a.model = observed if observed not in ("", "unobserved") else str(
+            dispatch.get("model_requested", "") or "")
     meta = {"id": fid, "author_role": a.role or "unknown",
             "category": a.category or "other",
             "run": a.run, "task": a.task or "-", "round": a.round or "-",
@@ -9464,6 +10406,10 @@ def cmd_feedback(a: argparse.Namespace) -> None:
     except OSError as exc:
         die(f"could not record feedback ({exc}); the lifecycle operation this "
             "accompanied is unaffected - feedback never blocks it")
+    log_feedback({"origin": a.origin, "run": a.run, "id": fid, "role": meta["author_role"],
+                  "category": meta["category"], "task": meta["task"], "round": meta["round"],
+                  "model": meta["model"], "harness": meta["harness"],
+                  "prompt_digest": meta["prompt_digest"], "body": body})
     print(f"recorded observation {fid} ({meta['category']})")
 
 
@@ -11852,6 +12798,20 @@ def dispatch_liveness(d: Path, record: dict) -> tuple[bool, str]:
     return True, "live"
 
 
+def round_dispatched(d: Path, owner: str, rnd: int) -> bool:
+    """Whether a live dispatch record binds exactly this owner round."""
+    record = read_dispatch(d, owner)
+    if not record:
+        return False
+    try:
+        if int(record.get("round", 0) or 0) != rnd:
+            return False
+    except (TypeError, ValueError):
+        return False
+    live, _ = dispatch_liveness(d, record)
+    return live
+
+
 def live_dispatches(d: Path) -> list[dict]:
     """Execution capacity as live work, derived from lifecycle documents.
 
@@ -11956,6 +12916,11 @@ def dispatch_dependencies_unmet(d: Path, owner: str) -> list[str]:
 
 def dispatch_ownership_problems(d: Path, owner: str) -> list[str]:
     """The exclusive change surface must be free before starting work."""
+    if owner == "orch":
+        # The aggregate has no task file and claims no exclusive change
+        # surface of its own; constituent tasks hold their scope through
+        # the scope gate, so there is nothing here to collide.
+        return []
     task = d / f"{owner}-task.mdx"
     if not task.is_file():
         return [f"no assignment {task.name}"]
@@ -12029,6 +12994,11 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             die(f"no assignment {a.owner} in {a.run}")
         role = "orchestrator" if parse(task.read_text())[0].get(
             "executor", "implementor") == "orchestrator" else "implementor"
+    if mode_of(d) == MODE_QUICK and role == "orchestrator":
+        # Quick merges planning and orchestration into the coordinator
+        # session, the same mapping authority_for applies to submit and
+        # verify duties, so the dispatch binding names the physical role.
+        role = "coordinator"
     try:
         rnd, _ = state_of(d, a.owner)
     except (OSError, ValueError):
@@ -12037,7 +13007,6 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         die(f"no report for {a.owner} in {a.run}")
     if not a.session:
         die("dispatch requires --session SESSION of a registered worker")
-    reg = check_registration(d, a.session, a.run, role)
     if a.owner != "orch":
         intent_problems = task_intent_problems(d, a.owner)
         if intent_problems:
@@ -12046,6 +13015,9 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 print(f"  - {problem}", file=sys.stderr)
             die(f"{a.owner} cannot dispatch with unresolved task intent; "
                 f"run `docket validate-task {a.run} {a.owner}` for the full gate")
+    if a.register:
+        ensure_session_registration(a.run, a.session, role, a.agent or a.session)
+    reg = check_registration(d, a.session, a.run, role)
     with owner_lock(d, a.owner):
         existing = read_dispatch(d, a.owner)
         if existing and existing.get("state") == "dispatched" \
@@ -12063,10 +13035,42 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 print(f"already dispatched: {a.owner} round {rnd} -> session {a.session} "
                       f"({existing.get('dispatch')})")
                 existing_digest = str(existing.get("prompt_digest", "") or "")
+                # The same writer re-dispatching after the task or plan changed gets
+                # the prompt re-rendered and rebound, so the record never keeps
+                # describing bytes nobody should send. Nothing else about the
+                # binding moves: same session, same round, same model.
+                model = str(existing.get("model_requested", "") or "")
+                seed_report_acceptance(d, a.owner)
+                try:
+                    prompt, prompt_info = compose_prompt(d, a.run, a.owner, role, model=model)
+                except SystemExit:
+                    prompt, prompt_info = "", {}
+                fresh_digest = str(prompt_info.get("digest", "") or "")
+                if fresh_digest and fresh_digest != existing_digest:
+                    history = existing.get("prompt_history", [])
+                    if not isinstance(history, list):
+                        history = []
+                    history.append({"at": stamp(), "digest": existing_digest,
+                                    "replaced_by": fresh_digest})
+                    existing["prompt_history"] = history
+                    existing["prompt_digest"] = fresh_digest
+                    existing["prompt_role"] = role
+                    publish_json(dispatch_path(d, a.owner), existing)
+                    prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, fresh_digest)
+                    machine_feedback(d, "dispatch", a.owner,
+                                     "prompt rebound: the task or plan changed after dispatch")
+                    print(f"rebound {a.owner} round {rnd}: its prompt changed since it was "
+                          f"bound (was {existing_digest}, now {fresh_digest})")
+                    print(f"prompt: {prompt_file.relative_to(root())} - send these exact "
+                          "bytes to the worker; the earlier prompt no longer describes the task")
+                    return
                 if existing_digest:
                     print(f"recorded binding {a.owner} round {rnd} "
                           f"(prompt digest {existing_digest}); no model launched, "
                           "no prompt delivered, nothing observed")
+                if prompt and fresh_digest:
+                    prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, fresh_digest)
+                    print(f"prompt: {prompt_file.relative_to(root())}")
                 return
             die(f"{a.owner} round {rnd} was dispatched to session {a.session!r} "
                 f"(generation {old_gen}), but session {a.session!r} is now generation "
@@ -12087,6 +13091,13 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         if ownership:
             die(f"{a.owner} cannot dispatch: the change surface is not exclusively free:\n      "
                 + "\n      ".join(f"- {item}" for item in ownership))
+        if a.owner != "orch" and not snapshot_path(d, a.owner).is_file():
+            # A dependency-gated task deferred its baseline to this moment; an
+            # incomplete capture refuses the dispatch and writes no record.
+            require_baseline(d, a.owner, task_scope_hint(d, a.owner))
+            print(f"captured {a.owner}'s baseline at dispatch, after its dependencies")
+        for dep, digest in pin_final_dependencies(d, a.owner):
+            print(f"{a.owner} consumes {dep}'s approved bundle {digest} as a final input")
         with capacity_lock(d):
             # Holds the run-wide capacity lock only for the read-check-write
             # below: re-read live capacity, refuse a full cap, and publish the
@@ -12103,6 +13114,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             model = a.model or primary
             if allowed is not None and model not in allowed:
                 refuse_outside_policy(d, a.owner, model, allowed)
+            seed_report_acceptance(d, a.owner)
+            prompt_file = None
             try:
                 prompt, prompt_info = compose_prompt(d, a.run, a.owner, role, model=model)
             except SystemExit:
@@ -12114,6 +13127,7 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 prompt_info = {"digest": prompt_digest}
             else:
                 prompt_digest = str(prompt_info.get("digest", ""))
+                prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, prompt_digest)
             txn = "dsp:" + hashlib.sha256(
                 "|".join([a.run, a.owner, str(rnd), a.session]).encode()).hexdigest()[:16]
             record = {
@@ -12141,11 +13155,29 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             print(f"recorded binding {a.owner} round {rnd} for model {model or 'unobserved'} "
                   f"(prompt digest {prompt_digest}); no model launched, no prompt delivered, "
                   "nothing observed")
+            if prompt_file is not None:
+                print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
+                      "the worker")
             if policy_state == "absent":
                 print(f"run {a.run} has no approved model policy so nothing is being enforced")
             if not model:
                 print("model telemetry unavailable: model is unknown until `docket set-model` "
                       "verifies the live harness")
+
+
+def write_prompt_file(d: Path, owner: str, role: str, rnd: int, prompt: str,
+                      digest: str) -> Path:
+    """Keep the exact prompt bytes a dispatch bound, named by round and digest.
+
+    The file lets a supervisor hand the worker the bound prompt without a second
+    render, and its bytes hash to the recorded prompt digest.
+    """
+    short = digest.split(":", 1)[-1][:12]
+    path = prompts_dir(d) / f"{owner}-{role}-r{rnd:02d}-{short}.txt"
+    if not path.is_file():
+        prompts_dir(d).mkdir(parents=True, exist_ok=True)
+        publish_bytes(path, prompt.encode())
+    return path
 
 
 def checkpoints_dir(d: Path) -> Path:
@@ -12211,6 +13243,50 @@ def cmd_resume(a: argparse.Namespace) -> None:
             rnd, _ = state_of(d, a.owner)
         except (OSError, ValueError):
             rnd = 0
+        if not rnd:
+            die(f"no report for {a.owner} in {a.run}; dispatch it first")
+        try:
+            bound_round = int(dispatch.get("round", 0) or 0)
+        except (TypeError, ValueError):
+            bound_round = 0
+        if bound_round != rnd:
+            # Rebinding a superseded dispatch to a correction round is a new
+            # dispatch claim. It must not skip the current round's admission
+            # checks merely because the predecessor already held a slot.
+            if a.owner != "orch":
+                intent_problems = task_intent_problems(d, a.owner)
+                if intent_problems:
+                    print(f"\nINVALID TASK: {a.owner}-task.mdx\n", file=sys.stderr)
+                    for problem in intent_problems:
+                        print(f"  - {problem}", file=sys.stderr)
+                    die(f"{a.owner} cannot resume with unresolved task intent; "
+                        f"run `docket validate-task {a.run} {a.owner}` for the full gate")
+            unmet = dispatch_dependencies_unmet(d, a.owner)
+            if unmet:
+                die(f"{a.owner} cannot resume with unmet dependencies:\n      "
+                    + "\n      ".join(f"- {item}" for item in unmet))
+            ownership = dispatch_ownership_problems(d, a.owner)
+            if ownership:
+                die(f"{a.owner} cannot resume: the change surface is not exclusively free:\n      "
+                    + "\n      ".join(f"- {item}" for item in ownership))
+        # A resume launches a new session, so it is held to the model policy in
+        # force now, exactly like a dispatch. Carrying the predecessor's model
+        # forward unchecked would let a policy change be bypassed by resuming
+        # instead of dispatching. --model names an approved replacement.
+        _primary, _fallbacks, _state, allowed = model_policy(d)
+        previous_model = str(dispatch.get("model_requested", "") or "")
+        model = a.model or previous_model
+        if allowed is not None and model not in allowed:
+            if a.model:
+                refuse_outside_policy(d, a.owner, model, allowed)
+            die(f"{a.owner} cannot resume on model {model or 'unrecorded'!r}: the approved "
+                f"model policy is now [{', '.join(allowed)}]. Resume with "
+                f"`docket resume {a.run} {a.owner} --session {a.session} --model "
+                f"{allowed[0]}` or another approved model")
+        if a.register:
+            ensure_session_registration(a.run, a.session,
+                                        str(dispatch.get("role", "implementor")),
+                                        a.agent or a.session)
         reg = check_registration(d, a.session, a.run, dispatch.get("role", "implementor"))
         with capacity_lock(d):
             # The same serialized read-check-write as dispatch: re-read live
@@ -12235,6 +13311,34 @@ def cmd_resume(a: argparse.Namespace) -> None:
             dispatch["session_generation"] = reg.get("generation", 1)
             if a.agent:
                 dispatch["agent"] = a.agent
+            # Bind the current round: a correction opened a newer report round
+            # since this record was written, and a record pinned to the old
+            # round reads as superseded, hence not live, so the slot it still
+            # holds would escape the cap. The rebound record describes the
+            # round the replacement actually works.
+            dispatch["round"] = rnd
+            role = str(dispatch.get("role", "implementor"))
+            if model != previous_model:
+                model_history = dispatch.get("model_history", [])
+                if not isinstance(model_history, list):
+                    model_history = []
+                model_history.append({"at": stamp(), "kind": "resume", "model": model})
+                dispatch["model_history"] = model_history
+                dispatch["model_requested"] = model
+                dispatch["model_observed"] = "unobserved"
+            prompt_file = None
+            try:
+                resumed_prompt, prompt_info = compose_prompt(d, a.run, a.owner, role, model=model)
+                dispatch["prompt_digest"] = str(prompt_info.get("digest", ""))
+                prompt_file = write_prompt_file(d, a.owner, role, rnd, resumed_prompt,
+                                                dispatch["prompt_digest"])
+            except SystemExit:
+                diag = rendering_problem(d, a.run, a.owner, role,
+                                         derive_stage(d, a.owner), model)
+                if not diag:
+                    raise
+                dispatch["prompt_digest"] = f"unavailable: {diag}"
+            dispatch["prompt_role"] = role
             dispatch["dispatch"] = "dsp:" + hashlib.sha256(
                 "|".join([a.run, a.owner, str(rnd), a.session,
                           str(len(history))]).encode()).hexdigest()[:16]
@@ -12243,9 +13347,14 @@ def cmd_resume(a: argparse.Namespace) -> None:
             dispatch.pop("released_at", None)
             publish_json(dispatch_path(d, a.owner), dispatch)
             fault("resume:rebind")
+            machine_feedback(d, "recovery", a.owner,
+                             f"round moved to a replacement session: {a.reason or 'no reason given'}")
             print(f"resumed {a.owner} round {rnd} -> session {a.session}")
             print(f"checkpoint {checkpoint.name} is mechanical (semantic_handoff: no); "
                   "the replacement discovers from the task, scope, and diff")
+            if prompt_file is not None:
+                print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
+                      "the replacement")
 
 
 def cmd_switch_model(a: argparse.Namespace) -> None:
@@ -12500,7 +13609,7 @@ def main() -> None:
     q.add_argument("run")
     q.add_argument("--harness", default="claude", choices=SUPPORTED_HARNESSES)
     q.add_argument("--mode", choices=MODES,
-                   help="tested run preset; bare init defaults to standard")
+                   help="tested run preset; bare init defaults to quick")
     q.add_argument("--agents", type=int, default=0,
                    help="assert the preset's physical session count")
     q.add_argument("--topology", default="", choices=("", *TOPOLOGIES))
@@ -12510,6 +13619,9 @@ def main() -> None:
                    help="low-level lifecycle policy; legacy preserves current semantics")
     q.add_argument("--root", action="append", default=[], metavar="ALIAS=PATH",
                    help="declare a checkout root; repeat per checkout, default is this one")
+    q.add_argument("--title", default="", help="plan title")
+    q.add_argument("--objective", default="",
+                   help="what done means for the whole run; fills the plan Objective")
     q.set_defaults(fn=cmd_init)
 
     q = sub.add_parser("assign", help="open a task and its first report")
@@ -12529,6 +13641,14 @@ def main() -> None:
                    help="declared environment input for verification; repeat per input")
     q.add_argument("--depends-on", action="append", default=[], metavar="TASK",
                    help="task that must be approved first; repeat per dependency")
+    q.add_argument("--title", default="", help="task title")
+    q.add_argument("--goal", default="", help="what must be true when the task is done")
+    q.add_argument("--criterion", action="append", default=[], metavar="TEXT",
+                   help="mechanically checkable acceptance criterion; repeat per criterion")
+    q.add_argument("--out-of-scope", action="append", default=[], metavar="TEXT",
+                   help="hard constraint the task must not cross; repeat per constraint")
+    q.add_argument("--decision", action="append", default=[], metavar="TEXT",
+                   help="decision already made that the implementor must follow; repeat")
     q.set_defaults(fn=cmd_assign)
 
     q = sub.add_parser("validate-task", help="gate functional task intent before implementor discovery")
@@ -12617,8 +13737,13 @@ def main() -> None:
                    help="inspect one stage explicitly; empty derives it from lifecycle state")
     q.set_defaults(fn=cmd_prompt)
 
-    q = sub.add_parser("feedback", help="record or list workflow observations")
-    q.add_argument("run")
+    q = sub.add_parser("feedback", help="record, list, or digest workflow observations")
+    q.add_argument("run", nargs="?", default="")
+    q.add_argument("--digest", action="store_true",
+                   help="summarize the user-level log across runs and projects")
+    q.add_argument("--since", default="", help="digest only records at or after this date")
+    q.add_argument("--top", type=int, default=10, help="recurring items to show in a digest")
+    q.add_argument("--log", default="", help="read this log instead of the user-level one")
     q.add_argument("--add", action="store_true", help="record one observation")
     q.add_argument("--list", action="store_true", help="list recorded observations")
     q.add_argument("--import-ops", action="store_true",
@@ -12720,6 +13845,8 @@ def main() -> None:
                    help="registered worker session that will hold the round")
     q.add_argument("--agent", default="", help="human-readable agent name")
     q.add_argument("--model", default="", help="requested model, within approved policy")
+    q.add_argument("--register", action="store_true",
+                   help="register --session for this run and role first when it is new")
     q.set_defaults(fn=cmd_dispatch)
 
     q = sub.add_parser("resume", help="resume a dispatched task under a new session")
@@ -12729,6 +13856,10 @@ def main() -> None:
                    help="registered worker session taking over")
     q.add_argument("--agent", default="", help="human-readable agent name")
     q.add_argument("--reason", default="", help="why the previous session stopped")
+    q.add_argument("--model", default="",
+                   help="approved model for the replacement session (default: the recorded one)")
+    q.add_argument("--register", action="store_true",
+                   help="register --session for this run and role first when it is new")
     q.set_defaults(fn=cmd_resume)
 
     q = sub.add_parser("switch-model", help="move along the approved model fallback list")

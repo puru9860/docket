@@ -50,8 +50,18 @@ class DocketCLI(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        # The user-level feedback log must never collect test runs.
+        # It lives outside the test checkout, which must see no stray file.
+        self._feedback_log = os.environ.get("DOCKET_FEEDBACK_LOG")
+        self._feedback_tmp = tempfile.TemporaryDirectory()
+        os.environ["DOCKET_FEEDBACK_LOG"] = str(Path(self._feedback_tmp.name) / "feedback.jsonl")
 
     def tearDown(self) -> None:
+        if self._feedback_log is None:
+            os.environ.pop("DOCKET_FEEDBACK_LOG", None)
+        else:
+            os.environ["DOCKET_FEEDBACK_LOG"] = self._feedback_log
+        self._feedback_tmp.cleanup()
         self.tmp.cleanup()
 
     def assert_disposable(self, target: Path) -> Path:
@@ -234,6 +244,9 @@ class DocketCLI(unittest.TestCase):
             files,
         )
         text = text.replace("- [ ] <!-- TODO -->", f"- [{' ' if blocked else 'x'}] {criterion}")
+        if not blocked:
+            # Dispatch and assign seed the task's criteria as unchecked boxes.
+            text = text.replace(f"- [ ] {criterion}", f"- [x] {criterion}")
         text = text.replace(
             "<!-- TODO: the exact command you ran and its real output. Never claim a result you did not see. -->",
             'Command: `printf "T01 ok\\n"`\n\nOutput: `T01 ok`',
@@ -5314,18 +5327,6 @@ class DocketCLI(unittest.TestCase):
         """A crash after ledger write but before harness accept re-announces after expiry."""
         run = self.init("split", evidence_mode="documents-only")
         self.submit_simple(run, "T01")
-        first = subprocess.run(
-            [sys.executable, str(DOCKET), "watch", "demo",
-             "--role", "orchestrator", "--timeout", "2"],
-            cwd=str(self.root), text=True, capture_output=True)
-        self.assertEqual(2, first.returncode)
-        led = run / ".woke-orchestrator"
-        self.assertTrue(led.is_file())
-        pending = list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))
-        self.assertEqual(1, len(pending))
-        key = json.loads(pending[0].read_text())["key"]
-        announce = list((run / ".delivery" / "orchestrator" / "announce").glob("*.json"))
-        self.assertEqual(1, len(announce))
         # Crash exactly at the announcement boundary: ledger and durable
         # announce state are written, but the notice never reaches the harness.
         crashed = subprocess.run(
@@ -5333,24 +5334,16 @@ class DocketCLI(unittest.TestCase):
              "--role", "orchestrator", "--timeout", "2"],
             cwd=str(self.root), text=True, capture_output=True,
             env=dict(os.environ, DOCKET_FAULT="watch:announce"))
-        # The fault fires only when there is something fresh to announce.
-        # After the first clean wake the lease is still active, so the second
-        # watcher has nothing fresh and exits 0 without faulting. Expire the
-        # lease first so the boundary is actually exercised.
-        if crashed.returncode == 0:
-            record = json.loads(announce[0].read_text())
-            until = float(record.get("lease_until", 0) or 0)
-            env = dict(os.environ, DOCKET_FAULT="watch:announce",
-                       DOCKET_NOW=str(until + 1))
-            crashed = subprocess.run(
-                [sys.executable, str(DOCKET), "watch", "demo",
-                 "--role", "orchestrator", "--timeout", "2"],
-                cwd=str(self.root), text=True, capture_output=True, env=env)
         self.assertEqual(70, crashed.returncode)
         self.assertIn("watch:announce", crashed.stderr)
-        # The durable pending event survives the crash.
-        self.assertEqual(
-            1, len(list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))))
+        led = run / ".woke-orchestrator"
+        self.assertTrue(led.is_file())
+        pending = list((run / ".delivery" / "orchestrator" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
+        key = json.loads(pending[0].read_text())["key"]
+        announce = list((run / ".delivery" / "orchestrator" / "announce").glob("*.json"))
+        self.assertEqual(1, len(announce))
+        self.assertFalse(json.loads(announce[0].read_text()).get("delivered_at"))
         # Immediate restart sees the active announcement lease and stays quiet:
         # concurrent hooks converge on one wake and create no lifecycle change.
         rounds_before = self.rounds(run, "T01")
@@ -5362,9 +5355,7 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(rounds_before, self.rounds(run, "T01"))
         # After lease expiry the same actionable event is announced again, and
         # stays claimable throughout via explicit inbox pickup.
-        record = json.loads(list(
-            (run / ".delivery" / "orchestrator" / "announce").glob("*.json"))[0].read_text())
-        until = float(record.get("lease_until", 0) or 0)
+        until = float(json.loads(announce[0].read_text()).get("lease_until", 0) or 0)
         env = dict(os.environ, DOCKET_NOW=str(until + 1))
         self.cli("session", "demo", "--register", "--session", "s1",
                  "--name", "orch-main", "--role", "orchestrator")
@@ -5383,6 +5374,18 @@ class DocketCLI(unittest.TestCase):
             cwd=str(self.root), text=True, capture_output=True, env=env)
         self.assertEqual(2, revived.returncode)
         self.assertIn("review batch ready", revived.stderr)
+        # That announcement reached the harness, so it stays delivered: the
+        # event persists while the review is pending, and waking the
+        # supervisor again after every lease would be polling by another name.
+        record = json.loads(announce[0].read_text())
+        self.assertTrue(record.get("delivered_at"))
+        later = subprocess.run(
+            [sys.executable, str(DOCKET), "watch", "demo",
+             "--role", "orchestrator", "--timeout", "1"],
+            cwd=str(self.root), text=True, capture_output=True,
+            env=dict(os.environ, DOCKET_NOW=str(float(record["lease_until"]) + 1)))
+        self.assertEqual(0, later.returncode, later.stderr)
+        self.assertEqual("", later.stderr)
 
     def test_hook_routes_verifier_and_reviewer_isolated(self) -> None:
         """Every five-role session receives only its own events through the hook."""
@@ -5768,9 +5771,12 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.submit5(run, "T01")
         self.submit5(run, "T02")
-        self.release_setup(run)
         for owner in ("T01", "T02"):
             self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+        # Delivery is qualified against a real orchestrator event: under
+        # five-role the review batch exists once verification resolves.
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
             self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
         self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
                  "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
@@ -5827,9 +5833,12 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.submit5(run, "T01")
         self.submit5(run, "T02")
-        self.release_setup(run)
         for owner in ("T01", "T02"):
             self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+        # Delivery is qualified against a real orchestrator event: under
+        # five-role the review batch exists once verification resolves.
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
             self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
         self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
                  "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
@@ -5852,9 +5861,12 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.submit5(run, "T01")
         self.submit5(run, "T02")
-        self.release_setup(run)
         for owner in ("T01", "T02"):
             self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+        # Delivery is qualified against a real orchestrator event: under
+        # five-role the review batch exists once verification resolves.
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
             self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
         self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
                  "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
@@ -6259,9 +6271,12 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.submit5(run, "T01")
         self.submit5(run, "T02")
-        self.release_setup(run)
         for owner in ("T01", "T02"):
             self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+        # Delivery is qualified against a real orchestrator event: under
+        # five-role the review batch exists once verification resolves.
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
             self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
         self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
                  "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
@@ -6389,9 +6404,12 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.submit5(run, "T01")
         self.submit5(run, "T02")
-        self.release_setup(run)
         for owner in ("T01", "T02"):
             self.cli("verify", "demo", owner, "--result", "pass", "--as", "verifier")
+        # Delivery is qualified against a real orchestrator event: under
+        # five-role the review batch exists once verification resolves.
+        self.release_setup(run)
+        for owner in ("T01", "T02"):
             self.cli("decide", "demo", owner, "--approve", "--as", "reviewer")
         self.cli("assign", "demo", "orch", "--complexity", "high", "--executor",
                  "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
@@ -7585,7 +7603,7 @@ class DocketCLI(unittest.TestCase):
         if "# Selected guidance" in out:
             section = out.split("# Selected guidance", 1)[1]
             # Guidance section ends at the next top-level heading.
-            cut = section.find("\n\n# Resume")
+            cut = section.find("\n\n# ")
             guidance_body = ("# Selected guidance" + (section[:cut] if cut != -1 else section))
         else:
             guidance_body = ""
@@ -7978,25 +7996,34 @@ class DocketCLI(unittest.TestCase):
 
     # ------------------------------- T51: standard and quick presets
 
-    def test_t51_new_runs_default_to_standard_and_modes_are_explicit(self) -> None:
-        """Bare init is standard; explicit presets record every independent dimension."""
+    def test_t51_new_runs_default_to_quick_and_modes_are_explicit(self) -> None:
+        """Bare init is quick; explicit presets record every independent dimension."""
         self.cli("init", "bare", "--evidence-mode", "documents-only")
         bare = self.root / ".docket" / "runs" / "bare"
         bare_meta = parse_meta(bare / "plan.mdx")
-        self.assertEqual("standard", bare_meta["mode"])
+        self.assertEqual("quick", bare_meta["mode"])
         self.assertEqual("five-role-v1", bare_meta["workflow"])
-        self.assertEqual("split", bare_meta["topology"])
-        self.assertEqual(
-            "planner, orchestrator, implementor, verifier, reviewer",
-            bare_meta["role_sessions"],
-        )
-        self.assertEqual("independent-verifier-reviewer", bare_meta["review_policy"])
-        self.assertIn("mode: standard", self.cli("status", "bare").stdout)
+        self.assertEqual("combined", bare_meta["topology"])
+        self.assertEqual("coordinator, implementor, checker", bare_meta["role_sessions"])
+        self.assertEqual("combined-checker", bare_meta["review_policy"])
+        self.assertIn("mode: quick", self.cli("status", "bare").stdout)
 
         self.cli("init", "standard", "--mode", "standard",
                  "--evidence-mode", "documents-only")
-        self.assertEqual("standard", parse_meta(
-            self.root / ".docket" / "runs" / "standard" / "plan.mdx")["mode"])
+        standard_meta = parse_meta(self.root / ".docket" / "runs" / "standard" / "plan.mdx")
+        self.assertEqual("standard", standard_meta["mode"])
+        self.assertEqual("split", standard_meta["topology"])
+        self.assertEqual(
+            "planner, orchestrator, implementor, verifier, reviewer",
+            standard_meta["role_sessions"],
+        )
+        self.assertEqual("independent-verifier-reviewer", standard_meta["review_policy"])
+        # Asking standard for a combined coordinator points at quick instead of
+        # leaving the caller to guess, and creates nothing.
+        conflict = self.cli("init", "conflict", "--mode", "standard", "--topology", "combined",
+                            ok=False)
+        self.assertIn("use --mode quick", conflict.stderr)
+        self.assertFalse((self.root / ".docket" / "runs" / "conflict").exists())
 
         self.cli("init", "quick", "--mode", "quick",
                  "--evidence-mode", "documents-only")
@@ -8253,10 +8280,21 @@ class DocketCLI(unittest.TestCase):
                                  env=base_env | {"DOCKET_ROLE": "checker"})
         self.assertEqual(2, checker.returncode)
         self.assertIn("T01", checker.stderr)
+        # Verified work wakes the checker again for its review duty; the
+        # coordinator is left alone until there is something for it to do.
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "checker")
+        reviewing = subprocess.run([str(HOOK)], cwd=self.root, capture_output=True, text=True,
+                                   env=base_env | {"DOCKET_ROLE": "checker"})
+        self.assertEqual(2, reviewing.returncode)
+        self.assertIn("review batch ready with 1 verified", reviewing.stderr)
+        idle = subprocess.run([str(HOOK)], cwd=self.root, capture_output=True, text=True,
+                              env=base_env | {"DOCKET_ROLE": "coordinator"})
+        self.assertEqual(0, idle.returncode, idle.stderr)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "checker")
         coordinator = subprocess.run([str(HOOK)], cwd=self.root, capture_output=True, text=True,
                                      env=base_env | {"DOCKET_ROLE": "coordinator"})
         self.assertEqual(2, coordinator.returncode)
-        self.assertIn("T01", coordinator.stderr)
+        self.assertIn("delegated tasks decided", coordinator.stderr)
 
     def test_t61_quick_end_to_end_via_session_surface(self) -> None:
         """A quick round runs through register, dispatch, submit, verify and decide."""
@@ -8381,9 +8419,10 @@ class DocketCLI(unittest.TestCase):
         plan = run / "plan.mdx"
         plan.write_text(plan.read_text().replace("correction_limit: 2", "correction_limit: 5"))
         self.submit5(run, "T01")
+        # Review readiness waits for verification under five-role: before the
+        # verifier records anything the orchestrator has nothing to route.
         before_orch = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
-        self.assertIn("review batch ready with 1 submitted", before_orch)
-        self.assertIn("T01 round 1", before_orch)
+        self.assertIn("no derived events", before_orch)
         self.assertIn("T01:1:submitted",
                       self.cli("events", "demo", "--role", "verifier", "--peek").stdout)
         self.assertIn("no derived events",
@@ -8396,7 +8435,7 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("T01", after_reviewer)
         self.assertIn("fail", after_reviewer.lower())
         after_orch = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
-        self.assertNotIn("review batch ready with 1 submitted", after_orch)
+        self.assertNotIn("review batch ready", after_orch)
         self.cli("reconcile", "demo")
         pending = [json.loads(p.read_text()) for p in
                    (run / ".delivery" / "reviewer" / "pending").glob("*.json")]
@@ -8643,9 +8682,10 @@ class DocketCLI(unittest.TestCase):
         run = self.init5()
         self.assign_simple(run, "T01")
         out = self.prompt_text(run, "T01", "implementor")
-        def count(prefix: str) -> int:
-            return sum(1 for line in out.splitlines()
-                       if line.strip().startswith(prefix))
+        def count(key: str) -> int:
+            # Each identity key is stated once, wherever the compact metadata
+            # line places it.
+            return sum(line.count(key) for line in out.splitlines())
         self.assertEqual(1, count("workflow:"))
         self.assertEqual(1, count("stage:"))
         self.assertEqual(1, count("renderer:"))
@@ -9083,3 +9123,843 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("missing required artifact", prompt_refused.stderr)
         self.assertIn("T01-task.mdx", prompt_refused.stderr)
         self.assertNotIn("<!-- TODO", prompt_refused.stdout)
+
+    def test_p1_orchestrator_task_in_closed_milestone_reaches_verifier_and_reviewer(self) -> None:
+        """An executor:orchestrator submission gets a verifier event and milestone review."""
+        run = self.init5()
+        self.assign_orchestrator_task(run, "T01")
+        self.submit_orchestrator_task(run, "T01")
+        orphan = run / "T99-report-01.mdx"
+        orphan.write_text((run / "T01-report-01.mdx").read_text())
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01",
+                 "--milestone")
+        self.cli("batch", "demo", "--close", "M1")
+        verifier = self.cli("events", "demo", "--role", "verifier", "--peek").stdout
+        self.assertIn("T01:1:submitted", verifier)
+        self.assertNotIn("T99:1:submitted", verifier)
+        refused = self.cli("decide", "demo", "T01", "--approve",
+                           "--as", "reviewer", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("no passing verification", refused.stderr)
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "orchestrator evidence needs a stronger assertion")
+        failed = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("T01:1:verification-failed", failed)
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "orchestrator evidence holds")
+        reviewer = self.cli("events", "demo", "--role", "reviewer", "--peek").stdout
+        self.assertIn("batch:M1:ready:", reviewer)
+        self.cli("decide", "demo", "T01", "--approve", "--as", "reviewer")
+        self.assertIn("status: approved", (run / "T01-report-01.mdx").read_text())
+
+    def test_p2_orchestrator_correction_wakes_orchestrator(self) -> None:
+        """A reviewer correction for orchestrator-owned work wakes its supervisor."""
+        run = self.init5()
+        self.assign_orchestrator_task(run, "T01")
+        self.submit_orchestrator_task(run, "T01")
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        decision = run / "T01-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/t01.py:1` and rerun the registered verification.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+
+        orchestrator = self.cli("events", "demo", "--role", "orchestrator", "--peek").stdout
+        correction_events = [
+            line for line in orchestrator.splitlines() if "T01:2:correction-ready" in line
+        ]
+        self.assertEqual(1, len(correction_events))
+        self.assertIn("re-dispatch", orchestrator)
+        planner = self.cli("events", "demo", "--role", "planner", "--peek").stdout
+        self.assertNotIn("T01:2:correction-ready", planner)
+
+    def test_p2_quick_dispatch_orch_binds_coordinator_session(self) -> None:
+        """In quick mode dispatch demo orch accepts a registered coordinator session."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli(
+            "assign", "demo", "orch", "--complexity", "high", "--executor",
+            "orchestrator", "--harness", "opencode", "--file", "src/orch.py",
+            "--verify", 'printf "orch ok\\n"',
+        )
+        self.cli("session", "demo", "--register", "--session", "c1",
+                 "--name", "coord", "--role", "coordinator")
+        dispatched = self.cli("dispatch", "demo", "orch", "--session", "c1")
+        self.assertIn("dispatched orch round 1", dispatched.stdout)
+        record = json.loads((run / ".dispatch" / "orch.json").read_text())
+        self.assertEqual("coordinator", record.get("role"))
+        self.assertEqual("c1", record.get("session"))
+
+    def test_p2_resume_after_correction_binds_current_round_and_holds_capacity(self) -> None:
+        """Resume of a correction round records the new round so the cap still counts it."""
+        run = self.init_policy(max_concurrency="1")
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("session", "demo", "--register", "--session", "w2",
+                 "--name", "worker-2", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.cli("decide", "demo", "T01", "--changes")
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/t01.py:1` and add a regression.",
+        ))
+        self.cli("decide", "demo", "T01", "--changes", "--reason", "Needs a guard.")
+        self.assertTrue((run / "T01-report-02.mdx").is_file())
+        resumed = self.cli("resume", "demo", "T01", "--session", "w1",
+                           "--reason", "restart after correction")
+        self.assertIn("resumed T01 round 2", resumed.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(2, int(record.get("round", 0)))
+        prompt = self.cli("prompt", "demo", "T01", "--role", "implementor").stdout
+        self.assertEqual(sha(prompt.encode()), record.get("prompt_digest"))
+        capped = self.cli("dispatch", "demo", "T02", "--session", "w2", ok=False)
+        self.assertNotEqual(0, capped.returncode)
+        self.assertIn("concurrency 1/1", capped.stderr)
+
+    def test_p2_cross_round_resume_refuses_unfinished_dependency(self) -> None:
+        """A resume cannot bind a new round before its dependency is terminal."""
+        run = self.init_policy()
+        self.assign_simple(run, "T01")
+        self.assign_simple(run, "T02")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T02", "--session", "w1")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/t02.py:1` - implemented T02.")
+        self.cli("submit", "demo", "T02")
+
+        # The dependency is introduced after round 1 was dispatched. The
+        # correction round must still obey it before a resume can rebind.
+        task = run / "T02-task.mdx"
+        task.write_text(task.read_text().replace("depends_on: ", "depends_on: T01"))
+        self.cli("decide", "demo", "T02", "--changes")
+        decision = run / "T02-decision-01.mdx"
+        decision.write_text(decision.read_text().replace(
+            "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->",
+            "1. Correct `src/t02.py:1` and rerun the registered verification.",
+        ))
+        self.cli("decide", "demo", "T02", "--changes")
+
+        refused = self.cli("resume", "demo", "T02", "--session", "w1", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("T02 cannot resume with unmet dependencies", refused.stderr)
+        self.assertIn("T01 (draft)", refused.stderr)
+        record = json.loads((run / ".dispatch" / "T02.json").read_text())
+        self.assertEqual(1, int(record.get("round", 0)))
+        self.assertIn("status: draft", (run / "T02-report-02.mdx").read_text())
+
+    def test_p2_numbered_verifier_findings_keep_indented_continuations(self) -> None:
+        """Indented continuation lines survive into the correction decision and prompt."""
+        run = self.init5()
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: allowed"))
+        self.submit5(run, "T01")
+        detail = ("1. Guard `src/t01.py:1` against empty input\n"
+                  "   must use constant-time compare in `src/t01.py:42`\n"
+                  "2. Add a regression test for the empty case")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", detail, "--open-correction")
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("1. Guard", decision)
+        self.assertIn("constant-time compare", decision)
+        self.assertIn("2. Add a regression test", decision)
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("stage: correction", out)
+        self.assertIn("constant-time compare", out)
+
+    def test_p2_first_round_blocked_renders_reviewer_prompt_without_decision(self) -> None:
+        """A round-1 blocked report derives a review stage the reviewer can render."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx", blocked=True,
+                              files="- `src/t01.py:1` - blocked change.")
+        self.cli("submit", "demo", "T01", "--blocked", "--as", "implementor")
+        out = self.prompt_text(run, "T01", "reviewer")
+        self.assertIn("stage: review", out)
+        self.assertNotIn("stage: correction", out)
+        wrong_stage = self.cli("prompt", "demo", "T01", "--role", "verifier",
+                               "--stage", "verification", ok=False)
+        self.assertIn("found blocked", wrong_stage.stderr)
+        self.cli("decide", "demo", "T01", "--waive", "--reason", "external outage",
+                 "--as", "reviewer")
+        self.assertIn("status: waived", (run / "T01-report-01.mdx").read_text())
+
+    # ---------------- wake coverage: every open state wakes exactly someone
+
+    DECISION_PLACEHOLDER = (
+        "<!-- Numbered, specific, each one independently actionable. Cite `file:line`. -->")
+
+    def init5_in(self, run_id: str, mode: str = "") -> Path:
+        """A documents-only five-role run under its own id, standard unless quick."""
+        if mode == "quick":
+            self.cli("init", run_id, "--mode", "quick", "--evidence-mode", "documents-only")
+        else:
+            self.cli("init", run_id, "--harness", "claude", "--topology", "split",
+                     "--evidence-mode", "documents-only", "--workflow", "five-role-v1")
+        return self.root / ".docket" / "runs" / run_id
+
+    def request_changes(self, run: Path, run_id: str, owner: str, reviewer: str = "reviewer",
+                        rnd: int = 1) -> None:
+        """Open, fill, and apply a reviewer changes decision for one round."""
+        self.cli("decide", run_id, owner, "--changes", "--as", reviewer)
+        dec = run / f"{owner}-decision-{rnd:02d}.mdx"
+        dec.write_text(dec.read_text().replace(self.DECISION_PLACEHOLDER, self.REQUIREMENT))
+        self.cli("decide", run_id, owner, "--changes", "--as", reviewer)
+
+    def derived_keys(self, run_id: str, role: str) -> list[str]:
+        """Event keys derived for one role, read through non-consuming inspection."""
+        out = self.cli("events", run_id, "--role", role, "--peek").stdout
+        return re.findall(r"^\s*\[(?:pending|delivered)\s*\]\s+(\S+)", out, re.MULTILINE)
+
+    def woken(self, run_id: str, roles: tuple[str, ...]) -> dict[str, list[str]]:
+        return {role: keys for role in roles if (keys := self.derived_keys(run_id, role))}
+
+    def watch_once(self, run_id: str, role: str, now: float | None = None,
+                   ) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env.pop("DOCKET_FAULT", None)
+        if now is not None:
+            env["DOCKET_NOW"] = str(now)
+        return subprocess.run(
+            [sys.executable, str(DOCKET), "watch", run_id, "--role", role, "--timeout", "1"],
+            cwd=str(self.root), text=True, capture_output=True, env=env)
+
+    def lease_expiry(self, run: Path, role: str) -> float:
+        records = (run / ".delivery" / role / "announce").glob("*.json")
+        return max(float(json.loads(p.read_text())["lease_until"]) for p in records)
+
+    def test_interrupted_verifier_correction_finishes_on_retry_without_recharging(self) -> None:
+        """A retry finishes an interrupted verifier correction; nothing strands or double-counts."""
+        detail = "1. Guard `src/t01.py:1` against empty input"
+        command = ("--result", "fail", "--as", "verifier", "--detail", detail,
+                   "--open-correction")
+        for index, fault in enumerate(("verify:before-correction", "transition:begin",
+                                       "transition:decision", "transition:report")):
+            rid = f"vc{index}"
+            run = self.init5_in(rid)
+            plan = run / "plan.mdx"
+            plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                     "verifier_correction: allowed"))
+            self.submit5_in(run, rid, "T01")
+            crashed = self.cli("verify", rid, "T01", *command, ok=False, fault=fault)
+            self.assertEqual(70, crashed.returncode, f"{fault}: {crashed.stderr}")
+            self.assertEqual(["T01-report-01.mdx"], self.rounds(run, "T01"), fault)
+            # The interrupted state is never silent: the reviewer is told how
+            # to finish it, and nobody is told the work is reviewable.
+            reviewer = self.cli("events", rid, "--role", "reviewer", "--peek").stdout
+            expected = ("T01:1:verification-failed" if fault == "verify:before-correction"
+                        else "T01:1:unfinished-changes-requested")
+            self.assertEqual([expected], self.derived_keys(rid, "reviewer"), fault)
+            self.assertIn("interrupted", reviewer, fault)
+            self.assertEqual([], self.derived_keys(rid, "orchestrator"), fault)
+            # A different verdict, or different findings, cannot slip past it.
+            passed = self.cli("verify", rid, "T01", "--result", "pass", "--as", "verifier",
+                              ok=False)
+            self.assertIn("unfinished verifier-triggered correction", passed.stderr, fault)
+            restated = self.cli("verify", rid, "T01", "--result", "fail", "--as", "verifier",
+                                "--detail", "1. something else", "--open-correction", ok=False)
+            self.assertIn("already recorded these findings", restated.stderr, fault)
+            retried = self.cli("verify", rid, "T01", *command)
+            self.assertIn("resuming the interrupted verifier correction", retried.stdout, fault)
+            self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"],
+                             self.rounds(run, "T01"), fault)
+            self.assertEqual(["T01-verification-01.mdx"],
+                             sorted(p.name for p in run.glob("T01-verification-*.mdx")), fault)
+            corrections = json.loads((run / ".corrections" / "T01.json").read_text())
+            self.assertEqual(1, corrections["verifier_returns"], fault)
+            decision = (run / "T01-decision-01.mdx").read_text()
+            self.assertIn("verification: T01-verification-01.mdx", decision, fault)
+            self.assertIn("Guard `src/t01.py:1`", decision, fault)
+            self.assertEqual(["T01:2:correction-ready"], self.derived_keys(rid, "orchestrator"),
+                             fault)
+            self.assertEqual([], self.derived_keys(rid, "reviewer"), fault)
+            again = self.cli("verify", rid, "T01", *command, ok=False)
+            self.assertIn("not submitted", again.stderr, fault)
+
+    def test_interrupted_verifier_correction_can_be_finished_by_the_reviewer(self) -> None:
+        """The reviewer woken for an interrupted correction finishes the recorded decision."""
+        run = self.init5()
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("verifier_correction: forbidden",
+                                                 "verifier_correction: allowed"))
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "1. Guard input", "--open-correction", ok=False,
+                 fault="transition:decision")
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer")
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run, "T01"))
+        decision = parse_meta(run / "T01-decision-01.mdx")
+        self.assertEqual("verifier", decision["triggered_by"])
+        corrections = json.loads((run / ".corrections" / "T01.json").read_text())
+        self.assertEqual(1, corrections["verifier_returns"])
+        self.assertEqual(0, corrections["reviewer_returns"])
+
+    def test_orchestrator_owned_blocked_task_wakes_the_reviewer(self) -> None:
+        """A blocked executor:orchestrator round needs a reviewer decision and gets a wake."""
+        run = self.init5()
+        self.assign_orchestrator_task(run, "T01")
+        self.fill_task_report(run / "T01-report-01.mdx", blocked=True,
+                              files="- `src/t01.py:1` - blocked change.")
+        self.cli("submit", "demo", "T01", "--blocked", "--as", "orchestrator")
+        self.assertEqual({"reviewer": ["T01:1:blocked"]},
+                         self.woken("demo", ("planner", "orchestrator", "verifier", "reviewer")))
+        self.cli("decide", "demo", "T01", "--waive", "--reason", "external outage",
+                 "--as", "reviewer")
+        self.assertEqual([], self.derived_keys("demo", "reviewer"))
+
+    def test_aggregate_correction_wakes_the_orchestrator(self) -> None:
+        """Changes on the aggregate re-enter the orchestrator, with or without delegated tasks."""
+        for rid, delegated in (("only-orch", False), ("mixed", True)):
+            run = self.init5_in(rid)
+            if delegated:
+                self.submit5_in(run, rid, "T01")
+            else:
+                self.assign_orchestrator_task(run, "T01", rid)
+                self.submit_orchestrator_task(run, "T01", rid)
+            self.cli("verify", rid, "T01", "--result", "pass", "--as", "verifier")
+            self.cli("decide", rid, "T01", "--approve", "--as", "reviewer")
+            self.assertTrue(any(key.startswith("all:decided:")
+                                for key in self.derived_keys(rid, "orchestrator")), rid)
+            self.submit_aggregate(run, rid)
+            self.assertEqual(["orch:1:submitted"], self.derived_keys(rid, "reviewer"), rid)
+            self.request_changes(run, rid, "orch")
+            self.assertIn("orch:2:correction-ready", self.derived_keys(rid, "orchestrator"), rid)
+            self.assertEqual([], self.derived_keys(rid, "reviewer"), rid)
+
+    def test_correction_wake_retires_once_the_round_is_dispatched(self) -> None:
+        """Dispatching the correction round ends its wake; no lease expiry revives it."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        for sid in ("w1", "w2"):
+            self.cli("session", "demo", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        self.request_changes(run, "demo", "T01")
+        self.assertEqual(["T01:2:correction-ready"], self.derived_keys("demo", "orchestrator"))
+        woke = self.watch_once("demo", "orchestrator")
+        self.assertEqual(2, woke.returncode)
+        self.assertIn("needs re-dispatch", woke.stderr)
+        until = self.lease_expiry(run, "orchestrator")
+        self.cli("dispatch", "demo", "T01", "--session", "w2")
+        self.assertEqual([], self.derived_keys("demo", "orchestrator"))
+        quiet = self.watch_once("demo", "orchestrator", now=until + 1)
+        self.assertEqual(0, quiet.returncode, quiet.stderr)
+        self.assertEqual("", quiet.stderr)
+
+    def test_a_delivered_wake_is_not_reannounced_while_its_identity_holds(self) -> None:
+        """A handled event that persists never re-wakes; a changed one wakes once."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        first = self.watch_once("demo", "orchestrator")
+        self.assertEqual(2, first.returncode)
+        self.assertIn("review batch ready with 1 verified", first.stderr)
+        # The reviewer is still deciding, so the batch stays derived. That is
+        # not news: well past the lease the supervisor is left alone.
+        until = self.lease_expiry(run, "orchestrator")
+        for later in (until + 1, until + 3600):
+            quiet = self.watch_once("demo", "orchestrator", now=later)
+            self.assertEqual(0, quiet.returncode, quiet.stderr)
+        # New evidence is a new identity and wakes exactly once.
+        self.submit5(run, "T02")
+        self.cli("verify", "demo", "T02", "--result", "pass", "--as", "verifier")
+        second = self.watch_once("demo", "orchestrator", now=until + 7200)
+        self.assertEqual(2, second.returncode)
+        self.assertIn("T02 round 1", second.stderr)
+        self.assertEqual(0, self.watch_once("demo", "orchestrator",
+                                            now=until + 99999).returncode)
+
+    def test_resume_is_held_to_the_current_model_policy(self) -> None:
+        """Resume cannot carry a model the policy no longer approves; --model picks one."""
+        run = self.init_policy(primary_model="m1")
+        self.assign_simple(run, "T01")
+        for sid in ("w1", "w2"):
+            self.cli("session", "demo", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01")
+        self.request_changes(run, "demo", "T01", reviewer="reviewer")
+        plan = run / "plan.mdx"
+        plan.write_text(plan.read_text().replace("primary_model: m1", "primary_model: m2"))
+        refused_dispatch = self.cli("dispatch", "demo", "T01", "--session", "w2",
+                                    "--model", "m1", ok=False)
+        self.assertIn("outside the approved", refused_dispatch.stderr)
+        refused = self.cli("resume", "demo", "T01", "--session", "w1", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("cannot resume on model 'm1'", refused.stderr)
+        self.assertIn("--model m2", refused.stderr)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(1, int(record["round"]))
+        self.assertEqual("m1", record["model_requested"])
+        outside = self.cli("resume", "demo", "T01", "--session", "w1", "--model", "m3",
+                           ok=False)
+        self.assertIn("outside the approved", outside.stderr)
+        resumed = self.cli("resume", "demo", "T01", "--session", "w1", "--model", "m2")
+        self.assertIn("resumed T01 round 2", resumed.stdout)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(2, int(record["round"]))
+        self.assertEqual("m2", record["model_requested"])
+        self.assertEqual("unobserved", record["model_observed"])
+        self.assertEqual(["requested", "resume"],
+                         [entry["kind"] for entry in record["model_history"]])
+        prompt = self.cli("prompt", "demo", "T01", "--role", "implementor",
+                          "--model", "m2").stdout
+        self.assertEqual(sha(prompt.encode()), record["prompt_digest"])
+
+    def test_five_role_review_readiness_waits_for_verification(self) -> None:
+        """The orchestrator is woken to route verified work, not merely submitted work."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.assertEqual([], self.derived_keys("demo", "orchestrator"))
+        self.assertEqual(["T01:1:submitted"], self.derived_keys("demo", "verifier"))
+        self.cli("verify", "demo", "T01", "--result", "fail", "--as", "verifier",
+                 "--detail", "1. oracle mismatch")
+        self.assertEqual([], self.derived_keys("demo", "orchestrator"))
+        self.cli("verify", "demo", "T01", "--result", "uncertain", "--as", "verifier",
+                 "--detail", "timing could not be measured offline")
+        after_uncertain = self.derived_keys("demo", "orchestrator")
+        self.assertEqual(1, len(after_uncertain))
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier")
+        after_pass = self.derived_keys("demo", "orchestrator")
+        self.assertEqual(1, len(after_pass))
+        self.assertNotEqual(after_uncertain, after_pass)
+        # A closed non-milestone batch follows the same rule.
+        batched = self.init5_in("batched")
+        self.submit5_in(batched, "batched", "T01")
+        self.cli("batch", "batched", "--create", "B1", "--members", "T01")
+        self.cli("batch", "batched", "--close", "B1")
+        self.assertEqual([], self.derived_keys("batched", "orchestrator"))
+        self.cli("verify", "batched", "T01", "--result", "pass", "--as", "verifier")
+        self.assertEqual(["batch:B1:ready:1"], self.derived_keys("batched", "orchestrator"))
+
+    def test_every_open_lifecycle_state_wakes_a_supervisor(self) -> None:
+        """No owner and state combination is left with every supervising role asleep."""
+        standard = ("planner", "orchestrator", "verifier", "reviewer")
+        quick = ("coordinator", "checker")
+        cases: list[tuple[str, str, str]] = []
+
+        def expect(rid: str, mode: str, role: str) -> None:
+            cases.append((rid, mode, role))
+
+        def fresh(rid: str, mode: str, orchestrator_task: bool) -> Path:
+            run = self.init5_in(rid, mode)
+            if orchestrator_task:
+                self.assign_orchestrator_task(run, "T01", rid)
+                self.submit_orchestrator_task_as(run, rid, "T01", mode)
+            else:
+                self.submit5_in(run, rid, "T01")
+            return run
+
+        for mode in ("standard", "quick"):
+            verifier = "checker" if mode == "quick" else "verifier"
+            reviewer = "checker" if mode == "quick" else "reviewer"
+            orchestrator = "coordinator" if mode == "quick" else "orchestrator"
+            for kind in ("impl", "orch"):
+                owned = kind == "orch"
+                prefix = f"{mode[0]}{kind}"
+                fresh(f"{prefix}-submitted", mode, owned)
+                expect(f"{prefix}-submitted", mode, verifier)
+                run = fresh(f"{prefix}-passed", mode, owned)
+                self.cli("verify", f"{prefix}-passed", "T01", "--result", "pass",
+                         "--as", verifier)
+                # Standard routes verified work through the orchestrator; quick
+                # wakes the checker, who holds the review duty itself.
+                expect(f"{prefix}-passed", mode, reviewer if mode == "quick" else orchestrator)
+                run = fresh(f"{prefix}-failed", mode, owned)
+                self.cli("verify", f"{prefix}-failed", "T01", "--result", "fail",
+                         "--as", verifier, "--detail", "1. oracle mismatch")
+                expect(f"{prefix}-failed", mode, reviewer)
+                run = fresh(f"{prefix}-changes", mode, owned)
+                self.request_changes(run, f"{prefix}-changes", "T01", reviewer=reviewer)
+                expect(f"{prefix}-changes", mode, orchestrator)
+                run = fresh(f"{prefix}-approved", mode, owned)
+                self.cli("verify", f"{prefix}-approved", "T01", "--result", "pass",
+                         "--as", verifier)
+                self.cli("decide", f"{prefix}-approved", "T01", "--approve", "--as", reviewer)
+                expect(f"{prefix}-approved", mode, orchestrator)
+                blocked_id = f"{prefix}-blocked"
+                run = self.init5_in(blocked_id, mode)
+                if owned:
+                    self.assign_orchestrator_task(run, "T01", blocked_id)
+                else:
+                    self.assign_simple_in(run, blocked_id, "T01")
+                self.fill_task_report(run / "T01-report-01.mdx", blocked=True,
+                                      files="- `src/t01.py:1` - blocked change.")
+                self.cli("submit", blocked_id, "T01", "--blocked", "--as",
+                         orchestrator if owned else "implementor")
+                expect(blocked_id, mode, reviewer if owned else orchestrator)
+
+        for rid, mode, role in cases:
+            roles = quick if mode == "quick" else standard
+            woken = self.woken(rid, roles)
+            self.assertIn(role, woken, f"{rid}: expected {role} to be woken, got {woken}")
+
+    def submit_orchestrator_task_as(self, run: Path, run_id: str, owner: str,
+                                    mode: str) -> None:
+        """Submit an executor:orchestrator task as the run's orchestrating session."""
+        self.fill_task_report(run / f"{owner}-report-01.mdx",
+                              files=f"- `src/{owner.lower()}.py:1` - implemented {owner}.")
+        role = "coordinator" if mode == "quick" else "orchestrator"
+        self.cli("submit", run_id, owner, "--as", role)
+
+    def test_an_interrupted_reviewer_decision_wakes_whoever_finishes_it(self) -> None:
+        """Every interruption window of a decision wakes the role that repeats it."""
+        for index, fault in enumerate(("transition:begin", "transition:decision",
+                                       "transition:report")):
+            rid = f"rd{index}"
+            run = self.init5_in(rid)
+            self.submit5_in(run, rid, "T01")
+            self.cli("verify", rid, "T01", "--result", "pass", "--as", "verifier")
+            self.cli("decide", rid, "T01", "--changes", "--as", "reviewer")
+            dec = run / "T01-decision-01.mdx"
+            dec.write_text(dec.read_text().replace(self.DECISION_PLACEHOLDER, self.REQUIREMENT))
+            crashed = self.cli("decide", rid, "T01", "--changes", "--as", "reviewer",
+                               ok=False, fault=fault)
+            self.assertEqual(70, crashed.returncode, fault)
+            self.assertEqual(["T01:1:unfinished-changes-requested"],
+                             self.derived_keys(rid, "reviewer"), fault)
+            self.assertEqual([], self.derived_keys(rid, "verifier"), fault)
+            peek = self.cli("events", rid, "--role", "reviewer", "--peek").stdout
+            self.assertIn(f"docket decide {rid} T01 --changes --as reviewer", peek, fault)
+            self.cli("decide", rid, "T01", "--changes", "--as", "reviewer")
+            self.assertEqual({"orchestrator": ["T01:2:correction-ready"]},
+                             self.woken(rid, ("planner", "orchestrator", "verifier",
+                                              "reviewer")), fault)
+        # A legacy orchestrator decides its own task rounds and is woken instead.
+        legacy = self.init_legacy_as("legacy", evidence_mode="documents-only")
+        self.assign_simple_in(legacy, "legacy", "T01")
+        self.fill_task_report(legacy / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "legacy", "T01")
+        self.cli("decide", "legacy", "T01", "--approve", ok=False, fault="transition:decision")
+        self.assertIn("T01:1:unfinished-approved", self.derived_keys("legacy", "orchestrator"))
+        self.cli("decide", "legacy", "T01", "--approve")
+        self.assertNotIn("T01:1:unfinished-approved",
+                         self.derived_keys("legacy", "orchestrator"))
+
+    def test_a_run_starts_in_three_commands(self) -> None:
+        """init, assign with intent, and dispatch --register reach a bound, sendable prompt."""
+        init = self.cli("init", "fast", "--evidence-mode", "documents-only",
+                        "--title", "Guard input", "--objective", "Empty input is rejected.")
+        self.assertIn("mode: quick", init.stdout)
+        run = self.root / ".docket" / "runs" / "fast"
+        plan = (run / "plan.mdx").read_text()
+        self.assertIn("# Plan: Guard input", plan)
+        self.assertIn("Empty input is rejected.", plan)
+        self.assertNotIn("<!-- TODO: what", plan)
+        assigned = self.cli("assign", "fast", "T01", "--harness", "opencode",
+                            "--file", "src/a.py", "--verify", 'printf "T01 ok\\n"',
+                            "--title", "Empty guard", "--goal", "Empty input raises.",
+                            "--criterion", "guard('') raises ValueError",
+                            "--criterion", "callers are unchanged")
+        self.assertIn("task intent is ready to dispatch", assigned.stdout)
+        task = (run / "T01-task.mdx").read_text()
+        self.assertIn("# Task T01: Empty guard", task)
+        self.assertIn("- [ ] guard('') raises ValueError", task)
+        self.assertIn("- [ ] callers are unchanged", task)
+        self.assertEqual([], [line for line in task.splitlines() if "<!-- TODO" in line])
+        self.cli("validate-task", "fast", "T01")
+        dispatched = self.cli("dispatch", "fast", "T01", "--session", "impl-1",
+                              "--agent", "impl-1", "--register")
+        self.assertIn("registered session impl-1 for fast implementor (generation 1)",
+                      dispatched.stdout)
+        match = re.search(r"^prompt: (\S+) ", dispatched.stdout, re.MULTILINE)
+        self.assertIsNotNone(match, dispatched.stdout)
+        prompt_file = self.root / match.group(1)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(sha(prompt_file.read_bytes()), record["prompt_digest"])
+        rendered = self.cli("prompt", "fast", "T01", "--role", "implementor").stdout
+        self.assertEqual(rendered.encode(), prompt_file.read_bytes())
+        # A retried dispatch reuses the registration instead of advancing it,
+        # so it adopts its own record rather than looking like a new writer.
+        again = self.cli("dispatch", "fast", "T01", "--session", "impl-1",
+                         "--agent", "impl-1", "--register")
+        self.assertIn("already dispatched", again.stdout)
+        self.assertNotIn("registered session", again.stdout)
+        registration = json.loads(
+            (self.root / ".docket" / "sessions" / "impl-1.json").read_text())
+        self.assertEqual(1, registration["generation"])
+        # An incomplete intent still refuses, and registers nothing first.
+        self.cli("assign", "fast", "T02", "--harness", "opencode", "--file", "src/b.py",
+                 "--goal", "Only a goal, no criteria.")
+        refused = self.cli("dispatch", "fast", "T02", "--session", "impl-2", "--register",
+                           ok=False)
+        self.assertIn("T02 cannot dispatch with unresolved task intent", refused.stderr)
+        self.assertFalse((self.root / ".docket" / "sessions" / "impl-2.json").exists())
+        orch = self.cli("assign", "fast", "orch", "--goal", "not a task", ok=False)
+        self.assertIn("plan Objective", orch.stderr)
+
+    # ---------------- prompts a worker can act on without the playbook
+
+    def test_prompts_carry_the_exact_steps_for_their_role_and_stage(self) -> None:
+        """Each rendered prompt names the run's real files and commands with the right --as."""
+        run = self.init5_in("steps", mode="quick")
+        self.assign_simple_in(run, "steps", "T01")
+        initial = self.prompt_text_in("steps", "T01", "implementor")
+        self.assertIn("# Steps", initial)
+        self.assertIn("`.docket/runs/steps/T01-scope.mdx`", initial)
+        self.assertIn("`docket scope steps T01 --submit`", initial)
+        self.assertIn("`docket submit steps T01 --as implementor`", initial)
+        self.assertIn("`docket submit steps T01 --blocked --as implementor`", initial)
+        self.assertIn("`.docket/runs/steps/T01-report-01.mdx`", initial)
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "steps", "T01", "--as", "implementor")
+        checking = self.prompt_text_in("steps", "T01", "checker")
+        self.assertIn("stage: verification", checking)
+        self.assertIn("# Applicable verification obligations", checking)
+        self.assertIn("--as checker --verifier checker", checking)
+        self.assertIn("`docket decide steps T01 --approve --as checker --reviewer checker "
+                      "--reason", checking)
+        self.request_changes(run, "steps", "T01", reviewer="checker")
+        correcting = self.prompt_text_in("steps", "T01", "implementor")
+        self.assertIn("stage: correction", correcting)
+        self.assertIn("Apply every required change listed above.", correcting)
+        self.assertIn("`.docket/runs/steps/T01-report-02.mdx`", correcting)
+        # Standard names its own roles, and legacy needs no --as at all.
+        standard = self.init5_in("std")
+        self.submit5_in(standard, "std", "T01")
+        verifying = self.prompt_text_in("std", "T01", "verifier")
+        self.assertIn("`docket verify std T01 --result pass|fail|uncertain --as verifier",
+                      verifying)
+        self.assertNotIn("docket decide", verifying)
+        self.cli("verify", "std", "T01", "--result", "pass", "--as", "verifier")
+        reviewing = self.prompt_text_in("std", "T01", "reviewer")
+        self.assertIn("`docket decide std T01 --approve --as reviewer --reason", reviewing)
+        legacy = self.init_legacy_as("old", evidence_mode="documents-only")
+        self.assign_simple_in(legacy, "old", "T01")
+        old = self.prompt_text_in("old", "T01", "implementor")
+        self.assertIn("`docket submit old T01`", old)
+        self.assertNotIn("--as", old)
+
+    def prompt_text_in(self, run_id: str, owner: str, role: str) -> str:
+        return self.cli("prompt", run_id, owner, "--role", role).stdout
+
+    def test_prompts_are_unwrapped_and_carry_no_empty_fields(self) -> None:
+        """Wrapped reference prose becomes one line per item; unstated fields are left out."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.", "Fix the herdr pane wake hook for the terminal."))
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertIn("[harness-plumbing]", out)
+        self.assertIn("- Confirm the live model label instead of trusting launch flags; record "
+                      "what was observed, requested, or is unknown.", out)
+        for empty in ("existing decisions: none", "discovery constraints: none",
+                      "plan risks: none", "starting hints (advisory only): none",
+                      "latest decision: (none yet)", "reason: none"):
+            self.assertNotIn(empty, out)
+        self.assertIn("hard constraints: none stated", out)
+        # Help output is unwrapped the same way, with fences left alone.
+        help_text = self.cli("help", "implementor").stdout
+        self.assertIn("Read the complete `Txx-task.mdx`. Own repository discovery: begin with "
+                      "project guidance/manifests", help_text)
+        self.assertIn("```bash\ndocket handoff <run> <owner>\n", help_text)
+
+    def test_guidance_triggers_match_whole_words_not_fragments(self) -> None:
+        """Common words and fragments no longer pull in unrelated guidance cards."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        base = task.read_text()
+        task.write_text(base.replace(
+            "Implement the feature.",
+            "Strip whitespace from the input and trace blocked users in a session."))
+        out = self.prompt_text(run, "T01", "implementor")
+        self.assertNotIn("[harness-plumbing]", out)
+        self.assertNotIn("[concurrency]", out)
+        task.write_text(base.replace("Implement the feature.",
+                                     "Fix the concurrent lock handling."))
+        self.assertIn("[concurrency]", self.prompt_text(run, "T01", "implementor"))
+
+    def test_reports_start_with_the_task_criteria_to_check(self) -> None:
+        """Every draft round is seeded with the task criteria; nothing written is overwritten."""
+        run = self.init5_in("seed", mode="quick")
+        self.cli("assign", "seed", "T01", "--harness", "opencode", "--file", "src/t01.py",
+                 "--verify", 'printf "T01 ok\\n"', "--goal", "Works.",
+                 "--criterion", "first criterion", "--criterion", "second criterion")
+        report = (run / "T01-report-01.mdx").read_text()
+        self.assertIn("- [ ] first criterion\n- [ ] second criterion", report)
+        self.assertNotIn("- [ ] <!-- TODO -->", report)
+        # A task filled in after assignment is seeded when it is dispatched.
+        self.assign_simple_in(run, "seed", "T02")
+        self.assertIn("- [ ] <!-- TODO -->", (run / "T02-report-01.mdx").read_text())
+        self.cli("dispatch", "seed", "T02", "--session", "w2", "--register")
+        self.assertIn("- [ ] The feature works.", (run / "T02-report-01.mdx").read_text())
+        # A worker's own acceptance text is never replaced.
+        self.assign_simple_in(run, "seed", "T03")
+        mine = run / "T03-report-01.mdx"
+        mine.write_text(mine.read_text().replace("- [ ] <!-- TODO -->", "- [x] my own words"))
+        self.cli("dispatch", "seed", "T03", "--session", "w3", "--register")
+        self.assertIn("- [x] my own words", mine.read_text())
+        self.assertNotIn("- [ ] The feature works.", mine.read_text())
+        # A correction round starts seeded too.
+        report_path = run / "T01-report-01.mdx"
+        text = report_path.read_text()
+        for item in ("first criterion", "second criterion"):
+            text = text.replace(f"- [ ] {item}", f"- [x] {item}")
+        report_path.write_text(text)
+        self.fill_task_report(report_path, files="- `src/t01.py:1` - implemented T01.")
+        self.cli("scope", "seed", "T01", "--submit", ok=False)
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "seed", "T01", "--submit")
+        self.cli("submit", "seed", "T01", "--as", "implementor")
+        self.request_changes(run, "seed", "T01", reviewer="checker")
+        self.assertIn("- [ ] first criterion\n- [ ] second criterion",
+                      (run / "T01-report-02.mdx").read_text())
+
+    def test_a_dependent_task_takes_its_baseline_at_dispatch(self) -> None:
+        """A dependency's approved work is the dependent's starting point, not its diff."""
+        self.repo()
+        self.cli("init", "dep", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "dep"
+        (self.root / "src" / "b.py").write_text("value = 1\n")
+        self.git("add", "src/b.py")
+        self.git("commit", "-qm", "b")
+        self.cli("assign", "dep", "T01", "--harness", "opencode", "--file", "src/a.py",
+                 "--verify", 'printf "T01 ok\\n"', "--goal", "Change a.",
+                 "--criterion", "The feature works.")
+        gated = self.cli("assign", "dep", "T02", "--harness", "opencode", "--file", "src/b.py",
+                         "--verify", 'printf "T02 ok\\n"', "--depends-on", "T01",
+                         "--goal", "Change b on top of a.", "--criterion", "The feature works.")
+        self.assertIn("baseline is captured when it is dispatched", gated.stdout)
+        self.assertFalse((run / ".snapshots" / "T02.json").exists())
+        early = self.cli("dispatch", "dep", "T02", "--session", "w2", "--register", ok=False)
+        self.assertIn("unmet dependencies", early.stderr)
+        self.assertFalse((run / ".snapshots" / "T02.json").exists())
+        # T01 is implemented and approved; its change stays uncommitted.
+        self.cli("dispatch", "dep", "T01", "--session", "w1", "--register")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "dep", "T01", "--submit")
+        (self.root / "src" / "a.py").write_text("allowed = 2\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "dep", "T01", "--as", "implementor")
+        self.cli("verify", "dep", "T01", "--result", "pass", "--as", "checker",
+                 "--verifier", "checker")
+        self.cli("decide", "dep", "T01", "--approve", "--as", "checker")
+        dispatched = self.cli("dispatch", "dep", "T02", "--session", "w2", "--register")
+        self.assertIn("captured T02's baseline at dispatch", dispatched.stdout)
+        self.assertTrue((run / ".snapshots" / "T02.json").is_file())
+        # T02 is built on T01's approved round, and its evidence says which one.
+        self.assertIn("T02 consumes T01's approved bundle", dispatched.stdout)
+        inputs = self.cli("depend", "dep", "T02").stdout
+        self.assertIn("T01  final  approved", inputs)
+        scope = run / "T02-scope.mdx"
+        self.fill_scope(scope)
+        scope.write_text(scope.read_text().replace("`src/a.py` contains", "`src/b.py` contains"))
+        self.cli("scope", "dep", "T02", "--submit")
+        (self.root / "src" / "b.py").write_text("value = 2\n")
+        self.fill_task_report(run / "T02-report-01.mdx",
+                              files="- `src/b.py:1` - built on T01.")
+        diff = self.cli("diff", "dep", "T02").stdout
+        self.assertIn("src/b.py", diff)
+        self.assertNotIn("src/a.py", diff)
+        self.cli("submit", "dep", "T02", "--as", "implementor")
+        bundle = self.cli("bundle", "dep", "T02").stdout
+        self.assertIn("1 path(s)", bundle)
+
+    def test_a_dependent_task_wakes_its_supervisor_once_dispatchable(self) -> None:
+        """Approving a dependency wakes the coordinator to dispatch its dependent, once."""
+        run = self.init5_in("dw", mode="quick")
+        self.assign_simple_in(run, "dw", "T01")
+        self.cli("assign", "dw", "T02", "--harness", "opencode", "--file", "src/t02.py",
+                 "--verify", 'printf "T02 ok\\n"', "--depends-on", "T01",
+                 "--goal", "Builds on T01.", "--criterion", "works")
+        self.cli("assign", "dw", "T03", "--harness", "opencode", "--file", "src/t03.py",
+                 "--verify", 'printf "T03 ok\\n"', "--goal", "Independent.",
+                 "--criterion", "works")
+        self.cli("dispatch", "dw", "T01", "--session", "w1", "--register")
+        self.assertFalse(any("dispatch-ready" in key
+                             for key in self.derived_keys("dw", "coordinator")))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "dw", "T01", "--as", "implementor")
+        self.cli("verify", "dw", "T01", "--result", "pass", "--as", "checker",
+                 "--verifier", "checker")
+        self.cli("decide", "dw", "T01", "--approve", "--as", "checker")
+        ready = self.derived_keys("dw", "coordinator")
+        self.assertIn("T02:1:dispatch-ready", ready)
+        self.assertFalse(any(key.startswith("T03:") for key in ready))
+        self.cli("dispatch", "dw", "T02", "--session", "w2", "--register")
+        self.assertNotIn("T02:1:dispatch-ready", self.derived_keys("dw", "coordinator"))
+
+    def test_redispatch_rebinds_a_prompt_the_task_changed_under(self) -> None:
+        """The same writer re-dispatching after a task edit gets the new prompt bound."""
+        run = self.init5_in("rb", mode="quick")
+        self.cli("assign", "rb", "T01", "--harness", "opencode", "--file", "src/t01.py",
+                 "--verify", 'printf "T01 ok\\n"', "--goal", "Guard input.",
+                 "--criterion", "works", "--out-of-scope", "Do not touch word_count.",
+                 "--decision", "Tokenize with str.split().")
+        task = (run / "T01-task.mdx").read_text()
+        self.assertIn("## Out of scope\n\n- Do not touch word_count.", task)
+        self.assertIn("## Existing decisions\n\n- Tokenize with str.split().", task)
+        first = self.cli("dispatch", "rb", "T01", "--session", "w1", "--register").stdout
+        old_digest = json.loads((run / ".dispatch" / "T01.json").read_text())["prompt_digest"]
+        same = self.cli("dispatch", "rb", "T01", "--session", "w1", "--register").stdout
+        self.assertIn("already dispatched", same)
+        self.assertNotIn("rebound", same)
+        (run / "T01-task.mdx").write_text(task.replace(
+            "- Tokenize with str.split().", "- Tokenize with str.split() only."))
+        again = self.cli("dispatch", "rb", "T01", "--session", "w1", "--register").stdout
+        self.assertIn("rebound T01 round 1", again)
+        record = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertNotEqual(old_digest, record["prompt_digest"])
+        self.assertEqual(old_digest, record["prompt_history"][-1]["digest"])
+        prompt_file = self.root / re.search(r"^prompt: (\S+) ", again, re.MULTILINE).group(1)
+        self.assertEqual(sha(prompt_file.read_bytes()), record["prompt_digest"])
+        self.assertIn("str.split() only", prompt_file.read_text())
+        self.assertFalse((run / ".checkpoints").exists())
+        self.assertIn("prompt:", first)
+
+
+    # ---------------- feedback embedded in every run
+
+    def test_every_role_prompt_asks_for_feedback_and_it_accumulates(self) -> None:
+        """Roles record what docket cost them; records reach the user-level log and digest."""
+        log = Path(os.environ["DOCKET_FEEDBACK_LOG"])
+        run = self.init5_in("fb", mode="quick")
+        self.assign_simple_in(run, "fb", "T01")
+        self.cli("dispatch", "fb", "T01", "--session", "w1", "--register")
+        prompt = self.prompt_text_in("fb", "T01", "implementor")
+        self.assertIn("`docket feedback fb --add --role implementor --task T01 --round 1", prompt)
+        self.cli("feedback", "fb", "--add", "--role", "implementor", "--task", "T01",
+                 "--round", "1", "--category", "instruction",
+                 "--body", "had to look up the scope capsule format")
+        self.cli("feedback", "fb", "--add", "--role", "checker", "--task", "T01",
+                 "--round", "1", "--category", "review", "--body", "none")
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(["implementor", "checker"], [r["role"] for r in records])
+        dispatch = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(dispatch["prompt_digest"], records[0]["prompt_digest"])
+        self.assertEqual(str(self.root), records[0]["project"])
+        # A gate refusal is observed mechanically, with no agent involved.
+        refused = self.cli("submit", "fb", "T01", "--as", "implementor", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        machine = [json.loads(line) for line in log.read_text().splitlines()
+                   if json.loads(line).get("origin") == "machine"]
+        self.assertEqual("verification", machine[-1]["category"])
+        self.assertIn("submit refused by the gate", machine[-1]["body"])
+        digest = self.cli("feedback", "--digest").stdout
+        self.assertIn("agent reports: 2 (1 said none)", digest)
+        self.assertIn("implementor  1/1", digest)
+        self.assertIn("checker      0/1", digest)
+        self.assertIn("had to look up the scope capsule format", digest)
+        # Off means off, and feedback never blocks the work it describes.
+        off = self.cli_env({"DOCKET_FEEDBACK_LOG": "off"}, "feedback", "fb", "--add",
+                           "--role", "implementor", "--body", "not logged")
+        self.assertIn("recorded observation", off.stdout)
+        self.assertNotIn("not logged", log.read_text())

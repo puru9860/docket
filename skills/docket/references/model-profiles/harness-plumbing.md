@@ -2,7 +2,7 @@
 profile: harness-plumbing
 version: 1
 card: true
-triggers: harness, pane, session, hook, wake, herdr, tmux, terminal, input
+triggers: harness, pane, hook, wake, herdr, tmux, terminal
 confidence: observed-pattern
 ---
 

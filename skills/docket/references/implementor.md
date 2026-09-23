@@ -71,8 +71,9 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    derivation, byte-sensitive fingerprints, zero/one/many boundaries,
    reviewed oracle changes, and controlled offline proof or an explicit gap.
 5. Fill the standard task report: summary, files changed, acceptance,
-   verification, and decisions needed. Copy every acceptance criterion exactly;
-   only change its checkbox state. Optionally map each criterion to evidence in
+   verification, and decisions needed. The acceptance criteria are already copied
+   from the task as unchecked boxes; keep their text exactly and only change the
+   checkbox state. Optionally map each criterion to evidence in
    an `## Evidence` table with one row per stable ID (A1, A2, in task order):
    `| A1 | met | verify.stdout | none |`. States are `met`, `partial`,
    `not-met`, or `not-verified`. A `met` row names frozen artifacts or existing

@@ -6,7 +6,7 @@ one standardized aggregate report for the planner or final record.
 
 ## Standard and quick sessions
 
-New runs start on the standard preset with separate planner, orchestrator, implementor, verifier, and reviewer sessions.
+New runs start on the quick preset; the standard preset (`--mode standard`) keeps separate planner, orchestrator, implementor, verifier, and reviewer sessions.
 The quick preset merges planning and orchestration into one coordinator session and verification and review into one checker session.
 A coordinator performs exactly the orchestration duties described here plus plan ownership.
 A checker performs verification and then review as two recorded duties under `combined-checker`.
@@ -26,7 +26,9 @@ Only `claude`, `codex`, and `opencode` are supported harness values. Codex suppo
 is temporary compatibility. `--model` records the requested model; it is not proof
 that the harness actually selected it.
 
-Fill the task goal and acceptance criteria before dispatch. Add constraints,
+Fill the task goal and acceptance criteria before dispatch, either with
+`docket assign ... --goal TEXT --criterion TEXT` (repeat per criterion) or by editing
+the generated task. Add constraints,
 existing decisions, or starting hints only when already known; do not investigate
 the repository merely to populate them. Validate task intent before dispatch:
 
@@ -92,9 +94,11 @@ Prefer visible Herdr panes when available. Address agents by stable agent name,
 not pane ID. Dispatch through Docket so one round has exactly one writer:
 
 ```bash
-docket session <run> --register --session SESSION --name NAME --role implementor
-docket dispatch <run> T03 --session SESSION --agent NAME
+docket dispatch <run> T03 --session SESSION --agent NAME --register
 ```
+
+`--register` registers a new session for this run and role in the same call and reuses a matching registration, so a retried dispatch stays the same writer; `docket session --register` remains the way to start a new generation.
+Dispatch writes the exact prompt it bound to `.prompts/` and prints the path: send that file to the worker instead of rendering the prompt again.
 
 A retry with the same session and the same registration generation adopts
 the same record after a crash; the same session name with a newer generation
@@ -121,6 +125,9 @@ and leaves exactly one live dispatch record for the new writer. A pending
 correction round wakes you with one `correction-ready` event per round, whether
 a reviewer or a verifier requested it, so the implementor is re-dispatched
 instead of stalled.
+The event retires as soon as a live dispatch record binds that round, so dispatching the correction is also what stops the wake.
+A correction on an orchestrator-owned task, and changes requested on the aggregate, wake you the same way.
+A resume launches a new session, so it is held to the model policy in force now, exactly like a dispatch: a recorded model the plan no longer approves is refused, and `docket resume <run> <owner> --session NEW --model <approved>` names the replacement, recorded in `model_history`.
 
 Arm only the orchestrator role and set `DOCKET_ROLE=orchestrator`:
 
@@ -141,16 +148,19 @@ To see what is waiting without consuming it, run
 deliverable. It is for inspection after an actionable wake or before handing over,
 not a substitute for waiting.
 
-Prefer a batched review event via `docket watch <run> --role orchestrator`.
+Wait with `docket watch <run> --role orchestrator`, following the per-harness table in `docket help signalling`.
 Ordinary submitted reports do not wake separately: Docket waits until every
 currently delegated task is submitted or already decided, then emits one batch
-wake. With explicit closed batches, readiness follows closed membership and
+wake. Under `five-role-v1` that batch also waits until every submitted member's
+verification resolves, so the wake always has verified work to route to the
+reviewer. With explicit closed batches, readiness follows closed membership and
 explicit dependencies instead. Blockers, scope collisions, replacement handoffs,
 and stall incidents remain immediate.
-When Herdr is the available completion surface, use one long
-`herdr agent prompt ... --wait` or `herdr agent wait`; a blocking shell wait does
-not require repeated model turns. On a timeout, re-arm the wait without narrating
-it. Inspect terminal output or lifecycle state only once after an actionable wake.
+Do not wait on `herdr agent wait`, `herdr agent prompt ... --wait`, or a `sleep` loop.
+They return when an agent goes idle or a timer fires, not when the lifecycle needs you, and every return is a full-context model turn.
+On Codex a blocking call is sliced into polls, so raise `background_terminal_max_timeout` and poll with a long `yield_time_ms`, as the signalling table says.
+On a timeout, re-arm the wait without narrating it.
+Inspect terminal output or lifecycle state only once after an actionable wake.
 Delivery notices are fixed-format (run, role, event, inbox pointer) and never
 carry report prose; when no verified turn boundary exists, events stay queued
 for explicit inbox pickup (`docket inbox <run> --role orchestrator --claim

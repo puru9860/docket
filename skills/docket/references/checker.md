@@ -6,9 +6,12 @@ It first performs the verifier duty: challenge whether the evidence proves accep
 
 The generated prompt carries the mandatory contract: relevant constraints from the plan, the task, Existing decisions and Discovery constraints, not Out of scope alone. Mandatory material is never truncated to fit a guidance budget and is reported in the mandatory size. For detail, read `references/verifier.md` and `references/reviewer.md` on demand; the prompt never concatenates those playbooks.
 
+On each wake, run `docket status <run>` once, read the round with `docket bundle <run> <owner>`, record the verification, then decide it; a wake for the aggregate needs only the decision, and `docket review-packet <run> --role reviewer` gathers its evidence.
+
 ```bash
-docket verify <run> <owner> --result pass|fail|uncertain --as checker --verifier checker
-docket decide <run> <owner> --approve --as checker --reviewer checker
+docket verify <run> <owner> --result pass|fail|uncertain --as checker --verifier checker --detail "1. finding with evidence"
+docket decide <run> <owner> --approve --as checker --reviewer checker --reason "why it holds"
+docket decide <run> <owner> --changes --as checker --reviewer checker   # opens a draft: fill its numbered required changes, then run it again
 docket prompt <run> <owner> --role checker
 docket session <run> --register --session <id> --name <name> --role checker
 ```

@@ -6,6 +6,38 @@ It owns exactly the planner intent and constraint duties plus deterministic disp
 
 The generated prompt carries the mandatory contract: relevant constraints from the plan, the task, Existing decisions and Discovery constraints, not Out of scope alone. Mandatory material is never truncated to fit a guidance budget and is reported in the mandatory size. For detail, read `references/planner.md` and `references/orchestrator.md` on demand; the prompt never concatenates those playbooks.
 
+Start a run in these commands, without `--help` discovery or template editing:
+
+```bash
+docket init R01 --title "Short name" --objective "What done means for the whole run."
+docket assign R01 T01 --harness opencode --file src/x.py --verify 'tests/test.sh' --title "Task name" --goal "What must be true when done." --criterion "A mechanically checkable criterion"
+docket dispatch R01 T01 --session impl-1 --agent impl-1 --register
+docket set-model R01 T01 --actual <model label the harness shows>
+docket arm R01 --role coordinator
+```
+
+`dispatch` runs the task-intent gate, registers the worker session, and prints the prompt file holding the exact bytes it bound; send that file to the worker.
+Start the checker session too (SKILL.md shows the launch and its prompt); it acts on every submission.
+Then wait with `docket watch R01 --role coordinator` as the signalling playbook describes for your harness.
+Verified work wakes the checker directly, so you are woken only for these:
+
+| Wake | What to do |
+| --- | --- |
+| `correction-ready` | `docket dispatch R01 T01 --session impl-1 --agent impl-1 --register`, then send the new prompt file to the implementor |
+| `blocked` | answer a planning question yourself; a waiver or changes belong to the checker, so prompt the checker to decide that round |
+| scope collision, handoff ready, stall | sequence the work, or `docket resume R01 T01 --session NEW --register` with the handoff |
+| `all:decided` | write the aggregate report, below |
+| `unfinished-*` or a correction for the aggregate | run the command the wake names |
+
+The aggregate closes the run once every task is decided:
+
+```bash
+docket assign R01 orch --executor orchestrator --verify 'tests/test.sh'
+docket submit R01 orch --as coordinator
+```
+
+Fill every section of `orch-report-01.mdx` between those two commands; the checker then decides the aggregate.
+
 ```bash
 docket prompt <run> <owner> --role coordinator
 docket session <run> --register --session <id> --name <name> --role coordinator

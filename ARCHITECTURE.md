@@ -21,8 +21,9 @@ budgets, and reviewer-owned approval). `workflow: legacy` is a historical decode
 for runs that already exist: the original three-role behavior is preserved
 exactly, a missing workflow key still reads as legacy, and `docket migrate`
 moves such a run explicitly. New runs cannot select legacy: `docket init`
-records five-role-v1 through the standard or quick preset and refuses
-`--workflow legacy` with a diagnostic naming standard and quick.
+records five-role-v1 through the quick preset by default, or the standard preset
+with `--mode standard`, and refuses `--workflow legacy` with a diagnostic naming
+standard and quick.
 
 ## Why files, not messages
 
@@ -363,6 +364,21 @@ evidence, where resolved means a recorded `pass` or `uncertain` verdict or
   then receives one `correction-ready` event per pending correction round so it
   can re-dispatch the implementor. Neither event makes failed work reviewable:
   approval still needs a passing verification for the exact frozen bundle.
+
+Every open lifecycle state wakes exactly the role that can move it, and `test_every_open_lifecycle_state_wakes_a_supervisor` holds that across both presets and both executors.
+Under `five-role-v1` review readiness means verified: the whole-run review batch and every closed batch, milestone or not, wait until each submitted member holds a resolved verification, and verdicts and findings are part of the identity.
+Readiness at submission woke a supervisor with nothing to route and no later event to wait for, so it polled until the verifier finished.
+A standard run routes that wake to the orchestrator, which sends verified work to the reviewer; a quick run routes it to the checker, which holds the review duty itself, and leaves the coordinator asleep.
+An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, since five-role submission is never terminal for it; a blocked one wakes the reviewer directly, as a blocked aggregate does.
+A `correction-ready` event retires as soon as a live dispatch record binds its round, and the same wake exists for an orchestrator-owned task and for changes requested on the aggregate.
+An interrupted decision transition derives one `unfinished-<verdict>` event naming the exact finishing command, read from the artifacts first and the journal second, as `applied_steps` does: a report left `changes-requested` with no next round, an applied decision over a report still submitted or blocked, or an in-progress journal.
+It goes to the reviewer in five-role runs and to the legacy orchestrator or split planner otherwise, and a transition whose owner lock is held is still running and derives nothing.
+
+A verifier-opened correction is retry-safe in every window.
+The verification records `opened_correction: requested` in the same write as the finding, after the policy and the numbered-change checks pass, so nothing is recorded for a correction that could not open.
+The budget charge is keyed by that verification, so a retry never charges it twice.
+Repeating `--open-correction` finishes the recorded correction from the journal, the applied decision, or the requested verification, writes no second verification, refuses different findings or a different verdict until it is finished, and works even after the report step, when the round already reads `changes-requested`.
+The reviewer can finish the same transition by repeating `--changes`.
 A verifier-opened correction carries numbered required changes derived from
 the recorded findings, never prose, so the round it opens renders in the
 implementor prompt; findings that cannot yield a numbered change refuse the
@@ -388,7 +404,9 @@ Mode, workflow version, topology, and model policy are four separate concepts.
 A mode selects a tested preset of the other three and records that selection.
 It never weakens evidence validation and never reinterprets an existing run.
 
-The standard preset is the default for new runs.
+The quick preset is the default for new runs, held in `MODE_NEW_RUN_DEFAULT`.
+Most runs have one clear outcome, and three sessions start and wait far more cheaply than five: every waiting supervisor is a session the harness re-enters with its whole context.
+The standard preset is selected with `--mode standard`.
 It uses workflow `five-role-v1` with `split` topology and five sessions: planner, orchestrator, implementor, verifier, reviewer.
 Its review policy is `independent-verifier-reviewer`, so a later reader can tell an independent verifier stood behind each decision.
 The quick preset is three roles for work with one clear outcome, established local verification, one writer, and no unresolved requirement or architecture decision.
@@ -443,6 +461,20 @@ submitted report. Every selected duty states why it applies. The selector is
 never an allowlist: the prompt explicitly invites the verifier to raise any
 other obligation or risk that discovery reveals.
 
+Every prompt has one shape: the role contract, one metadata line (`stage | workflow | mode | review_policy`), the authority line, the task contract, the latest decision on a correction, the applicable obligations for verification, selected guidance, numbered steps, pointers, and one revisions line.
+The steps, rendered by `prompt_steps`, carry the run's real file paths and the exact commands for that role and stage with the `--as` identity the preset requires, so a worker can act on the prompt alone instead of reading its playbook first.
+A contract field nobody stated is left out rather than rendered as `none`; `hard constraints` always appears so its absence is explicit.
+Reference prose is hard-wrapped for human editors, and `unwrap_markdown` joins it so each paragraph and list item is one line in prompts and in `docket help`, while fences, tables, and headings keep their bytes.
+Guidance-card triggers match at the start of a word, so a stem like `concurren` still selects while `input` no longer pulls in harness guidance and `lock` no longer fires on `block`.
+The quick checker receives the verification obligations whenever its round still awaits verification, since it performs the verifier duty.
+Every draft report round, at assignment, at dispatch, and when a correction opens, is seeded with the task's acceptance criteria as unchecked boxes when it still holds the template placeholder, because retyping them exactly is the commonest way a worker fails the gate; nothing a worker wrote is ever replaced.
+
+Feedback is embedded in every run so bottlenecks surface as docket is used.
+Every rendered prompt ends with a step asking the role to record what docket itself cost it that round, or `none`, and `docket feedback --add` ties the report to the dispatch's prompt digest and model automatically.
+Each record is also appended to a user-level log (`~/.local/state/docket/feedback.jsonl`, `DOCKET_FEEDBACK_LOG` to move it, `off` to disable), so observations accumulate across runs and projects.
+docket appends machine observations of its own at the points that cost roles effort, at no model cost: a gate refusal, a prompt rebound after the task changed, a resume, and an exhausted correction budget.
+`docket feedback --digest` summarizes the log by role, category, and recurring item; the `none` reports are the denominator that shows which roles and stages run without friction.
+
 Feedback is optional evidence, never a gate. Any role may record a short
 observation at its handoff (`docket feedback --add`); absent or failed
 feedback never blocks submission, blocking, handoff, approval, waiver, or
@@ -478,6 +510,7 @@ A run that already holds a cycle stays readable and new unrelated work still ent
 A batch written before the source rule stays readable: dispatch and readiness only read edges keyed by members, so a stored non-member edge is inert and never blocks member work.
 `docket dispatch` runs the same task-intent check as `docket validate-task` and refuses before writing a dispatch record, naming the same problems.
 A prompt whose mandatory contract would carry unresolved template placeholders is refused as a missing required artifact rather than rendered.
+A same-session retry after the task or plan changed re-renders the prompt and rebinds `prompt_digest`, keeping the replaced digest in `prompt_history`, so a record never keeps describing bytes nobody should send; nothing else about the binding moves.
 A retry with the same session and the same
 registration generation adopts the same record, so a crash before or after the
 launch acknowledgement never creates a second writer. A retry with the same
@@ -517,7 +550,9 @@ discovery. `docket switch-model` walks the approved fallback list; past its
 end, or past the spending tier, exactly one compact exception opens instead of
 silent higher-tier spend. An initial `docket dispatch --model` outside the
 approved list is refused through that same open exception before any record is
-published, so an approved policy cannot be bypassed by a new dispatch. Model
+published, so an approved policy cannot be bypassed by a new dispatch.
+`docket resume` launches a new session too, so it is held to the policy in force now: a recorded model the plan no longer approves is refused, and `--model` names an approved replacement, recorded in `model_history` as a resume and read back as unobserved until `docket set-model` verifies it.
+Carrying the predecessor's model forward unchecked let a policy change be bypassed by resuming a correction round instead of dispatching it. Model
 policy has three states: absent means no `primary_model` and no
 `fallback_models`, and any model dispatches with one plain line stating the run
 has no approved model policy so nothing is being enforced; single means a
@@ -687,6 +722,11 @@ Each path that was already dirty at capture is recorded with its porcelain state
 worktree mode, its content digest, and its index entry. A content hash alone cannot see
 an executable-bit change or a staging change layered on a path that was dirty when the
 baseline was taken, and either one would then be missing from the task diff.
+
+A task assigned with a `--depends-on` edge whose dependency is not approved yet defers its task baseline to `docket dispatch`, which captures it once, whole, before the dispatch record exists, and refuses the dispatch when it cannot.
+Captured at assignment, the baseline predated the dependency's work, so the dependency's approved but uncommitted change showed up as the dependent's own out-of-scope change: the gate refused it, and the only way past was to widen the dependent's scope over the dependency's files and freeze that work into the wrong patch.
+Deferral keeps invariant 17, since the baseline still precedes the task's own dispatch and is never recaptured, and the dependency's work becomes the dependent's starting point.
+When the dependency is approved, the orchestrator (the coordinator in quick) receives one `dispatch-ready` event for the dependent, which retires once the round is dispatched; nothing else re-entered it at that moment, because the dependent is still a draft.
 
 `docket assign` takes the run baseline before it opens the first task, because a
 baseline taken when the aggregate report is assigned has already lost the run's initial
@@ -957,7 +997,17 @@ a crash after the ledger write but before the harness accepts the wake leaves
 the durable pending event behind, and the next watcher re-announces the same
 actionable event once the announcement lease expires. An active lease suppresses
 duplicate wakes so concurrent watchers converge on one exit 2, and explicit
-inbox pickup stays claimable throughout. `docket events <run> --role R --peek`
+inbox pickup stays claimable throughout.
+The watcher marks an announcement `delivered_at` only after writing its banner and immediately before exiting 2, and a delivered announcement is not re-announced while its identity holds.
+An event usually stays derived after delivery because another role is still working on it: the reviewer deciding a routed batch, an implementor answering a correction.
+Re-announcing it every lease period re-entered the supervisor every five minutes for news it had already acted on, which is polling by another name.
+An identity that moves is retired and re-derived by `sweep_role`, which removes the announcement, so a changed event still wakes.
+
+A harness re-entry replays the whole session context, so how a supervisor waits is the dominant token cost of a run.
+Claude Code waits for free through the Stop hook, or once per event through a background `docket watch`.
+Codex slices a blocking call into polls, each a full-context turn, capped per empty poll by `background_terminal_max_timeout`; its own awaiter agent sets that to an hour, and the signalling playbook tells supervisors to do the same.
+OpenCode blocks for the whole shell timeout and has no idle wake.
+Waiting on agent state (`herdr agent wait`) or timers instead of Docket events returns on idle transitions that need nobody, which is why the playbooks forbid it. `docket events <run> --role R --peek`
 derives the same list, marks each key `pending` or `delivered`, and writes
 nothing: it never creates, migrates, or appends a ledger, so repeated inspection
 cannot consume a wake. `status` and `doctor` touch no delivery state either.
@@ -1201,15 +1251,15 @@ Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
 | commands | task validation, discovery scope, handoff, report, review, diff, bundle, depend, and preflight |
 | gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | verification | `task_env`, `parse_framework_counts`, `run_verification` |
-| transitions | `owner_lock`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
-| five-role | `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `submit_op_for`, `note_correction`, `guard_correction_budget`, `open_escalation`, `latest_verification`, `cmd_verify`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
+| transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
+| five-role | `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `guard_correction_budget`, `open_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
 | prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
 | feedback | `cmd_feedback`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
-| dispatch | `task_depends_on`, `read_dispatch`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
+| dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
 | amendments | `list_amendments`, `amendment_consumers`, `amendment_blocks`, `cmd_propose_amendment`, `cmd_amendment` |
 | packets | `task_coverage_row`, `packet_tokens`, `cmd_review_packet` |
 | metrics | `cmd_metrics`, `run_artifact_span` |
-| delivery | `workflow_of`, `reopen_epoch`, `derive_events`, `reviewer_verifier_events`, `now_s`, `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
+| delivery | `workflow_of`, `reopen_epoch`, `derive_events`, `reviewer_verifier_events`, `review_scope_states`, `review_readiness_events`, `unfinished_decision`, `announce_delivered`, `now_s`, `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
 | batches | `batch_path`, `read_batch`, `list_batches`, `batch_ready`, `cmd_batch` |
 | health | `execution_health`, `latest_verify_text`, `list_incidents`, `plan_grace_seconds`, `cmd_health` |
 | qualified delivery | `paused_flag`, `input_active_flag`, `outbox_path`, `probe_boundary`, `claim_event`, `fixed_notice`, `cmd_delivery` |
@@ -1225,6 +1275,10 @@ relevant playbook, while `docket help <role>` exposes the same installed files.
 ```bash
 tests/test.sh
 ```
+
+`tests/test.sh` runs every test in its own process from a shared work queue (`tests/parallel.py`), half the CPUs by default and `DOCKET_TEST_JOBS` to override, and prints exactly one unittest summary so `docket suite --qualify` reads it unchanged.
+`DOCKET_TEST_JOBS=1` runs the plain serial suite.
+The suite is also the `verify:` command of Docket's own runs, and a waiting supervisor pays for every minute of it, so its wall time is a token cost, not only a convenience.
 
 The Python behavioral suite uses a fresh temporary directory per test. It covers task
 intent, implementor-owned discovery, atomic collision detection, scope amendments,

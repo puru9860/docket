@@ -61,6 +61,9 @@ for legacy runs. A frontier is a wake, never a combined verdict: approving one
    required changes, since failed work never becomes approval-ready and the
    batch never claims readiness for it. The event resolves when you decide or
    when a correction round opens, and never re-wakes you afterwards.
+   A blocked orchestrator-owned task wakes you directly, as a blocked aggregate does.
+   An interrupted decision, yours or a verifier-opened correction, wakes you with one `unfinished-<verdict>` event naming the command that finishes it; repeat that verdict alone and the recorded decision is finished exactly as written.
+   In a quick run, verified work that is ready for a decision wakes the checker directly rather than going through the coordinator.
 3. Review corrections against the delta from the reviewed bundle with refreshed
    evidence, keeping the full diff in reach; expand review when corrections
    touch other work. Two local correction attempts after initial submission is

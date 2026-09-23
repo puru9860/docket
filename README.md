@@ -19,10 +19,10 @@ Implementors can run cheaply in another harness. Docket supports Claude Code, Co
 (temporary compatibility), and OpenCode.
 
 Two presets select tested combinations of mode, workflow, topology, and review policy.
-The standard preset is the default for new runs: five sessions (planner, orchestrator,
-implementor, verifier, reviewer) with an independent verifier behind every decision.
-The quick preset is three roles for small certain work: a coordinator combining planning
+The quick preset is the default for new runs: three roles, a coordinator combining planning
 and orchestration, an implementor, and a checker combining verification and review.
+The standard preset is five sessions (planner, orchestrator, implementor, verifier,
+reviewer) with an independent verifier behind every decision; select it with `--mode standard`.
 Quick records `combined-checker` on every artifact, so no reader mistakes a quick decision
 for independently verified work.
 Quick merges duties through explicit recorded policy only.
@@ -86,7 +86,7 @@ Run `docket doctor` at any time to see what you have and what each missing piece
 | | Without it |
 | --- | --- |
 | A multiplexer for dispatch - [herdr](https://github.com/kunchenguid) recommended, tmux or zellij fine | Run each role in its own terminal window, or dispatch headless with `claude -p`. The file protocol is unchanged. |
-| Claude Code, for the `asyncRewake` wake hook | Supervisors block on a foreground call instead of idling for free, which caps out around 8 minutes per wait. Headless dispatch needs no watcher at all, since process exit is the signal. |
+| Claude Code, for the `asyncRewake` wake hook | Supervisors wait on a blocking `docket watch` instead of idling for free, and every return costs one full-context model turn; the Wake signalling section says how to keep that to one turn per event on each harness. Headless dispatch needs no watcher at all, since process exit is the signal. |
 | Several agent CLIs (`claude`, `codex`, `opencode`) | Model tiering collapses. One agent can still play the roles sequentially; you keep the paper trail and gate but lose the cost saving. |
 
 None of the optional pieces are enforced and nothing is blocked if they are absent.
@@ -154,9 +154,22 @@ use uv; nothing else changes.
 
 ```bash
 cd <your project> && mkdir -p .docket
-docket init R01          # scaffolds .docket/runs/R01/plan.mdx
-docket help planner      # then follow the playbook
+docket init R01 --title "Short name" --objective "What done means for the whole run."
+docket assign R01 T01 --harness opencode --file src/x.py --verify 'tests/test.sh' \
+  --title "Task name" --goal "What must be true when done." \
+  --criterion "A mechanically checkable criterion" --criterion "Another one"
+docket dispatch R01 T01 --session impl-1 --agent impl-1 --register
+# dispatch prints `prompt: .docket/runs/R01/.prompts/<file>.txt`; start the worker in
+# its harness and send it exactly that file, e.g. herdr agent prompt impl-1 "$(cat <file>)"
+docket set-model R01 T01 --actual <model label the harness shows>
+docket arm R01 --role coordinator      # then wait: docket help signalling, per harness
 ```
+
+That is the whole start: a bare `docket init` is the quick preset, `assign` takes the
+goal and criteria so nothing has to be opened and edited first, and `dispatch` runs the
+task-intent gate, registers the worker session, and writes the exact prompt to send.
+A checker session waits with `docket watch R01 --role checker` and verifies then reviews
+each submission. Use `--mode standard` for five sessions with an independent verifier.
 
 The role playbooks ship beside the skill and are surfaced by the CLI:
 
@@ -228,9 +241,12 @@ submitted or blocked work it tells you to open a fresh round with `docket decide
 ## Commands
 
 ```
-docket init <run> [--mode standard|quick] [--topology split|combined] [--harness H] [--evidence-mode M]
-                                  [--root alias=path ...]
-docket assign <run> <owner> --complexity low|high --executor implementor|orchestrator
+docket init <run> [--mode quick|standard] [--title T] [--objective TEXT] [--harness H]
+                                  [--evidence-mode M] [--root alias=path ...]
+docket assign <run> <owner> [--goal TEXT] [--criterion TEXT ...] [--file PATH ...] [--verify CMD]
+                                  [--complexity low|high] [--executor implementor|orchestrator]
+docket dispatch <run> <owner> --session S [--agent NAME] [--register]
+                                                     bind one round; writes the prompt to send
 docket validate-task <run> <owner>                   validate functional intent
 docket scope <run> <owner> --submit                  claim implementor-discovered paths
 docket handoff <run> <owner> [--submit]              partial-work checkpoint
@@ -301,8 +317,27 @@ The watcher is inert unless `watch.conf` exists, so an idle project costs nothin
 run in the hook's own foreground process tree - never with shell `&` - so the harness can
 tear it down with the session. See `docket help signalling`.
 
-Harnesses without an equivalent wake hook fall back to the blocking mode described in the
-same playbook. The file protocol is identical either way.
+Harnesses without an equivalent wake hook wait with one blocking `docket watch` instead.
+Every return re-enters the model with its whole context, so the wait window is the cost lever.
+On Codex, a blocking call is sliced into polls: set `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` so one poll can cover an hour rather than the default five minutes, and never wait in 30-second slices.
+Wait on Docket events, not on `herdr agent wait` or a `sleep` loop, which return on idle transitions and timers.
+`docket help signalling` has the table for each harness.
+The file protocol is identical either way.
+
+A delivered wake is not repeated while the event behind it is unchanged, so a supervisor that routed work to another role is left alone until that role's answer lands.
+
+## Feedback loop
+
+Every role records what docket itself cost it in each round - a missing instruction, a refusal it had to work around, a command it had to look up, waiting - or `none`, as the last step of its prompt.
+Records also go to one user-level log, `~/.local/state/docket/feedback.jsonl`, across every project, next to machine observations docket records by itself: gate refusals, prompts rebound after a task changed, resumes, and exhausted correction budgets.
+Review it periodically:
+
+```bash
+docket feedback --digest              # friction by role, category, and recurring item
+docket feedback --digest --since 2026-10-01
+```
+
+`DOCKET_FEEDBACK_LOG=path` moves the log and `DOCKET_FEEDBACK_LOG=off` disables it; feedback never blocks a run.
 
 ## Terminal layout
 

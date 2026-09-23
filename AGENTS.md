@@ -133,3 +133,14 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
   was verified against the old one, and re-recording is not reverifying.
 - `docket submit --blocked` refuses a round whose baseline capture was deleted. A
   lightweight blocked submission still has to freeze evidence somebody can rebuild.
+- A supervisor woken once for an event is not woken again while that event is
+  unchanged, even long after the announcement lease. Only an announcement that never
+  reached the harness is repeated; a moved identity is a new wake.
+- Under `five-role-v1` the orchestrator's review batch does not fire at submission.
+  It waits until every submitted member's verification resolves, and in a quick run it
+  wakes the checker instead of the coordinator.
+- `docket resume` refuses a recorded model the current plan policy no longer approves.
+  Pass `--model` with an approved one; a resume is a new launch, not a continuation.
+- A task assigned with an unmet `--depends-on` has no task baseline until it is
+  dispatched. That is deliberate: its baseline must include the dependency's approved
+  work, and it is still captured once, before its own dispatch, and never recaptured.

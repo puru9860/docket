@@ -15,7 +15,7 @@ Record the choice with `docket init <run> --topology split|combined`.
 
 ## Choose the preset
 
-New runs start on the standard preset unless `--mode quick` selects the smaller one.
+New runs start on the quick preset unless `--mode standard` selects the five-session one.
 The standard preset keeps planner and orchestrator as separate sessions with an independent verifier behind every decision.
 The quick preset merges planning and orchestration into one coordinator session for work with one clear outcome, established local verification, one writer, and no unresolved requirement or architecture decision.
 A coordinator owns exactly the planner duties described here plus deterministic dispatch.

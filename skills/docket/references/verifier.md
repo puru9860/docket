@@ -41,8 +41,12 @@ a rewrite.
    correction carries numbered required changes derived from your recorded
    findings, never prose, so the round can be rendered for the implementor;
    findings that cannot yield a numbered change refuse the opening with a
-   diagnostic instead of writing an unworkable decision. Otherwise
-   the orchestrator transports your finding unchanged to the reviewer.
+   diagnostic before anything is recorded, instead of writing an unworkable
+   decision. Otherwise the orchestrator transports your finding unchanged to
+   the reviewer.
+   If `--open-correction` is interrupted, repeat the same command.
+   The retry finishes the correction recorded by that verification: it writes no second verification, charges the correction budget once, may omit `--detail` but never restates it differently, and refuses any other verdict until the correction is finished.
+   The reviewer is woken for the interrupted state and may finish it instead with `docket decide <run> <owner> --changes --as reviewer`.
 4. Disputed findings stop with you: preserve both claims with their evidence
    and route the dispute to the reviewer instead of continuing an argument
    loop. Never approve disputed work, waive requirements, or alter
