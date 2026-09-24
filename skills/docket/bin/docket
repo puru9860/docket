@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -87,6 +88,9 @@ REQUIRED_HANDOFF_SECTIONS = [
     "Exact next action",
 ]
 PLACEHOLDER = re.compile(r"<!--\s*TODO|\bTODO:|\bFIXME\b|\bXXX\b")
+# The template's own unfilled markers. Supervisor-written tasks are checked for these
+# alone, so a criterion that names FIXME or XXX is a criterion, not a placeholder.
+TEMPLATE_PLACEHOLDER = re.compile(r"<!--\s*TODO")
 DOCUMENTS_ONLY = "documents-only"
 EVIDENCE_MODES = ("git", DOCUMENTS_ONLY)
 COVERAGE_AVAILABLE = "available"
@@ -107,7 +111,13 @@ ROOTS_DECLARED = "declared"
 
 
 def parse(text: str) -> tuple[dict[str, str], str]:
-    """Split flat YAML-ish frontmatter from the body."""
+    """Split flat YAML-ish frontmatter from the body.
+
+    A comment starts at a `#` that begins a line or follows whitespace, as in `sh`,
+    so `echo a#b`, a URL fragment, or `$#` in a verify command stays whole. A byte
+    order mark an editor added is not part of the document.
+    """
+    text = text.removeprefix("\ufeff")
     if not text.startswith("---"):
         return {}, text
     end = text.find("\n---", 3)
@@ -129,7 +139,8 @@ def parse(text: str) -> tuple[dict[str, str], str]:
                     in_single = not in_single
                 elif ch == '"' and not in_single:
                     in_double = not in_double
-                elif ch == "#" and not in_single and not in_double:
+                elif ch == "#" and not in_single and not in_double \
+                        and (i == 0 or line[i - 1] in " \t"):
                     cut = i
                     break
             if cut is not None:
@@ -142,37 +153,70 @@ def parse(text: str) -> tuple[dict[str, str], str]:
 
 
 def render(meta: dict[str, str], body: str) -> str:
+    for key, value in meta.items():
+        if "\n" in str(value) or "\r" in str(value):
+            die(f"frontmatter {key!r} cannot contain a line break, since each line is one key: "
+                f"{str(value)!r}")
     lines = "\n".join(f"{k}: {v}" for k, v in meta.items())
     return f"---\n{lines}\n---\n\n{body.lstrip()}"
 
 
-def sections(body: str) -> dict[str, str]:
-    """Map '## Heading' -> its content."""
-    out: dict[str, str] = {}
-    cur = None
-    buf: list[str] = []
-    for line in body.splitlines():
-        m = re.match(r"^##\s+(.+?)\s*$", line)
-        if m:
-            if cur:
-                out[cur] = "\n".join(buf).strip()
-            cur = m.group(1)
-            buf = []
-        elif cur:
-            buf.append(line)
-    if cur:
-        out[cur] = "\n".join(buf).strip()
+CODE_FENCE = re.compile(r"^\s*(```|~~~)")
+
+
+def heading_lines(body: str) -> list[tuple[int, str]]:
+    """(line index, name) of every `## ` heading outside a code fence.
+
+    Pasted output often carries Markdown of its own; a heading inside a fence is
+    content, never a new section of the document around it.
+    """
+    out: list[tuple[int, str]] = []
+    fence = ""
+    for index, line in enumerate(body.splitlines()):
+        marker = CODE_FENCE.match(line)
+        if marker:
+            if not fence:
+                fence = marker.group(1)
+            elif marker.group(1) == fence:
+                fence = ""
+            continue
+        if fence:
+            continue
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            out.append((index, heading.group(1)))
     return out
+
+
+def sections(body: str) -> dict[str, str]:
+    """Map '## Heading' -> its content. A repeated heading keeps its first section,
+    the same one `set_section` edits; `duplicate_sections` names the repeat."""
+    lines = body.splitlines()
+    heads = heading_lines(body)
+    out: dict[str, str] = {}
+    for n, (index, name) in enumerate(heads):
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        out.setdefault(name, "\n".join(lines[index + 1:end]).strip())
+    return out
+
+
+def duplicate_sections(body: str, names: list[str]) -> list[str]:
+    """Required headings that appear more than once, which make a document ambiguous."""
+    found = [name for _, name in heading_lines(body)]
+    return [name for name in names if found.count(name) > 1]
 
 
 def set_section(body: str, name: str, content: str) -> str:
     """Replace one '## name' section's content, appending the section when absent."""
-    heading = re.search(rf"^##[ \t]+{re.escape(name)}[ \t]*$", body, re.M)
-    if not heading:
+    lines = body.splitlines(keepends=True)
+    heads = heading_lines(body)
+    target = next((n for n, (_, heading) in enumerate(heads) if heading == name), None)
+    if target is None:
         return body.rstrip("\n") + f"\n\n## {name}\n\n{content}\n"
-    following = re.compile(r"^##[ \t]+", re.M).search(body, heading.end())
-    end = following.start() if following else len(body)
-    return (body[: heading.end()] + f"\n\n{content}\n\n" + body[end:]).rstrip("\n") + "\n"
+    index = heads[target][0]
+    end = heads[target + 1][0] if target + 1 < len(heads) else len(lines)
+    head = "".join(lines[:index + 1]).rstrip("\n")
+    return (head + f"\n\n{content}\n\n" + "".join(lines[end:])).rstrip("\n") + "\n"
 
 
 def checkbox_items(text: str) -> list[str]:
@@ -223,6 +267,23 @@ def perturb(point: str) -> None:
             subprocess.run(command, shell=True, cwd=root())
 
 
+# Directories that hold captured workspace content: baseline patches, untracked file
+# bodies, frozen bundles, and the private object store. They can contain secrets, so
+# they are readable by their owner alone, which covers everything beneath them.
+PRIVATE_STATE_DIRS = (".snapshots", ".bundles", ".baselines")
+
+
+def keep_private(path: Path) -> None:
+    """Make every private state directory above `path` owner-only."""
+    for parent in (path, *path.parents):
+        if parent.name in PRIVATE_STATE_DIRS and parent.is_dir():
+            try:
+                if parent.stat().st_mode & 0o077:
+                    os.chmod(parent, 0o700)
+            except OSError:
+                pass
+
+
 def publish_bytes(path: Path, data: bytes) -> None:
     """Publish raw bytes through a temporary file and one atomic replace.
 
@@ -230,6 +291,7 @@ def publish_bytes(path: Path, data: bytes) -> None:
     so evidence is written as bytes while documents go through `publish`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    keep_private(path.parent)
     tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
     try:
         with tmp.open("wb") as fh:
@@ -369,11 +431,48 @@ def die(msg: str) -> None:
 # ----------------------------------------------------------- assignment scope
 
 
+# Evidence is read in Git's own formats, never the user's presentation settings: a
+# `diff.noprefix` patch applied one directory too shallow and turned a baseline's dirt
+# into the implementor's rename. `--no-ext-diff` and `--no-textconv` cover drivers.
+GIT_FIXED_CONFIG = (
+    "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.submodule=short", "-c", "core.quotePath=false", "-c", "color.ui=false",
+)
+# Repository selection and config a caller's environment can carry, as inside a git
+# hook. Evidence always names its own repository, index, and object store instead.
+GIT_CALLER_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS",
+)
+
+
+def git_env() -> dict[str, str]:
+    """The environment every Git command runs in: the caller's, minus its Git state.
+
+    `GIT_OPTIONAL_LOCKS=0` keeps `git status` from refreshing the user's index, which
+    would otherwise be a write into the checkout being measured.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in GIT_CALLER_ENV and not re.fullmatch(r"GIT_CONFIG_(KEY|VALUE)_\d+", k)}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def git_argv(*args: str) -> list[str]:
+    return ["git", *GIT_FIXED_CONFIG, *args]
+
+
 def git_text(cwd: Path | str, *args: str, timeout: int = 30) -> str | None:
-    """Trimmed stdout of a Git command, or None when Git cannot answer at all."""
+    """Trimmed stdout of a Git command, or None when Git cannot answer at all.
+
+    Paths that are not UTF-8 survive as surrogate escapes, so they round-trip to the
+    filesystem instead of crashing the command that met them.
+    """
     try:
         result = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            git_argv(*args), cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="surrogateescape", timeout=timeout, env=git_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -383,7 +482,8 @@ def git_text(cwd: Path | str, *args: str, timeout: int = 30) -> str | None:
 def git_raw(cwd: Path | str, *args: str, timeout: int = 300) -> bytes | None:
     """Raw stdout of a Git command. Patches are captured as bytes so binary survives."""
     try:
-        result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, timeout=timeout)
+        result = subprocess.run(git_argv(*args), cwd=str(cwd), capture_output=True,
+                                timeout=timeout, env=git_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result.stdout if result.returncode == 0 else None
@@ -399,6 +499,26 @@ def empty_tree(repo: Path) -> str:
     return git_text(repo, "hash-object", "-t", "tree", os.devnull) or EMPTY_TREE_SHA1
 
 
+def state_prefix(repo: Path | str) -> str:
+    """Docket's own state directory relative to one checkout, or '' when it is outside it.
+
+    `.docket` may sit below a checkout's top, in a package directory, so a filter for
+    `.docket/` at the top alone measured Docket's own files as a task's changes.
+    """
+    try:
+        relative = os.path.relpath((root() / STATE_DIR).resolve(), Path(repo).resolve())
+    except ValueError:
+        return ""
+    if relative == os.curdir or relative.startswith(os.pardir):
+        return ""
+    return relative.replace(os.sep, "/")
+
+
+def is_state_path(prefix: str, relative: str) -> bool:
+    """Whether a checkout-relative path is Docket's own state under that prefix."""
+    return bool(prefix) and (relative == prefix or relative.startswith(prefix + "/"))
+
+
 def porcelain_records(repo: Path) -> list[tuple[str, str]] | None:
     """(status, path) pairs from porcelain v1, or None when Git cannot answer.
 
@@ -412,6 +532,7 @@ def porcelain_records(repo: Path) -> list[tuple[str, str]] | None:
         return None
     records = text.split("\0")
     out: list[tuple[str, str]] = []
+    state = state_prefix(repo)
     i = 0
     while i < len(records):
         record = records[i]
@@ -419,13 +540,14 @@ def porcelain_records(repo: Path) -> list[tuple[str, str]] | None:
         if not record:
             continue
         status, path = record[:2], record[3:]
-        if path and not path.startswith(STATE_DIR + "/"):
+        # An untracked `.docket` is reported as one directory entry with a slash.
+        if path and not is_state_path(state, path.rstrip("/")):
             out.append((status, path))
         if "R" in status or "C" in status:
             if i < len(records) and records[i]:
                 old = records[i]
                 i += 1
-                if not old.startswith(STATE_DIR + "/"):
+                if not is_state_path(state, old):
                     out.append((status, old))
     return out
 
@@ -481,12 +603,13 @@ def index_entries(repo: Path) -> dict[str, str] | None:
     if text is None:
         return None
     out: dict[str, str] = {}
+    state = state_prefix(repo)
     for entry in text.split("\0"):
         if not entry or "\t" not in entry:
             continue
         meta, name = entry.split("\t", 1)
         fields = meta.split()
-        if len(fields) >= 2 and not name.startswith(STATE_DIR + "/"):
+        if len(fields) >= 2 and not is_state_path(state, name):
             out[name] = f"{fields[0]} {fields[1]}"
     return out
 
@@ -880,11 +1003,12 @@ def capture_root_baseline(d: Path, owner: str, record: dict[str, str]) -> dict[s
         return captured
     base_tree = identity["head"] or empty_tree(path)
     staged = git_raw(
-        path, "diff", "--cached", "--binary", "--no-color", "--no-ext-diff",
+        path, "diff", "--cached", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
         "--no-renames", base_tree,
     )
     unstaged = git_raw(
-        path, "diff", "--binary", "--no-color", "--no-ext-diff", "--no-renames",
+        path, "diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv",
+        "--no-renames",
     )
     if staged is None or unstaged is None:
         captured["reason"] = f"Git cannot render the baseline difference in {path}"
@@ -1115,9 +1239,10 @@ def root_changes(record: dict[str, object]) -> tuple[list[str], str]:
         committed = git_text(path, "diff", "--name-only", "--no-renames", "-z", pinned, now_head)
         if committed is None:
             return [], f"Git cannot compare the pinned baseline {pinned[:12]} in {path}"
+        state = state_prefix(path)
         changed |= {
             relative for relative in committed.split("\0")
-            if relative and not relative.startswith(STATE_DIR + "/")
+            if relative and not is_state_path(state, relative)
         }
     return sorted(changed), ""
 
@@ -1165,9 +1290,9 @@ def assignment_evidence(d: Path, owner: str) -> tuple[str, str, list[str], list[
         return COVERAGE_UNAVAILABLE, f"plan.mdx declares an unknown evidence_mode: {mode}", [], []
     snap = snapshot_path(d, owner)
     if not snap.is_file():
-        if owner != "orch" and task_depends_on(d, owner) and not read_dispatch(d, owner):
+        if owner != "orch" and not read_dispatch(d, owner):
             return (COVERAGE_UNAVAILABLE, f"{owner}'s baseline is captured when it is "
-                    "dispatched, after its dependencies are approved", [], [])
+                    "dispatched, so work finished before then is its starting point", [], [])
         return COVERAGE_UNAVAILABLE, f"no assignment snapshot at {snap.name}", [], []
     try:
         data = json.loads(snap.read_text())
@@ -1205,8 +1330,11 @@ def assignment_evidence(d: Path, owner: str) -> tuple[str, str, list[str], list[
     def allowed(value: str) -> bool:
         if unrestricted:
             return True
+        # A whole-root claim is `alias:`, which admits that root's paths and no other.
         return any(
-            value == item or item.endswith(":") or value.startswith(item + "/")
+            value == item
+            or (item.endswith(":") and value.startswith(item))
+            or value.startswith(item + "/")
             for item in scope
         )
 
@@ -1228,6 +1356,12 @@ def baseline_path(d: Path, owner: str) -> Path:
 def evidence_digest(report_body: str) -> str:
     """Identity of a submitted report body, recorded in the decision artifact."""
     return "sha256:" + hashlib.sha256(report_body.encode()).hexdigest()
+
+
+def verify_output_bytes(verification: dict, stream: str) -> bytes:
+    """A captured stream's exact bytes, or its text for a record from an older build."""
+    raw = verification.get(f"{stream}_bytes")
+    return raw if isinstance(raw, bytes) else str(verification.get(f"{stream}_text", "")).encode()
 
 
 def output_fingerprint(stdout: str, stderr: str) -> str:
@@ -1364,10 +1498,9 @@ def private_git_env(d: Path, record: dict[str, object], index: str) -> dict[str,
     objects = bundle_objects(d)
     (objects / "info").mkdir(parents=True, exist_ok=True)
     (objects / "pack").mkdir(parents=True, exist_ok=True)
+    keep_private(objects)
     bundle_work(d).mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    for name in ("GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CONFIG_PARAMETERS"):
-        env.pop(name, None)
+    env = git_env()
     env["GIT_DIR"] = str(record.get("git_dir", ""))
     env["GIT_INDEX_FILE"] = str(bundle_work(d) / index)
     env["GIT_OBJECT_DIRECTORY"] = str(objects)
@@ -1410,7 +1543,7 @@ def private_git(
     """Run one Git command against the private object store and index."""
     try:
         result = subprocess.run(
-            ["git", *args], cwd=str(cwd), env=env, input=stdin,
+            git_argv(*args), cwd=str(cwd), env=env, input=stdin,
             capture_output=True, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1432,11 +1565,11 @@ def prune_index(env: dict[str, str], cwd: Path, embedded: list[str]) -> str:
     code, out, err = private_git(env, cwd, "ls-files", "-z")
     if code:
         return first_line(err) or "Git cannot read the private index"
+    state = state_prefix(cwd)
     drop = [
         entry for entry in out.decode(errors="surrogateescape").split("\0")
         if entry and (
-            entry == STATE_DIR
-            or entry.startswith(STATE_DIR + "/")
+            is_state_path(state, entry)
             or any(entry == item or entry.startswith(item + "/") for item in embedded)
         )
     ]
@@ -1530,6 +1663,40 @@ def baseline_tree(d: Path, owner: str, record: dict[str, object]) -> tuple[str, 
     return out.decode().strip(), ""
 
 
+def carry_hidden_flags(env: dict[str, str], path: Path) -> str:
+    """Copy the checkout's skip-worktree and assume-unchanged bits into a private index.
+
+    Baseline capture reads Git's own view, which hides those paths' local edits, so the
+    source tree must hide them too. Rebuilt from HEAD without the bits, `git add -A`
+    froze a hidden local edit, a secret included, as the implementor's own change.
+    """
+    listing = git_raw(path, "ls-files", "-v", "-z")
+    if listing is None:
+        return f"Git cannot read the index flags of {path}"
+    flagged: dict[str, list[str]] = {"--skip-worktree": [], "--assume-unchanged": []}
+    for item in listing.decode("utf-8", "surrogateescape").split("\0"):
+        if len(item) < 3:
+            continue
+        tag, name = item[0], item[2:]
+        if tag == "S":
+            flagged["--skip-worktree"].append(name)
+        elif tag.islower():
+            flagged["--assume-unchanged"].append(name)
+    code, present, _ = private_git(env, path, "ls-files", "-z")
+    if code:
+        return f"Git cannot list the private index for {path}"
+    known = set(present.decode("utf-8", "surrogateescape").split("\0"))
+    for flag, names in flagged.items():
+        names = [name for name in names if name in known]
+        if not names:
+            continue
+        data = "\0".join(names).encode("utf-8", "surrogateescape") + b"\0"
+        code, _, err = private_git(env, path, "update-index", flag, "-z", "--stdin", stdin=data)
+        if code:
+            return f"Git cannot carry {flag} into the private index: {first_line(err)}"
+    return ""
+
+
 def source_tree(
     d: Path, owner: str, record: dict[str, object], slot: str
 ) -> tuple[dict[str, str], str]:
@@ -1551,6 +1718,9 @@ def source_tree(
     code, _, _ = private_git(env, path, "read-tree", head)
     if code:
         return {}, f"Git cannot read the current HEAD of {alias}"
+    problem = carry_hidden_flags(env, path)
+    if problem:
+        return {}, problem
     work = dict(env)
     work["GIT_WORK_TREE"] = str(path)
     # Docket's own state is pruned from the index either way. Excluding it up front
@@ -1558,9 +1728,10 @@ def source_tree(
     # every freeze - but only when it is not already ignored, because an exclude
     # pathspec naming an ignored path makes `git add` refuse the whole invocation.
     pathspecs: list[str] = []
-    if private_git(work, path, "check-ignore", "-q", STATE_DIR)[0] != 0:
+    state = state_prefix(path)
+    if state and private_git(work, path, "check-ignore", "-q", state)[0] != 0:
         pathspecs = [
-            "--", ":/", f":(exclude,top){STATE_DIR}", f":(exclude,top,glob){STATE_DIR}/**",
+            "--", ":/", f":(exclude,top){state}", f":(exclude,top,glob){state}/**",
         ]
     code, _, err = private_git(work, path, "add", "-A", *pathspecs)
     if code:
@@ -1580,6 +1751,47 @@ def source_tree(
     }, ""
 
 
+def retain_tree_objects(d: Path, record: dict[str, object], trees: tuple[str, ...]) -> str:
+    """Copy into the private store every object a pinned tree adds to the pinned HEAD.
+
+    Git does not write an object that already exists through an alternate, so content
+    the user had staged was pinned by a bundle while living only in the user's store,
+    and a later `git gc` after restaging deleted it. Objects the pinned commit reaches
+    are the user's history; everything a tree adds on top of it is kept here.
+    """
+    path = Path(str(record.get("path", "")))
+    env = private_git_env(d, record, "retain.index")
+    head = str(record.get("base_tree") or EMPTY_TREE_SHA1)
+    wanted: set[str] = set()
+    for tree in trees:
+        code, out, err = private_git(env, path, "diff-tree", "-r", "-t", "-z", "--no-renames",
+                                     head, tree)
+        if code:
+            return f"Git cannot list the objects of tree {tree[:12]}: {first_line(err)}"
+        wanted.add(tree)
+        for field in out.split(b"\0"):
+            if field.startswith(b":"):
+                sha = field.split()[3].decode()
+                if sha.strip("0"):
+                    wanted.add(sha)
+    solo = {k: v for k, v in env.items() if k != "GIT_ALTERNATE_OBJECT_DIRECTORIES"}
+    query = "".join(f"{sha}\n" for sha in sorted(wanted)).encode()
+    code, out, err = private_git(solo, path, "cat-file", "--batch-check", stdin=query)
+    if code:
+        return f"Git cannot check the private object store: {first_line(err)}"
+    missing = [line.split()[0] for line in out.decode().splitlines() if line.endswith(" missing")]
+    if not missing:
+        return ""
+    names = "".join(f"{sha}\n" for sha in missing).encode()
+    code, pack, err = private_git(env, path, "pack-objects", "--stdout", "-q", stdin=names)
+    if code:
+        return f"Git cannot pack the pinned objects: {first_line(err)}"
+    code, _, err = private_git(solo, path, "index-pack", "--stdin", stdin=pack)
+    if code:
+        return f"Git cannot keep the pinned objects in the private store: {first_line(err)}"
+    return ""
+
+
 def tree_patch(
     d: Path, record: dict[str, object], left: str, right: str
 ) -> tuple[bytes, list[str], str]:
@@ -1588,7 +1800,8 @@ def tree_patch(
     path = Path(str(record.get("path", "")))
     env = private_git_env(d, record, f"diff.{alias}.index")
     code, patch, err = private_git(
-        env, path, "diff", "--binary", "-M", "--no-color", "--no-ext-diff", left, right,
+        env, path, "diff", "--binary", "-M", "--no-color", "--no-ext-diff", "--no-textconv",
+        left, right,
     )
     if code:
         return b"", [], f"Git cannot render the patch for {alias}: {first_line(err)}"
@@ -1735,9 +1948,17 @@ def tree_problems(d: Path, record: dict[str, object], trees: list[str]) -> list[
                 ids.append(fields[2])
         if not ids:
             continue
-        _, listed, _ = private_git(
+        code, listed, err = private_git(
             env, root(), "cat-file", "--batch-check", stdin=("\n".join(ids) + "\n").encode(),
         )
+        # A check that did not run is not a pass: no output would otherwise read as
+        # nothing missing, and an unverifiable bundle as intact.
+        if code or len(listed.decode(errors="replace").splitlines()) != len(ids):
+            problems.append(
+                f"pins the tree {tree[:12]} for {alias}, whose objects Git could not check: "
+                f"{first_line(err) or 'incomplete answer'}"
+            )
+            continue
         missing = [
             line.split(" ")[0] for line in listed.decode(errors="replace").splitlines()
             if line.endswith(" missing")
@@ -1837,8 +2058,9 @@ def append_ledger(d: Path, owner: str, entry: dict[str, object]) -> None:
 
 
 def publish_bundle(
-    d: Path, owner: str, manifest: dict[str, object], artifacts: dict[str, bytes]
-) -> tuple[dict[str, object], Path]:
+    d: Path, owner: str, manifest: dict[str, object], artifacts: dict[str, bytes],
+    validate: object = None,
+) -> tuple[dict[str, object], Path, list[str]]:
     """Freeze one bundle at its content address, then record it in the ledger.
 
     The address is the manifest digest, so a later round, a later report edit, or a
@@ -1846,7 +2068,8 @@ def publish_bundle(
     reopened for writing, and re-freezing identical evidence is a no-op rather than
     a second copy. The whole directory is assembled beside its address and moved into
     place in one rename, so an interrupted freeze leaves no half-bundle behind and no
-    ledger entry pointing at one.
+    ledger entry pointing at one. The published unit is validated before the ledger
+    names it, so a freeze that fails its own integrity check is never a round.
     """
     digest = manifest_digest(manifest)
     manifest["digest"] = digest
@@ -1873,8 +2096,10 @@ def publish_bundle(
             shutil.rmtree(staging, ignore_errors=True)
         else:
             os.replace(staging, where)
-    append_ledger(d, owner, entry)
-    return entry, where
+    problems = list(validate(entry)) if callable(validate) else []
+    if not problems:
+        append_ledger(d, owner, entry)
+    return entry, where, problems
 
 
 # -------------------------------------------------------------- bundle freeze
@@ -1886,13 +2111,18 @@ def parse_framework_counts(text: str) -> dict[str, object]:
     Counts are recognized only with a supported parser; anything else reports
     unknown rather than a guessed number.
     """
-    match = re.search(r"(\d+)\s+passed(?:\s*,\s*(\d+)\s+failed)?"
-                      r"(?:\s*,\s*(\d+)\s+skipped)?", text)
-    if match:
-        return {"parser": "pytest",
-                "passed": int(match.group(1)),
-                "failed": int(match.group(2) or 0),
-                "skipped": int(match.group(3) or 0)}
+    # pytest ends with one summary such as `3 failed, 12 passed, 1 skipped in 0.5s`,
+    # whose counts come in any order; the last such line is the run's own verdict.
+    kinds = r"passed|failed|skipped|errors?|xfailed|xpassed|warnings?|deselected"
+    summaries = [line for line in text.splitlines()
+                 if re.search(rf"\d+ (?:{kinds})\b.*\bin [\d.]+s", line)]
+    if summaries:
+        counts: dict[str, object] = {"parser": "pytest", "passed": 0, "failed": 0, "skipped": 0}
+        for number, kind in re.findall(rf"(\d+) ({kinds})\b", summaries[-1]):
+            key = {"error": "errors", "warning": "warnings"}.get(kind, kind)
+            if key in ("passed", "failed", "skipped", "errors"):
+                counts[key] = int(number)
+        return counts
     oks = len(re.findall(r"(?m)^ok\b", text))
     not_oks = len(re.findall(r"(?m)^not ok\b", text))
     skips = len(re.findall(r"(?mi)^ok\b.*#\s*skip", text))
@@ -1991,19 +2221,10 @@ def run_verification(command: str, timeout: int, requested_model: str = "",
     }
     run_env, effective = verification_run_env(list(declared_env or []))
     record["effective_env"] = effective
-    try:
-        result = subprocess.run(
-            command, shell=True, cwd=root(), capture_output=True, text=True, timeout=timeout,
-            env=run_env,
-        )
-        stdout, stderr, code = result.stdout, result.stderr, result.returncode
-        record["status"] = "passed" if code == 0 else "failed"
-        record["returncode"] = code
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        record["status"] = "timeout"
-        record["returncode"] = None
+    code, out_bytes, err_bytes = execute_verify(command, timeout, run_env)
+    stdout, stderr = out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
+    record["status"] = "timeout" if code is None else ("passed" if code == 0 else "failed")
+    record["returncode"] = code
     ended = time.time()
     record["ended_at"] = stamp(ended)
     record["duration_seconds"] = round(ended - started, 3)
@@ -2012,7 +2233,54 @@ def run_verification(command: str, timeout: int, requested_model: str = "",
     record["output_tail"] = (stdout + stderr).strip().splitlines()[-15:]
     record["stdout_text"] = stdout
     record["stderr_text"] = stderr
+    # The frozen artifacts keep the exact bytes; the text fields above are for reading.
+    record["stdout_bytes"] = out_bytes
+    record["stderr_bytes"] = err_bytes
     return record
+
+
+VERIFY_OUTPUT_KEYS = ("stdout_text", "stderr_text", "stdout_bytes", "stderr_bytes")
+
+
+def end_process_group(pgid: int, grace: float = 2.0) -> None:
+    """Terminate every process a verify command started, then kill what remains."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.05)
+
+
+def execute_verify(command: str, timeout: int, env: dict[str, str]) -> tuple[int | None, bytes, bytes]:
+    """Run a verify command in its own process group: exit code (None on timeout) and output.
+
+    Output goes to temporary files rather than pipes, so a helper the command left in
+    the background cannot hold a pipe open and turn a finished pass into a timeout.
+    The whole group ends when the command does or when its timeout passes, so no test
+    process keeps running, or writing into the checkout, after the result is taken.
+    """
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(command, shell=True, cwd=root(), stdout=out_f, stderr=err_f,
+                                    env=env, start_new_session=True)
+        except OSError as exc:
+            return 127, b"", f"cannot start the verify command: {exc}\n".encode()
+        try:
+            code: int | None = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            code = None
+        end_process_group(proc.pid)
+        proc.wait()
+        out_f.seek(0)
+        err_f.seek(0)
+        return code, out_f.read(), err_f.read()
 
 
 def frozen_baseline_root(
@@ -2122,10 +2390,10 @@ def freeze_task_bundle(
     dependencies.update(store("dependencies.json", consumed))
 
     captured = {key: value for key, value in verification.items()
-                if key not in ("stdout_text", "stderr_text")}
+                if key not in VERIFY_OUTPUT_KEYS}
     if "stdout_text" in verification:
-        captured["stdout"] = store("verify.stdout", str(verification["stdout_text"]).encode())
-        captured["stderr"] = store("verify.stderr", str(verification["stderr_text"]).encode())
+        captured["stdout"] = store("verify.stdout", verify_output_bytes(verification, "stdout"))
+        captured["stderr"] = store("verify.stderr", verify_output_bytes(verification, "stderr"))
 
     mode = evidence_mode(d)
     records: list[dict[str, object]] = []
@@ -2152,6 +2420,9 @@ def freeze_task_bundle(
                 if problem:
                     break
                 data, paths, problem = tree_patch(d, record, left, identity["tree"])
+                if problem:
+                    break
+                problem = retain_tree_objects(d, record, (left, identity["tree"]))
                 if problem:
                     break
                 entry: dict[str, object] = {
@@ -2263,8 +2534,8 @@ def freeze_task_bundle(
         "digest": "",
         **artifact_policy_fields(d),
     }
-    entry, where = publish_bundle(d, owner, manifest, artifacts)
-    problems = bundle_problems(d, owner, entry)
+    entry, where, problems = publish_bundle(
+        d, owner, manifest, artifacts, validate=lambda e: bundle_problems(d, owner, e))
     if problems:
         return None, "; ".join(problems)
     return manifest, ""
@@ -2451,10 +2722,10 @@ def freeze_aggregate_bundle(
     }
 
     captured = {key: value for key, value in verification.items()
-                if key not in ("stdout_text", "stderr_text")}
+                if key not in VERIFY_OUTPUT_KEYS}
     if "stdout_text" in verification:
-        captured["stdout"] = store("verify.stdout", str(verification["stdout_text"]).encode())
-        captured["stderr"] = store("verify.stderr", str(verification["stderr_text"]).encode())
+        captured["stdout"] = store("verify.stdout", verify_output_bytes(verification, "stdout"))
+        captured["stderr"] = store("verify.stderr", verify_output_bytes(verification, "stderr"))
 
     mode = evidence_mode(d)
     records: list[dict[str, object]] = []
@@ -2481,6 +2752,9 @@ def freeze_aggregate_bundle(
                 if problem:
                     break
                 data, paths, problem = tree_patch(d, record, left, identity["tree"])
+                if problem:
+                    break
+                problem = retain_tree_objects(d, record, (left, identity["tree"]))
                 if problem:
                     break
                 entry: dict[str, object] = {
@@ -2523,7 +2797,7 @@ def freeze_aggregate_bundle(
         if before != after:
             return None, (
                 "the checkout changed while the verification ran, so the captured result does "
-                f"not describe the source being frozen: {moved_paths(d, 'orch', before, after)}. "
+                f"not describe the source being frozen: {moved_paths(d, 'run', before, after)}. "
                 "Nothing was frozen "
                 "and nothing was handed off: stop whatever writes those paths during the verify "
                 "command, then re-run `docket submit` on a settled workspace"
@@ -2549,8 +2823,8 @@ def freeze_aggregate_bundle(
         "digest": "",
         **artifact_policy_fields(d),
     }
-    entry, where = publish_bundle(d, "orch", manifest, artifacts)
-    problems = aggregate_bundle_problems(d, entry)
+    entry, where, problems = publish_bundle(
+        d, "orch", manifest, artifacts, validate=lambda e: aggregate_bundle_problems(d, e))
     if problems:
         return None, "; ".join(problems)
     return manifest, ""
@@ -2664,6 +2938,7 @@ def reopen_finish(d: Path, a: argparse.Namespace, journal: dict, reason: str) ->
     journal["completed"] = ["next-round"]
     publish_json(transition_path(d, a.owner), journal)
     fault("transition:next-round")
+    record_reopen(d, a.owner, journal)
     journal["state"] = "complete"
     fault("transition:complete")
     publish_json(transition_path(d, a.owner), journal)
@@ -3080,7 +3355,8 @@ depends_on: {depends_on}
 
 The implementor owns discovery. Before editing, create and submit the discovery
 capsule with `docket scope ...`; its accepted `files:` become the change boundary.
-`file_hints:` and `verify_hint:` are optional clues, not supervisor-approved scope.
+`file_hints:` is an optional clue, not supervisor-approved scope. `verify_hint:` is the
+assigned verification: the gate always runs it, alongside any command the capsule adds.
 
 ## Out of scope
 
@@ -3383,7 +3659,9 @@ def cmd_init(a: argparse.Namespace) -> None:
     policy = init_policy(a)
     (base / "docs").mkdir(parents=True)
     plan = base / "plan.mdx"
-    evidence = a.evidence_mode or ("git" if git_root() else DOCUMENTS_ONLY)
+    # Declared checkout roots are Git evidence by definition, even when `.docket` sits
+    # in a plain parent directory with no checkout of its own.
+    evidence = a.evidence_mode or ("git" if a.root or git_root() else DOCUMENTS_ONLY)
     text = template("plan").format(
         run=a.run, harness=a.harness, evidence_mode=evidence, **policy,
     )
@@ -3444,6 +3722,14 @@ def cmd_assign(a: argparse.Namespace) -> None:
             a.harness = "opencode"
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
+    # These become frontmatter lines, and a line break would write a key of its own.
+    for label, value in (("--verify", a.verify), ("--model", a.model), ("--effort", a.effort),
+                         *(("--file", item) for item in a.file),
+                         *(("--env", item) for item in a.env),
+                         *(("--depends-on", item) for item in a.depends_on)):
+        if "\n" in str(value or "") or "\r" in str(value or ""):
+            die(f"{label} cannot contain a line break, since it becomes one frontmatter "
+                f"line: {str(value)!r}. Nothing was assigned")
     criteria = [c.strip() for c in (a.criterion or []) if c.strip()]
     if a.owner == "orch" and ((a.title or "").strip() or (a.goal or "").strip() or criteria
                               or a.out_of_scope or a.decision):
@@ -3459,18 +3745,20 @@ def cmd_assign(a: argparse.Namespace) -> None:
             if cycle is not None:
                 die(f"refusing dependency cycle: {' -> '.join(cycle)} "
                     f"({a.owner} depends on {', '.join(assign_deps)}); nothing published")
-    # Baselines precede dispatch, and an incomplete one refuses it. The run baseline
-    # is taken before the first subordinate can edit anything, and each task records
-    # its own immutable baseline here. Discovery only reads, so a capsule submitted
-    # later refines scope, never the baseline underneath it.
+    # Baselines precede the work they measure, and an incomplete one refuses it.
+    # The run baseline is taken before the first subordinate can edit anything.
     require_baseline(d, "run", [], kind="run")
-    # A task gated on a dependency that is not approved yet takes its baseline
-    # at dispatch instead: the dependency's approved work then belongs to the
-    # starting point rather than showing up as this task's own out-of-scope
-    # change. It is still captured once, whole, and before its own dispatch.
+    # A delegated task takes its own baseline when it is dispatched, not here. A
+    # batch is assigned before any implementor starts, so a baseline taken now
+    # would predate the earlier tasks' work, and that work would then show up as
+    # this task's own out-of-scope change. Taken at dispatch, work finished before
+    # then is its starting point. It is still captured once, whole, and before the
+    # task's own work. An orchestrator-executed task is started by the session that
+    # assigns it and may never be dispatched, so it is captured here.
     deferred = [dep for dep in (assign_deps if a.owner != "orch" else [])
                 if state_of(d, dep)[1] not in ("approved", "completed")]
-    if a.owner != "orch" and not deferred:
+    delegated = a.owner != "orch" and a.executor == "implementor"
+    if a.owner != "orch" and not deferred and not delegated:
         require_baseline(d, a.owner, a.file)
     task = d / f"{a.owner}-task.mdx"
     policy_fields = artifact_policy_fields(d)
@@ -3516,6 +3804,9 @@ def cmd_assign(a: argparse.Namespace) -> None:
         if deferred:
             print(f"{a.owner} depends on {', '.join(deferred)}, not approved yet: its baseline "
                   "is captured when it is dispatched, so that work is not counted as its own")
+        elif delegated and evidence_mode(d) == "git":
+            print(f"{a.owner}'s baseline is captured when it is dispatched, so work finished "
+                  "before then is its starting point, not its own change")
         if (a.goal or "").strip() or criteria:
             problems = task_intent_problems(d, a.owner)
             print(f"{task.name}: " + ("task intent is ready to dispatch" if not problems
@@ -3586,7 +3877,43 @@ def seed_report_acceptance(d: Path, owner: str, rep: Path | None = None) -> bool
     return True
 
 
-def required_section_problems(body: str, required: list[str]) -> list[str]:
+def body_line_offset(text: str, body: str) -> int:
+    """Lines before the body in its file, so a diagnostic names the line an editor shows."""
+    text = text.removeprefix("\ufeff")
+    return text[: len(text) - len(body)].count("\n") if body and text.endswith(body) else 0
+
+
+def placeholder_problems(body: str, pattern: re.Pattern = PLACEHOLDER, offset: int = 0,
+                         quoted_sections: tuple[str, ...] = ()) -> list[str]:
+    """One problem per line still holding a placeholder, at its line in the file.
+
+    Code fences and inline code are quoted material, such as real tool output, and
+    are never policed for words. A section in `quoted_sections` copies supervisor
+    text verbatim, so only template markers count there.
+    """
+    problems: list[str] = []
+    fence = ""
+    current = ""
+    for n, line in enumerate(body.splitlines(), 1):
+        marker = CODE_FENCE.match(line)
+        if marker:
+            fence = "" if fence and marker.group(1) == fence else (fence or marker.group(1))
+            continue
+        if fence:
+            continue
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            current = heading.group(1)
+        prose = re.sub(r"`[^`\n]*`", "", line)
+        check = TEMPLATE_PLACEHOLDER if current in quoted_sections else pattern
+        if check.search(prose):
+            problems.append(f"unresolved placeholder at line {n + offset}: {line.strip()[:60]}"
+                            " (quote literal text in backticks)")
+    return problems
+
+
+def required_section_problems(body: str, required: list[str],
+                              pattern: re.Pattern = PLACEHOLDER, offset: int = 0) -> list[str]:
     secs = sections(body)
     problems: list[str] = []
     for name in required:
@@ -3594,9 +3921,9 @@ def required_section_problems(body: str, required: list[str]) -> list[str]:
             problems.append(f"missing section '## {name}'")
         elif is_empty(secs[name]):
             problems.append(f"section '## {name}' is empty")
-    for n, line in enumerate(body.splitlines(), 1):
-        if PLACEHOLDER.search(line):
-            problems.append(f"unresolved placeholder at line {n}: {line.strip()[:60]}")
+    for name in duplicate_sections(body, required):
+        problems.append(f"duplicate section '## {name}': keep one")
+    problems.extend(placeholder_problems(body, pattern, offset))
     return problems
 
 
@@ -3609,10 +3936,12 @@ def task_intent_problems(d: Path, owner: str) -> list[str]:
     """
     task = d / f"{owner}-task.mdx"
     try:
-        _, body = parse(task.read_text())
+        text = task.read_text()
+        _, body = parse(text)
     except (OSError, ValueError) as exc:
         return [f"{owner}-task.mdx is unreadable ({exc})"]
-    problems = required_section_problems(body, REQUIRED_TASK_SECTIONS)
+    problems = required_section_problems(body, REQUIRED_TASK_SECTIONS, TEMPLATE_PLACEHOLDER,
+                                         body_line_offset(text, body))
     secs = sections(body)
     criteria = checkbox_items(secs.get("Acceptance criteria", ""))
     if not criteria:
@@ -3635,11 +3964,13 @@ def cmd_validate_task(a: argparse.Namespace) -> None:
 
 
 def normalized_scope(meta: dict[str, str]) -> list[str]:
+    """Claimed paths from `files:`, separated by spaces or commas."""
     try:
         values = shlex.split(meta.get("files", ""))
     except ValueError:
         values = []
-    return sorted({value.strip("`/") for value in values if value.strip("`/")})
+    parts = [part for value in values for part in value.split(",")]
+    return sorted({part.strip("`/ ") for part in parts if part.strip("`/ ")})
 
 
 def paths_overlap(left: str, right: str) -> bool:
@@ -3690,6 +4021,30 @@ def scope_collisions(d: Path, owner: str, proposed: list[str]) -> list[str]:
     return sorted(set(collisions))
 
 
+def names_path(text: str, path: str) -> bool:
+    """Whether a report names this exact path, optionally followed by `:line`.
+
+    A substring test let `docs/src/a.py.orig`, `src/a.pyi`, or `tests/src/a.py` stand
+    in for `src/a.py`, so a report could omit a change it made and still pass.
+    """
+    return re.search(rf"(?<![\w./-]){re.escape(path)}(?![\w/.-])", text) is not None
+
+
+def gate_verify(assigned: str, discovered: str) -> str:
+    """The command the gate runs: the assigned one, plus the capsule's own if it differs.
+
+    The supervisor's `--verify` is the acceptance oracle and the implementor's is
+    discovery, so a capsule may add checks but never replace the assigned ones. Each
+    side runs in its own subshell so a `||` in either cannot mask the other's failure.
+    """
+    assigned, discovered = assigned.strip(), discovered.strip()
+    if not assigned or discovered == assigned or discovered.startswith(f"({assigned}) && "):
+        return discovered or assigned
+    if not discovered:
+        return assigned
+    return f"({assigned}) && ({discovered})"
+
+
 def cmd_scope(a: argparse.Namespace) -> None:
     """Validate an implementor-authored discovery capsule and claim its change scope."""
     d = need_run(a.run)
@@ -3732,17 +4087,24 @@ def cmd_scope(a: argparse.Namespace) -> None:
             print("The orchestrator must sequence the tasks or resolve ownership.", file=sys.stderr)
             raise SystemExit(1)
 
+        if not snapshot_path(d, a.owner).is_file():
+            # Implementation starts once the scope is accepted, so a task that was
+            # never dispatched is baselined now, before its capsule is published.
+            require_baseline(d, a.owner, proposed)
         meta["status"] = "ready"
         meta.pop("collisions", None)
         publish(capsule, render(meta, body))
         task_meta, task_body = parse(task.read_text())
         task_meta["scope_status"] = "ready"
         task_meta["files"] = " ".join(proposed)
-        task_meta["verify"] = meta["verify"].strip()
+        gate_command = gate_verify(str(task_meta.get("verify_hint", "")), meta["verify"])
+        task_meta["verify"] = gate_command
         publish(task, render(task_meta, task_body))
         update_snapshot_scope(d, a.owner, proposed)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     print(f"{capsule.name}: scope accepted; implementation may continue")
+    if gate_command != meta["verify"].strip():
+        print(f"the gate runs the assigned verify command as well: {gate_command}")
     if evidence_mode(d) == "git":
         state, roots, reason = read_roots(d)
         if state != ROOTS_DECLARED:
@@ -4007,8 +4369,13 @@ def evidence_problems(d: Path, owner: str, body: str, blocked: bool,
             if verify_skipped and "verify.stdout" in row["artifacts"]:
                 problems.append(f"evidence {row['id']}: names verify.stdout but the "
                                 "verification was skipped")
-        elif gapless:
-            problems.append(f"evidence {row['id']} is {row['state']} but names no gap")
+        else:
+            if gapless:
+                problems.append(f"evidence {row['id']} is {row['state']} but names no gap")
+            # Its box is checked, since a normal submission checks every box; the row
+            # says otherwise, and the report cannot claim both.
+            problems.append(f"evidence {row['id']} is {row['state']}, but a normal submission "
+                            "needs every criterion met: finish it, or submit with --blocked")
     return problems
 
 
@@ -4039,10 +4406,18 @@ def gate_problems(
             problems.append(f"frontmatter {key!r} must be {expected!r}, got {meta.get(key)!r}")
     if meta.get("harness") not in SUPPORTED_HARNESSES:
         problems.append(f"frontmatter 'harness' must be one of: {', '.join(SUPPORTED_HARNESSES)}")
-    if meta.get("requested_model") and not meta.get("actual_model"):
-        problems.append("record actual_model before submission (it may equal requested_model)")
-    if meta.get("requested_effort") and not meta.get("actual_effort"):
-        problems.append("record actual_effort before submission (it may equal requested_effort)")
+    # A block is the honest stop, so it never waits on model bookkeeping; an unrecorded
+    # model reads as the requested one in the outcome log.
+    if not blocked and meta.get("requested_model") and not meta.get("actual_model"):
+        problems.append(
+            "record actual_model before submission (it may equal requested_model): "
+            f"`docket set-model {run} {owner} --actual MODEL`"
+        )
+    if not blocked and meta.get("requested_effort") and not meta.get("actual_effort"):
+        problems.append(
+            "record actual_effort before submission (it may equal requested_effort): "
+            f"`docket set-model {run} {owner} --actual MODEL --effort EFFORT`"
+        )
 
     required = REQUIRED_ORCH_REPORT_SECTIONS if owner == "orch" else REQUIRED_TASK_REPORT_SECTIONS
     for name in required:
@@ -4050,11 +4425,14 @@ def gate_problems(
             problems.append(f"missing section '## {name}'")
         elif is_empty(secs[name]):
             problems.append(f"section '## {name}' is empty")
+    for name in duplicate_sections(body, required):
+        problems.append(f"duplicate section '## {name}': keep one")
 
-    if PLACEHOLDER.search(body):
-        for n, line in enumerate(body.splitlines(), 1):
-            if PLACEHOLDER.search(line):
-                problems.append(f"unresolved placeholder at line {n}: {line.strip()[:60]}")
+    try:
+        offset = body_line_offset(rep.read_text(), body)
+    except OSError:
+        offset = 0
+    problems.extend(placeholder_problems(body, PLACEHOLDER, offset, quoted_sections=("Acceptance",)))
 
     acc = secs.get("Acceptance", "")
     unchecked = [l.strip() for l in acc.splitlines() if re.match(r"^\s*-\s*\[\s*\]", l)]
@@ -4079,10 +4457,10 @@ def gate_problems(
         if coverage == COVERAGE_AVAILABLE:
             if outside:
                 problems.append(
-                    "paths changed since assignment outside the task scope: " + ", ".join(outside)
+                    "paths changed since the task baseline outside the task scope: " + ", ".join(outside)
                 )
             reported_files = secs.get("Files changed", "")
-            omitted = [path for path in changed if path not in reported_files]
+            omitted = [path for path in changed if not names_path(reported_files, path)]
             if omitted:
                 problems.append("task-local changes omitted from 'Files changed': " + ", ".join(omitted))
         elif coverage == COVERAGE_UNAVAILABLE and not blocked:
@@ -4103,12 +4481,14 @@ def gate_problems(
         if missing:
             problems.append("orchestrator task outcomes omit planned tasks: " + ", ".join(missing))
         waived = [o for o in planned if state_of(d, o)[1] == "waived"]
-        exceptions = secs.get("Exceptions and waivers", "").strip().lower()
-        if waived and exceptions in ("none", "none."):
+        exceptions = stated(secs.get("Exceptions and waivers", "")).lower()
+        if waived and exceptions in ("", "none", "none."):
             problems.append("orchestrator report must explain every waived task")
     if blocked:
         needed = secs.get("Decisions needed", "")
-        if is_empty(needed) or needed.strip().lower() in ("none", "none."):
+        # The template's own comment sits above whatever the worker wrote, so compare
+        # the authored text alone: "none" under that comment is still none.
+        if stated(needed).lower() in ("", "none", "none."):
             problems.append(
                 "status is blocked but 'Decisions needed' says none - state what the reviewer must decide"
             )
@@ -4210,8 +4590,15 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
         verification["skip_reason"] = a.skip_verify_reason.strip()
     if verify and not blocked and not a.skip_verify and not problems:
         # The resulting source revision is pinned on both sides of the run, so a green
-        # result can never be frozen against a checkout it did not describe.
-        verified_source = source_identity(d, a.owner, "verify")[0] or None
+        # result can never be frozen against a checkout it did not describe. The
+        # aggregate is measured against the run baseline, not a snapshot of its own.
+        pinned, unpinned = source_identity(d, "run" if a.owner == "orch" else a.owner, "verify")
+        verified_source = pinned or None
+        if unpinned and evidence_mode(d) == "git":
+            # Without a pre-verify pin the drift check has nothing to compare, so a
+            # result would be frozen against a source nobody tied it to.
+            problems.append(f"the source could not be pinned before verification: {unpinned}")
+    if verify and not blocked and not a.skip_verify and not problems:
         print(f"running verify: {verify}")
         task_requested = parse(task.read_text())[0].get("requested_model", "") if task.is_file() else ""
         verification = run_verification(verify, verify_timeout,
@@ -4817,6 +5204,104 @@ def reopen_decide(a: argparse.Namespace, d: Path) -> None:
     reopen_waived(d, a, rnd, reason)
 
 
+def abandon_unpublished_transition(
+    a: argparse.Namespace, d: Path, journal: dict, verdict: str, reasons: list[str]
+) -> None:
+    """Retire an interrupted transition that published nothing and can no longer finish.
+
+    Such a transition exists only in its journal. When the evidence it bound has moved,
+    finishing it would record a verdict on evidence nobody reviewed, and refusing it
+    forever would strand the round, since a different verdict is refused while it is
+    unfinished. It is abandoned instead: the journal keeps the reviewer's text with the
+    reason, a copy survives the next transition, and the reviewer decides again.
+    """
+    txn = str(journal.get("transition", "?"))
+    journal = {**journal, "state": "abandoned", "abandoned_at": stamp(),
+               "abandoned_because": list(reasons)}
+    publish_json(transition_path(d, a.owner), journal)
+    keep = d / ".transitions" / "abandoned" / f"{a.owner}-{txn.split(':')[-1]}.json"
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    publish_json(keep, journal)
+    print(
+        f"docket: the interrupted {verdict} transition {txn} was abandoned: it published "
+        "nothing, and the evidence it bound no longer supports it:\n      "
+        + "\n      ".join(f"- {item}" for item in reasons)
+        + f"\n    Its text is kept in {keep.relative_to(d)}. Decide {a.owner} again against the "
+        "current evidence.",
+        file=sys.stderr,
+    )
+
+
+def guard_accepting_verdict(
+    a: argparse.Namespace, d: Path, rnd: int, verdict: str, frozen: dict[str, object] | None
+) -> None:
+    """Refuse an approval or waiver whose frozen evidence no longer supports it.
+
+    An accepting verdict settles the work. For a task owner, a consumed input that
+    moved after the consumer submitted takes its review readiness with it. For the
+    orchestrator, pinned constituent evidence that moved does the same.
+    """
+    if a.owner == "orch":
+        if verdict == "approved" and frozen_verification_status(frozen) == "skipped":
+            die(skipped_approval_problem(a.owner, rnd, a.run))
+        stale_constituents = stale_aggregate(d)
+        stale_constituents.extend(amendment_blocks(d, "orch"))
+        if stale_constituents:
+            die(
+                f"orch cannot be {verdict} against aggregate evidence that moved:\n      "
+                + "\n      ".join(f"- {item}" for item in stale_constituents)
+                + f"\n    Open a fresh round with `docket decide {a.run} orch --changes` and "
+                "resubmit so the aggregate is verified against current constituent evidence."
+            )
+    else:
+        if verdict == "approved" and frozen_verification_status(frozen) == "skipped":
+            die(skipped_approval_problem(a.owner, rnd, a.run))
+        stale_inputs = [
+            *dependency_problems(d, a.owner),
+            *refreshed_inputs(d, a.owner, frozen or {}),
+            *amendment_blocks(d, a.owner),
+        ]
+        live_contract = ""
+        task_file = d / f"{a.owner}-task.mdx"
+        if task_file.is_file():
+            live_contract = digest_of(task_file.read_bytes())
+        frozen_contract = str(((frozen or {}).get("contract", {}) or {}).get("revision", ""))
+        if live_contract and frozen_contract and live_contract != frozen_contract:
+            stale_inputs.append(
+                f"the task contract changed after round {rnd} was frozen: "
+                "the captured verification described different acceptance"
+            )
+        if is_five_role(d) and verdict == "approved":
+            exempt = [item.strip() for item in
+                      plan_flag(d, "verifier_exempt", "").split(",") if item.strip()]
+            if a.owner not in exempt:
+                vpath, vmeta, _ = latest_verification(d, a.owner, rnd)
+                frozen_digest = str((frozen or {}).get("digest", ""))
+                if vpath is None or vmeta.get("result") != "pass":
+                    die(f"{a.owner} round {rnd} has no passing verification: a verifier pass "
+                        "means ready for review, never approved. Record one with "
+                        f"`docket verify {a.run} {a.owner} --result pass --as verifier` first")
+                if str(vmeta.get("bundle_digest", "")) != frozen_digest:
+                    die(f"{vpath.name} binds bundle {vmeta.get('bundle_digest')} but round {rnd} "
+                        f"froze {frozen_digest}: re-verify the current evidence")
+                if str(vmeta.get("contract_revision", "")) != live_contract:
+                    die(f"{vpath.name} verified contract {vmeta.get('contract_revision')} but the "
+                        "task now reads differently: re-verify after the amendment")
+        if stale_inputs:
+            die(
+                f"{a.owner} cannot be {verdict} against consumed evidence that moved:\n      "
+                + "\n      ".join(f"- {item}" for item in stale_inputs)
+                + f"\n    Open a fresh round with `docket decide {a.run} {a.owner} --changes`, "
+                f"re-record the input with `docket depend {a.run} {a.owner} --on <task>`, and "
+                f"resubmit so {a.owner} is verified against the evidence it now consumes."
+            )
+        for entry in provisional_dependencies(d, a.owner):
+            print(
+                f"note: {a.owner} consumed {entry.get('on')} provisionally at "
+                f"{entry.get('bundle')}; that is readiness, not an approval of {entry.get('on')}"
+            )
+
+
 def decide_locked(a: argparse.Namespace, d: Path) -> None:
     """The decision transition itself, always under the owner lock."""
     verdict = "waived" if a.waive else ("approved" if a.approve else "changes-requested")
@@ -4864,6 +5349,8 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
             a, d, settled_round, verdict, rep, report_meta, report_body,
             dec, decision_meta, decision_body,
         )
+        if verdict in ("approved", "waived") and is_five_role(d):
+            clear_corrections(d, a.owner)
         if not finished:
             print(f"{a.owner} round {settled_round} is already {recorded} -> {dec.name}")
             print("Nothing was rewritten: the recorded decision, the report body, and the")
@@ -4928,15 +5415,41 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
     frozen: dict[str, object] | None = None
     stale_bundle = ""
     binding = not resuming and not recovered
-    if binding and a.owner == "orch":
-        frozen, stale_bundle = require_aggregate(d, rnd, rep, digest)
+    # A recovered transition has published nothing, so the evidence it bound is
+    # checked exactly as a fresh verdict's is; only its payload is not rebuilt.
+    if not resuming:
+        if a.owner == "orch":
+            frozen, stale_bundle = require_aggregate(d, rnd, rep, digest)
+        else:
+            frozen, stale_bundle = require_bundle(d, a.owner, rnd, rep, digest)
+    if binding and frozen is not None:
         decision_meta["bundle_digest"] = str(frozen.get("digest", ""))
         decision_meta["bundle_round"] = str(frozen.get("round", rnd))
-        decision_meta["bundle_kind"] = "aggregate"
-    elif binding:
-        frozen, stale_bundle = require_bundle(d, a.owner, rnd, rep, digest)
-        decision_meta["bundle_digest"] = str(frozen.get("digest", ""))
-        decision_meta["bundle_round"] = str(frozen.get("round", rnd))
+        if a.owner == "orch":
+            decision_meta["bundle_kind"] = "aggregate"
+    if recovered:
+        moved = []
+        journalled = decision_meta.get("evidence_digest", "").strip()
+        if stale_bundle or (journalled and journalled != digest):
+            moved.append(f"{rep.name} changed after the transition was journalled: it reviewed "
+                         f"{journalled or 'the frozen body'} and the body is now {digest}")
+        bound = decision_meta.get("bundle_digest", "").strip()
+        if frozen is not None and bound and bound != str(frozen.get("digest", "")):
+            moved.append(f"round {rnd} now freezes {frozen.get('digest')}, not the bundle "
+                         f"{bound} the transition bound")
+        if moved:
+            abandon_unpublished_transition(a, d, pending, verdict, moved)
+            raise SystemExit(1)
+    if resuming:
+        recorded_body = decision_meta.get("evidence_digest", "").strip()
+        if recorded_body and recorded_body != digest:
+            die(
+                f"{rep.name} changed after {dec.name} recorded the {verdict} verdict: it reviewed "
+                f"{recorded_body} and the body is now {digest}. A recorded verdict cannot be "
+                "applied to evidence it did not review, so restore the reviewed body (its frozen "
+                f"copy is listed by `docket bundle {a.run} {a.owner}`) and repeat the verdict to "
+                "finish it. Anything new belongs in the next round"
+            )
 
     if a.changes and fresh:
         decision_meta["applied"] = "no"
@@ -4991,69 +5504,14 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
     elif a.re_review:
         print(f"{rep.name} still matches the reviewed evidence; nothing needed re-review")
 
-    # An accepting verdict settles the work. For a task owner, a consumed input that
-    # moved after the consumer submitted takes its review readiness with it. For the
-    # orchestrator, pinned constituent evidence that moved does the same.
-    if binding and verdict in ("approved", "waived"):
-        if a.owner == "orch":
-            if verdict == "approved" and frozen_verification_status(frozen) == "skipped":
-                die(skipped_approval_problem(a.owner, rnd, a.run))
-            stale_constituents = stale_aggregate(d) if not (resuming or recovered) else []
-            stale_constituents.extend(amendment_blocks(d, "orch"))
-            if stale_constituents:
-                die(
-                    f"orch cannot be {verdict} against aggregate evidence that moved:\n      "
-                    + "\n      ".join(f"- {item}" for item in stale_constituents)
-                    + f"\n    Open a fresh round with `docket decide {a.run} orch --changes` and "
-                    "resubmit so the aggregate is verified against current constituent evidence."
-                )
-        else:
-            if verdict == "approved" and frozen_verification_status(frozen) == "skipped":
-                die(skipped_approval_problem(a.owner, rnd, a.run))
-            stale_inputs = [
-                *dependency_problems(d, a.owner),
-                *refreshed_inputs(d, a.owner, frozen or {}),
-                *amendment_blocks(d, a.owner),
-            ]
-            live_contract = ""
-            task_file = d / f"{a.owner}-task.mdx"
-            if task_file.is_file():
-                live_contract = digest_of(task_file.read_bytes())
-            frozen_contract = str(((frozen or {}).get("contract", {}) or {}).get("revision", ""))
-            if live_contract and frozen_contract and live_contract != frozen_contract:
-                stale_inputs.append(
-                    f"the task contract changed after round {rnd} was frozen: "
-                    "the captured verification described different acceptance"
-                )
-            if is_five_role(d) and verdict == "approved":
-                exempt = [item.strip() for item in
-                          plan_flag(d, "verifier_exempt", "").split(",") if item.strip()]
-                if a.owner not in exempt:
-                    vpath, vmeta, _ = latest_verification(d, a.owner, rnd)
-                    frozen_digest = str((frozen or {}).get("digest", ""))
-                    if vpath is None or vmeta.get("result") != "pass":
-                        die(f"{a.owner} round {rnd} has no passing verification: a verifier pass "
-                            "means ready for review, never approved. Record one with "
-                            f"`docket verify {a.run} {a.owner} --result pass --as verifier` first")
-                    if str(vmeta.get("bundle_digest", "")) != frozen_digest:
-                        die(f"{vpath.name} binds bundle {vmeta.get('bundle_digest')} but round {rnd} "
-                            f"froze {frozen_digest}: re-verify the current evidence")
-                    if str(vmeta.get("contract_revision", "")) != live_contract:
-                        die(f"{vpath.name} verified contract {vmeta.get('contract_revision')} but the "
-                            "task now reads differently: re-verify after the amendment")
-            if stale_inputs:
-                die(
-                    f"{a.owner} cannot be {verdict} against consumed evidence that moved:\n      "
-                    + "\n      ".join(f"- {item}" for item in stale_inputs)
-                    + f"\n    Open a fresh round with `docket decide {a.run} {a.owner} --changes`, "
-                    f"re-record the input with `docket depend {a.run} {a.owner} --on <task>`, and "
-                    f"resubmit so {a.owner} is verified against the evidence it now consumes."
-                )
-            for entry in provisional_dependencies(d, a.owner):
-                print(
-                    f"note: {a.owner} consumed {entry.get('on')} provisionally at "
-                    f"{entry.get('bundle')}; that is readiness, not an approval of {entry.get('on')}"
-                )
+    if not resuming and verdict in ("approved", "waived"):
+        try:
+            guard_accepting_verdict(a, d, rnd, verdict, frozen)
+        except SystemExit:
+            if recovered:
+                abandon_unpublished_transition(a, d, pending, verdict, [
+                    "the accepting-verdict check above refused it against the current evidence"])
+            raise
 
     if not resuming and not recovered:
         if a.changes:
@@ -5278,9 +5736,9 @@ def cmd_diff(a: argparse.Namespace) -> None:
         )
         raise SystemExit(1)
     if not changed:
-        print(f"{a.owner}: no worktree changes since assignment ({detail})")
+        print(f"{a.owner}: no worktree changes since its baseline ({detail})")
         return
-    print(f"{a.owner}: changes since assignment ({detail})")
+    print(f"{a.owner}: changes since its baseline ({detail})")
     outside_set = set(outside)
     for path in changed:
         marker = "OUTSIDE SCOPE" if path in outside_set else "in scope"
@@ -5530,28 +5988,18 @@ def cmd_preflight(a: argparse.Namespace) -> None:
     timeout = a.verify_timeout or task_timeout
     print(f"running baseline verify: {verify}")
     run_env, _ = verification_run_env(task_env(d, a.owner))
-    try:
-        result = subprocess.run(
-            verify, shell=True, cwd=root(), capture_output=True, text=True, timeout=timeout,
-            env=run_env,
-        )
-        data = {
-            "command": verify,
-            "returncode": result.returncode,
-            "fingerprint": output_fingerprint(result.stdout, result.stderr),
-            "output_tail": (result.stdout + result.stderr).strip().splitlines()[-30:],
-        }
-        outcome = "passing" if result.returncode == 0 else f"failing (exit {result.returncode})"
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        data = {
-            "command": verify,
-            "returncode": "timeout",
-            "fingerprint": output_fingerprint(stdout, stderr),
-            "output_tail": (stdout + stderr).strip().splitlines()[-30:],
-        }
+    code, out_bytes, err_bytes = execute_verify(verify, timeout, run_env)
+    stdout, stderr = out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
+    data = {
+        "command": verify,
+        "returncode": "timeout" if code is None else code,
+        "fingerprint": output_fingerprint(stdout, stderr),
+        "output_tail": (stdout + stderr).strip().splitlines()[-30:],
+    }
+    if code is None:
         outcome = f"timed out after {timeout}s"
+    else:
+        outcome = "passing" if code == 0 else f"failing (exit {code})"
     target = baseline_path(d, a.owner)
     publish_json(target, data)
     print(f"baseline recorded: {outcome} -> {target.relative_to(root())}")
@@ -5665,6 +6113,39 @@ def artifact_policy_fields(d: Path) -> dict[str, str]:
             "review_policy": str(policy["review_policy"])}
 
 
+def reopens_path(d: Path, owner: str) -> Path:
+    return d / ".reopens" / f"{owner}.json"
+
+
+def read_reopens(d: Path, owner: str) -> list[dict] | None:
+    """Every completed reopen of an owner, oldest first, or None for a run from before."""
+    path = reopens_path(d, owner)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return [item for item in data.get("reopens", []) if isinstance(item, dict)] \
+        if isinstance(data, dict) else None
+
+
+def record_reopen(d: Path, owner: str, journal: dict) -> None:
+    """Append one reopen to the owner's durable ledger, once per transition.
+
+    The transition journal is one file per owner that the next decision replaces, so
+    a generation read from it fell back to 1 after the reopened round's first verdict,
+    and an incident from before the reopen came back as live.
+    """
+    entries = read_reopens(d, owner) or []
+    txn = str(journal.get("transition", ""))
+    if any(str(item.get("transition", "")) == txn for item in entries):
+        return
+    entries.append({"transition": txn, "round": int(journal.get("round", 0) or 0),
+                    "at": stamp()})
+    publish_json(reopens_path(d, owner), {"owner": owner, "reopens": entries})
+
+
 def reopen_epoch(d: Path, owner: str, rnd: int) -> int:
     """The reopen generation an event for this owner and round belongs to.
 
@@ -5675,6 +6156,11 @@ def reopen_epoch(d: Path, owner: str, rnd: int) -> int:
     """
     if not owner:
         return 1
+    reopens = read_reopens(d, owner)
+    if reopens is not None:
+        # One generation per completed reopen of this round or an earlier one.
+        return 1 + sum(1 for item in reopens if int(item.get("round", 0) or 0) <= rnd)
+    # A run from before the ledger still reads its one reopen from the journal.
     journal = read_transition(d, owner)
     if journal.get("verdict") == "reopen-waived" and journal.get("state") == "complete":
         try:
@@ -5818,6 +6304,20 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
             emit(f"{o}:{rnd}:submitted",
                  f"{o} round {rnd} submitted; challenge whether the evidence proves acceptance",
                  o, rnd, rev)
+        # A granted chain whose refused correction was the verifier's own is the
+        # verifier's to finish: no draft decision exists for the reviewer to apply.
+        for entry in open_escalations(d, ("granted",)):
+            owner = str(entry.get("owner", ""))
+            grnd, gst = state_of(d, owner)
+            refused = refused_verifier_correction(d, owner, grnd) if gst == "submitted" else None
+            if refused is None:
+                continue
+            iid = str(entry.get("id", owner))
+            emit(f"{owner}:{grnd}:budget-granted:{iid}",
+                 f"{owner} was granted {entry.get('granted', 1)} more correction round(s): finish "
+                 f"the refused correction with `docket verify {d.name} {owner} --result fail "
+                 f"--open-correction --as {verifier_role_of(d)}`",
+                 owner, grnd, f"sha256:{hashlib.sha256((iid + refused.name).encode()).hexdigest()}")
         return out
 
     if role == "reviewer":
@@ -6150,10 +6650,10 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
         if derive_stage(d, o) != "initial":
             # Corrections and handoffs already carry their own wakes.
             continue
-        met = ", ".join(sorted(gates))
+        met = ", ".join(f"{dep} {state_of(d, dep)[1]}" for dep in sorted(gates))
         signature = ";".join(f"{dep}:{state_of(d, dep)[1]}" for dep in sorted(gates))
         emit(f"{o}:{rnd}:dispatch-ready",
-             f"{o} is ready to dispatch: its dependencies ({met}) are approved",
+             f"{o} is ready to dispatch: its dependencies are settled ({met})",
              o, rnd, f"sha256:{hashlib.sha256(signature.encode()).hexdigest()}")
 
     # A legacy orchestrator decides its delegated task rounds itself, so an
@@ -6384,18 +6884,37 @@ def cmd_events(a: argparse.Namespace) -> None:
     print("Nothing was claimed: no ledger was created, migrated, or appended.")
 
 
+@contextlib.contextmanager
+def watch_conf_lock():
+    """Serialize every read-modify-write of watch.conf.
+
+    Supervisors arm as they start, often at the same moment, and an unlocked rewrite
+    let one arm republish the list without another's pair: that role was then never
+    woken, silently.
+    """
+    path = root() / STATE_DIR / "watch.conf.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def cmd_arm(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     require_preset_role(d, a.role)
     conf = root() / STATE_DIR / "watch.conf"
-    conf.parent.mkdir(parents=True, exist_ok=True)
-    pairs = armed()
-    if (a.run, a.role) in pairs:
-        print(f"already armed: {a.run} {a.role}")
-    else:
-        pairs.append((a.run, a.role))
-        publish(conf, "".join(f"{r} {ro}\n" for r, ro in pairs))
-        print(f"armed: {a.run} {a.role}")
+    with watch_conf_lock():
+        pairs = armed()
+        if (a.run, a.role) in pairs:
+            print(f"already armed: {a.run} {a.role}")
+        else:
+            pairs.append((a.run, a.role))
+            perturb("arm:before-publish")
+            publish(conf, "".join(f"{r} {ro}\n" for r, ro in pairs))
+            print(f"armed: {a.run} {a.role}")
     print("\narmed now:")
     for r, ro in armed():
         print(f"  {r} {ro}")
@@ -6403,15 +6922,16 @@ def cmd_arm(a: argparse.Namespace) -> None:
 
 def cmd_disarm(a: argparse.Namespace) -> None:
     conf = root() / STATE_DIR / "watch.conf"
-    keep = [
-        (r, ro) for r, ro in armed()
-        if not ((a.run in (None, r)) and (a.role in (None, ro)))
-    ]
-    if not keep:
-        conf.unlink(missing_ok=True)
-        print("disarmed everything")
-        return
-    publish(conf, "".join(f"{r} {ro}\n" for r, ro in keep))
+    with watch_conf_lock():
+        keep = [
+            (r, ro) for r, ro in armed()
+            if not ((a.run in (None, r)) and (a.role in (None, ro)))
+        ]
+        if not keep:
+            conf.unlink(missing_ok=True)
+            print("disarmed everything")
+            return
+        publish(conf, "".join(f"{r} {ro}\n" for r, ro in keep))
     print("armed now:")
     for r, ro in keep:
         print(f"  {r} {ro}")
@@ -6449,11 +6969,21 @@ def stated(text: str) -> str:
     return re.sub(r"<!--.*?-->", "", text or "", flags=re.S).strip()
 
 
+# A wake is exit 2 for a person or agent running `docket watch`. Inside the wake
+# hook it is 3, which no launcher or argument error produces, and `wake.sh` turns
+# only 3 into the harness's 2.
+WAKE_EXIT = 2
+HOOK_WAKE_EXIT = 3
+
+
 def cmd_watch(a: argparse.Namespace) -> None:
     """Block with no token cost until something needs a watched role, then exit 2.
 
     Armed from a Claude Code Stop hook with asyncRewake: true. Must run in the
-    foreground of the hook's process tree - never with shell '&'.
+    foreground of the hook's process tree - never with shell '&'. Under
+    `DOCKET_WATCH_HOOK=1` a wake exits `HOOK_WAKE_EXIT` instead, because uv and
+    argparse exit 2 on their own errors; `hooks/wake.sh` maps only that code to
+    the harness's 2, so a broken launcher can never read as a wake.
 
     Each role gets its own ledger, so an orchestrator and a planner watching the
     same run never consume each other's events.
@@ -6577,7 +7107,8 @@ def cmd_watch(a: argparse.Namespace) -> None:
             sys.stderr.flush()
             for run, role, _led, k, _m in fresh:
                 mark_announce_delivered(run_dir(run), role, k)
-            raise SystemExit(2)
+            raise SystemExit(HOOK_WAKE_EXIT if os.environ.get("DOCKET_WATCH_HOOK") == "1"
+                             else WAKE_EXIT)
         if time.monotonic() >= deadline:
             raise SystemExit(0)
         time.sleep(min(a.interval, max(1, deadline - time.monotonic())))
@@ -7504,7 +8035,7 @@ def cmd_health(a: argparse.Namespace) -> None:
 def _git_bytes(*args: str) -> tuple[int, bytes]:
     """One read-only git command against the invocation root, raw bytes out."""
     try:
-        result = subprocess.run(["git", *args], capture_output=True,
+        result = subprocess.run(git_argv(*args), capture_output=True, env=git_env(),
                                 timeout=30, cwd=str(root()))
     except (OSError, subprocess.TimeoutExpired):
         return 128, b""
@@ -7571,7 +8102,7 @@ def worktree_identity(cwd: Path | None = None) -> str:
 
     def git(*args: str) -> tuple[int, bytes]:
         try:
-            result = subprocess.run(["git", *args], capture_output=True,
+            result = subprocess.run(git_argv(*args), capture_output=True, env=git_env(),
                                     timeout=30, cwd=str(base))
         except (OSError, subprocess.TimeoutExpired):
             return 128, b""
@@ -7602,7 +8133,9 @@ def worktree_identity(cwd: Path | None = None) -> str:
     code, unstaged = git("diff", "--binary")
     if code not in (0, 1):
         return "unknown (git diff failed)"
-    ignored = STATE_DIR.encode()
+    code, top = git("rev-parse", "--show-toplevel")
+    top_dir = top.decode("utf-8", "surrogateescape").strip() if code == 0 else str(base)
+    ignored = (state_prefix(top_dir) or STATE_DIR).encode("utf-8", "surrogateescape")
     state_h = hashlib.sha256()
     state_h.update(head_line[0].strip() + b"\0")
     untracked: list[bytes] = []
@@ -8083,7 +8616,37 @@ def herdr_run(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]
                           timeout=timeout)
 
 
-def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
+@contextlib.contextmanager
+def qualification_sandbox(d: Path, role: str):
+    """A disposable copy of one run, entered as the working directory.
+
+    Qualification runs real watchers, claims, and pauses. Against the live run it
+    delivered the role's real pending event, so the real supervisor was never woken
+    for it, and it lifted an operator's pause. The copy leaves out the object store,
+    which delivery never reads, and starts unpaused, since a paused role cannot
+    announce; the live pause is untouched.
+    """
+    home = Path(tempfile.mkdtemp(prefix="docket-qualify-"))
+    previous = Path.cwd()
+
+    def ignore(directory: str, names: list[str]) -> list[str]:
+        if Path(directory).name == ".bundles":
+            return [name for name in names if name in ("objects", "work")]
+        return []
+
+    try:
+        target = home / STATE_DIR / "runs" / d.name
+        shutil.copytree(d, target, symlinks=True, ignore=ignore)
+        paused_flag(target, role).unlink(missing_ok=True)
+        os.chdir(home)
+        yield target
+    finally:
+        os.chdir(previous)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def cmd_delivery_qualify(d: Path, run: str, role: str, session: str,
+                         artifact: Path | None = None, live_root: Path | None = None) -> None:
     """Qualify delivery against disposable real processes, or block honestly.
 
     Exercises a real hook announcement, a SIGKILLed hook restart, a real
@@ -8095,12 +8658,28 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
     capability, `failed` means something actually broke, and production stays
     manual until a positive behavior-level qualification succeeds.
     """
-    artifact = delivery_dir(d, role).parent / f"qualification-{role}.json"
+    artifact = artifact or delivery_dir(d, role).parent / f"qualification-{role}.json"
     record: dict[str, object] = {
         "run": run, "role": role, "started_at": stamp(), "checks": [],
+        "live_state": "untouched: qualified against a disposable copy of the run",
     }
     failed: list[str] = []
     blocked: list[str] = []
+
+    def with_history(rec: dict[str, object]) -> dict[str, object]:
+        # The disposable copy is discarded, so its lease history travels in the record.
+        log = delivery_dir(d, role) / "log.jsonl"
+        try:
+            lines = log.read_text().splitlines() if log.is_file() else []
+        except OSError:
+            lines = []
+        history = []
+        for line in lines:
+            try:
+                history.append(json.loads(line))
+            except ValueError:
+                continue
+        return {**rec, "lease_history": history}
 
     def check(name: str, status: str, detail: str, **extra: object) -> None:
         record["checks"].append({"check": name, "status": status,
@@ -8122,10 +8701,13 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
     record["probe"] = {"command": "herdr agent prompt --help",
                        "boundary": boundary, "mode": mode, "detail": detail,
                        "herdr_version": herdr_version}
-    record["source_tree"] = worktree_identity()
+    # The content tree and HEAD are the live checkout's, which is what a release binds;
+    # only delivery state is exercised in the disposable copy.
+    checkout = live_root or root()
+    record["source_tree"] = worktree_identity(checkout)
     try:
-        head_out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                                  text=True, timeout=10, cwd=str(root()))
+        head_out = subprocess.run(git_argv("rev-parse", "HEAD"), capture_output=True,
+                                  text=True, timeout=10, cwd=str(checkout), env=git_env())
         record["repo_head"] = (head_out.stdout.strip()[:64]
                                if head_out.returncode == 0 and head_out.stdout.strip()
                                else "unknown (not a git checkout)")
@@ -8143,7 +8725,7 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
         record["status"] = "blocked"
         record["blocked_capability"] = "no-actionable-event"
         record["finished_at"] = stamp()
-        publish_json(artifact, freeze_record(record))
+        publish_json(artifact, freeze_record(with_history(record)))
         print(f"qualification {role}: blocked (no derived event to qualify against; "
               "submit work first)")
         print(f"artifact: {artifact}")
@@ -8154,7 +8736,7 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", sid):
         record["status"] = "failed"
         record["finished_at"] = stamp()
-        publish_json(artifact, freeze_record(record))
+        publish_json(artifact, freeze_record(with_history(record)))
         die(f"invalid session id {sid!r} for qualification")
     session_argv = ["session", run, "--register", "--session", sid,
                     "--name", "delivery-qualification-disposable", "--role", role]
@@ -8165,7 +8747,7 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
               argv=session_argv, exit=reg_result.returncode)
         record["status"] = "failed"
         record["finished_at"] = stamp()
-        publish_json(artifact, freeze_record(record))
+        publish_json(artifact, freeze_record(with_history(record)))
         die(f"qualification {role}: disposable session registration failed")
     generation = read_registration(sid).get("generation", "?")
     record["session"] = {"id": sid, "generation": generation,
@@ -8393,7 +8975,7 @@ def cmd_delivery_qualify(d: Path, run: str, role: str, session: str) -> None:
         record["status"] = "passed"
     record["mode"] = mode
     record["finished_at"] = stamp()
-    publish_json(artifact, freeze_record(record))
+    publish_json(artifact, freeze_record(with_history(record)))
     print(f"qualification {role}: {record['status']} (mode {mode}; event {key}; "
           f"session {sid}; {len(record['checks'])} checks)")
     print(f"artifact: {artifact}")
@@ -8564,7 +9146,12 @@ def cmd_delivery(a: argparse.Namespace) -> None:
             print(f"  {known}: {flag}, {count} queued event(s)")
         return
     if a.qualify:
-        cmd_delivery_qualify(d, a.run, role, a.session)
+        artifact = delivery_dir(d, role).parent / f"qualification-{role}.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        live_root = root()
+        with qualification_sandbox(d, role) as sandbox:
+            cmd_delivery_qualify(sandbox, a.run, role, a.session, artifact=artifact,
+                                 live_root=live_root)
         return
     if a.send:
         if not a.session:
@@ -8619,7 +9206,7 @@ def cmd_doctor(a: argparse.Namespace) -> None:
     print("Required")
     print(f"  [{ok}] python {sys.version.split()[0]}")
     print(f"  [{ok if _has('git') else warn}] git" + ("" if _has("git") else "  - needed to review implementor diffs"))
-    inrepo = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+    inrepo = subprocess.run(git_argv("rev-parse", "--is-inside-work-tree"), env=git_env(),
                             capture_output=True, cwd=root()).returncode == 0 if _has("git") else False
     print(f"  [{ok if inrepo else warn}] inside a git repo"
           + ("" if inrepo else "  - no diff evidence; a run must declare"
@@ -8685,6 +9272,16 @@ def cmd_doctor(a: argparse.Namespace) -> None:
                 print(f"  [{warn}] {run} is missing role(s): {', '.join(sorted(missing))}")
     else:
         print(f"  [{ok}] watcher not armed (correct when idle)")
+    # wake.sh records a launcher or argument failure here, because a hook that
+    # cannot start never wakes anyone and the harness shows nothing.
+    for failure in sorted((root() / STATE_DIR).glob("hook-failure-*")):
+        hook_role = failure.name.removeprefix("hook-failure-")
+        try:
+            detail = " | ".join(line.strip() for line in failure.read_text().splitlines()
+                                if line.strip())
+        except OSError as exc:
+            detail = f"unreadable: {exc}"
+        print(f"  [{warn}] wake hook for {hook_role} last failed, so it wakes nobody: {detail}")
 
     print("\ndocket itself works with none of the optional pieces above.")
     print("The protocol is files; dispatch and wake are conveniences.")
@@ -8894,7 +9491,9 @@ def read_corrections(d: Path, owner: str) -> dict:
             except (OSError, ValueError):
                 opened += 1
                 continue
-            opened += str(meta.get("opened_correction", "")) != "no"
+            # Only a correction that opened, or is opening, returned anything. One
+            # the budget refused (`escalated`) never reached the implementor.
+            opened += str(meta.get("opened_correction", "")) in ("requested", "yes")
         data["verifier_returns"] = opened
     return data
 
@@ -8992,7 +9591,8 @@ def escalation_events(d: Path) -> list[tuple[str, str, str, int, str]]:
         out.append((f"{owner}:escalated:{iid}",
                     f"{owner} exhausted its local correction budget ({used} attempts, limit "
                     f"{entry.get('limit', '?')}): grant more rounds with `docket escalation "
-                    f"{d.name} {owner} --grant 1 --reason TEXT`, re-plan the task, or leave it "
+                    f"{d.name} {owner} --grant 1 --as {plan_owner_role(d)} --reason TEXT`, "
+                    "re-plan the task, or leave it "
                     "for a waiver",
                     owner, state_of(d, owner)[0],
                     f"sha256:{hashlib.sha256(iid.encode()).hexdigest()}"))
@@ -9022,7 +9622,10 @@ def cmd_escalation(a: argparse.Namespace) -> None:
     """Grant an exhausted correction chain more rounds; only the plan owner may."""
     d = need_run(a.run)
     owner_role = plan_owner_role(d)
-    role = a.as_role or owner_role
+    role = a.as_role
+    if not role:
+        die(f"escalation --grant requires --as {owner_role}: only the plan owner extends a "
+            "correction budget, and the role must be stated, never assumed")
     if role != owner_role:
         die(f"only the {owner_role} extends a correction budget in {a.run}; the budget is "
             "plan policy, and the role that hit it cannot raise it")
@@ -9044,10 +9647,15 @@ def cmd_escalation(a: argparse.Namespace) -> None:
                       "reason": reason, "resolved_at": stamp()})
         publish_json(corrections_path(d, a.owner), record)
         publish_json(path, entry)
-    reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+    grnd, gst = state_of(d, a.owner)
+    if gst == "submitted" and refused_verifier_correction(d, a.owner, grnd) is not None:
+        woken = f"the {verifier_role_of(d)} is woken to finish the correction it was refused"
+    else:
+        reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+        woken = f"the {reviewer} is woken to apply the correction it was refused"
     print(f"granted {a.owner} {a.grant} more correction round(s): "
           f"{correction_attempts(record)} used of {correction_budget(d, a.owner, record)}; "
-          f"the {reviewer} is woken to apply the correction it was refused")
+          + woken)
 
 
 def escalation_path(d: Path, owner: str, start_round: int) -> Path:
@@ -9061,11 +9669,17 @@ def open_escalation(d: Path, owner: str, record: dict, why: str) -> dict:
     except (TypeError, ValueError):
         start = 0
     path = escalation_path(d, owner, start)
+    history: list[dict] = []
     if path.is_file():
         try:
             existing = json.loads(path.read_text())
             if isinstance(existing, dict) and existing.get("state") == "open":
                 return existing
+            # A chain exhausted again after a grant keeps every earlier grant and
+            # its reason; the new escalation never erases why rounds were given.
+            if isinstance(existing, dict):
+                history = [h for h in existing.get("history", []) if isinstance(h, dict)]
+                history.append({k: v for k, v in existing.items() if k != "history"})
         except (OSError, ValueError):
             pass
     findings = [p.name for p in _ordered(d.glob(f"{owner}-verification-*.mdx"))]
@@ -9083,6 +9697,8 @@ def open_escalation(d: Path, owner: str, record: dict, why: str) -> dict:
         "decisions": decisions,
         "opened_at": stamp(),
     }
+    if history:
+        entry["history"] = history
     record["escalated"] = entry["id"]
     publish_json(corrections_path(d, owner), record)
     publish_json(path, entry)
@@ -9216,6 +9832,20 @@ def cmd_verify(a: argparse.Namespace) -> None:
     print(f"recorded {path.name}: {a.result} (report stays submitted)")
 
 
+def verifier_role_of(d: Path) -> str:
+    """The role that performs verification under the run's preset."""
+    return "checker" if mode_of(d) == MODE_QUICK else "verifier"
+
+
+def refused_verifier_correction(d: Path, owner: str, rnd: int) -> Path | None:
+    """The round's verification whose correction the budget refused, if that is its state."""
+    vpath, vmeta, _ = latest_verification(d, owner, rnd)
+    if vpath is not None and vmeta.get("result") == "fail" \
+            and vmeta.get("opened_correction") == "escalated":
+        return vpath
+    return None
+
+
 def mark_verification_correction(vpath: Path, state: str) -> None:
     """Record how a verification's requested correction stands."""
     vmeta, vbody = parse(vpath.read_text())
@@ -9252,8 +9882,10 @@ def interrupted_verifier_correction(d: Path, owner: str, rnd: int) -> Path | Non
             if vpath.is_file():
                 return vpath
     vpath, vmeta, _ = latest_verification(d, owner, rnd)
+    # A correction the budget refused is still the one to finish once more rounds
+    # are granted, so the retry reuses its findings rather than recording another.
     if vpath is not None and vmeta.get("result") == "fail" \
-            and vmeta.get("opened_correction") in ("requested", "yes"):
+            and vmeta.get("opened_correction") in ("requested", "yes", "escalated"):
         return vpath
     return None
 
@@ -9274,6 +9906,8 @@ def finish_verifier_correction(a: argparse.Namespace, d: Path, rnd: int, vpath: 
         die(f"{vpath.name} already recorded these findings:\n{recorded}\n"
             "A retry finishes that correction and never replaces it; repeat the command "
             "without --detail, or state anything new in the next round. Nothing was recorded")
+    # Attempting it again makes it a return again, charged once under its own token.
+    mark_verification_correction(vpath, "requested")
     note_correction(d, a.owner, "verifier_returns", token=vpath.name)
     guard_correction_budget(
         d, a.owner, f"verification {vpath.name}",
@@ -9692,6 +10326,20 @@ def profile_revision(name: str) -> str:
     return f"{name}:v{meta.get('version', '?')}:{digest_of(data).split(':')[1][:12]}"
 
 
+def profile_version(meta: dict[str, str]) -> int | None:
+    """A profile's version as a whole number, or None when it is not one."""
+    try:
+        return int(str(meta.get("version", "")).strip())
+    except ValueError:
+        return None
+
+
+def profile_candidates() -> list[Path]:
+    """Every model profile file, user profiles first, in matching order."""
+    user = sorted(user_profiles_dir().glob("*.md")) if user_profiles_dir().is_dir() else []
+    return [*user, *sorted(profiles_dir().glob("*.md"))]
+
+
 def match_model_profile(model: str) -> str:
     """The reviewed profile for a model string, or empty for unknown models.
 
@@ -9702,15 +10350,14 @@ def match_model_profile(model: str) -> str:
     want = normalized_model(model).lower()
     if not want:
         return ""
-    user = sorted(user_profiles_dir().glob("*.md")) if user_profiles_dir().is_dir() else []
-    for path in [*user, *sorted(profiles_dir().glob("*.md"))]:
+    for path in profile_candidates():
         try:
             meta, _ = parse(path.read_text())
         except (OSError, ValueError):
             continue
         if meta.get("card", "") == "true":
             continue
-        models = [item.strip().lower() for item in meta.get("models", "").split(",")]
+        models = [normalized_model(item.strip()).lower() for item in meta.get("models", "").split(",")]
         if any(item and item == want for item in models):
             return path.stem
     return ""
@@ -11248,6 +11895,9 @@ def task_model(d: Path, owner: str) -> tuple[str, str, str]:
     dispatch = read_dispatch(d, owner) or {}
     observed = str(dispatch.get("model_observed", "") or "")
     model = observed if observed not in ("", "unobserved", "unknown") else ""
+    # The dispatch binds the current round, so the model it requests outranks the
+    # task's older fields; a switch or a resume moved it, and the task never did.
+    model = model or str(dispatch.get("model_requested", "") or "")
     harness = ""
     try:
         tmeta, _ = parse((d / f"{owner}-task.mdx").read_text())
@@ -11255,7 +11905,6 @@ def task_model(d: Path, owner: str) -> tuple[str, str, str]:
         harness = str(tmeta.get("harness", "") or "")
     except (OSError, ValueError):
         pass
-    model = model or str(dispatch.get("model_requested", "") or "")
     return (normalized_model(model) or "unknown", harness or "-",
             str(dispatch.get("model_profile", "") or ""))
 
@@ -11510,7 +12159,7 @@ def model_review_packet(records: list[dict], model: str, since: str) -> str:
                          f"{r.get('pointer')}")
         lines.append("")
     newest = max((str(r.get("at", "")) for r in cases), default=through)
-    version = int(str(meta.get("version", "0")) or 0) + 1 if name else 1
+    version = (profile_version(meta) or 0) + 1 if name else 1
     lines += [
         "## How to update the profile",
         "",
@@ -11566,11 +12215,32 @@ def adopt_model_profile(path: Path) -> None:
     if estimate_tokens(body) > PROFILE_TOKEN_BUDGET // 2:
         problems.append(f"the body is about {estimate_tokens(body)} tokens; keep it under "
                         f"{PROFILE_TOKEN_BUDGET // 2} so task cards still fit the guidance budget")
+    version = profile_version(meta)
+    if version is None:
+        problems.append(f"version must be a whole number, got {meta.get('version')!r}")
     target = user_profiles_dir() / f"{name}.md"
-    if target.is_file():
+    if target.is_file() and version is not None:
         old, _ = parse(target.read_text())
-        if int(str(meta.get("version", "0")) or 0) <= int(str(old.get("version", "0")) or 0):
+        if version <= (profile_version(old) or 0):
             problems.append(f"version must be above the adopted version {old.get('version')}")
+    # Matching takes the first profile naming a model, so a second one would install
+    # and never apply; a model's rules evolve as versions of its one profile.
+    wanted = {normalized_model(m).lower() for m in models}
+    for other in profile_candidates():
+        if other.stem == name:
+            continue
+        try:
+            other_meta, _ = parse(other.read_text())
+        except (OSError, ValueError):
+            continue
+        if other_meta.get("card", "") == "true":
+            continue
+        shared = sorted(wanted & {normalized_model(m.strip()).lower()
+                                  for m in str(other_meta.get("models", "")).split(",")
+                                  if m.strip()})
+        if shared:
+            problems.append(f"{', '.join(shared)} already has the profile {other.stem}; adopt a "
+                            f"new version of {other.stem} instead of a second profile")
     if problems:
         die(f"cannot adopt {path.name}:\n  - " + "\n  - ".join(problems))
     history = user_profiles_dir() / "history"
@@ -11610,7 +12280,9 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
         return str(record.get("body", "")).strip().lower().rstrip(".") in ("none", "")
 
     usage = [r for r in records if r.get("origin") == "usage"]
-    due = [item for item in pending_reviews(records) if item[1] >= 3]
+    # The same normalized records `docket models` reads, so an aliased spelling counts
+    # toward its model rather than splitting it under the review threshold.
+    due = [item for item in pending_reviews(outcome_records(path, a.since)) if item[1] >= 3]
     records = [r for r in records if r.get("origin") not in ("usage", "outcome", "profile")]
     agent = [r for r in records if r.get("origin") != "machine"]
     machine = [r for r in records if r.get("origin") == "machine"]
@@ -13336,8 +14008,8 @@ def find_bundle_by_digest(d: Path, digest: str) -> tuple[str | None, dict | None
 def current_repo_head() -> str:
     """Enclosing checkout HEAD at this instant, or an explicit unknown."""
     try:
-        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                             text=True, timeout=10, cwd=str(root()))
+        out = subprocess.run(git_argv("rev-parse", "HEAD"), capture_output=True,
+                             text=True, timeout=10, cwd=str(root()), env=git_env())
     except (OSError, subprocess.TimeoutExpired):
         return "unknown (git unavailable)"
     head = out.stdout.strip().splitlines()
@@ -14261,9 +14933,15 @@ def reconcile_dispatches(d: Path) -> list[str]:
     return sorted(set(names))
 
 
+# A waived dependency is settled: the reviewer accepted it as it stands. A dependent
+# gated only on approval could never dispatch and nothing would wake anyone about it,
+# so a waiver releases it, and dispatch says the work beneath it was never passed.
+DEPENDENCY_MET_STATES = {"approved", "completed", "waived"}
+
+
 def dispatch_dependencies_unmet(d: Path, owner: str) -> list[str]:
-    """Task and batch dependencies that are not approved or completed yet."""
-    terminal = {"approved", "completed"}
+    """Task and batch dependencies that are not approved, completed, or waived yet."""
+    terminal = DEPENDENCY_MET_STATES
     unmet = []
     for dep in task_depends_on(d, owner):
         if state_of(d, dep)[1] not in terminal:
@@ -14377,6 +15055,27 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 print(f"  - {problem}", file=sys.stderr)
             die(f"{a.owner} cannot dispatch with unresolved task intent; "
                 f"run `docket validate-task {a.run} {a.owner}` for the full gate")
+    # A dispatch that will be refused writes nothing, a registration included. The
+    # checks below repeat under the lock and stay the authority; this pass only
+    # keeps a refused first dispatch from leaving a session registered behind it.
+    prior = read_dispatch(d, a.owner) or {}
+    adopting = (prior.get("state") == "dispatched" and int(prior.get("round", 0) or 0) == rnd
+                and str(prior.get("session", "")) == a.session)
+    if not adopting:
+        early = dispatch_dependencies_unmet(d, a.owner)
+        if early:
+            die(f"{a.owner} cannot dispatch with unmet dependencies:\n      "
+                + "\n      ".join(f"- {item}" for item in early))
+        early = dispatch_ownership_problems(d, a.owner)
+        if early:
+            die(f"{a.owner} cannot dispatch: the change surface is not exclusively free:\n      "
+                + "\n      ".join(f"- {item}" for item in early))
+        cap = max_concurrency_of(d)
+        active = [r for r in live_dispatches(d)
+                  if not (r.get("owner") == a.owner and int(r.get("round", 0) or 0) == rnd)]
+        if cap and len(active) >= cap:
+            die(f"{a.owner} cannot dispatch: provider concurrency {len(active)}/{cap} "
+                "exhausted; wait for a dispatched task to finish")
     if a.register:
         ensure_session_registration(a.run, a.session, role, a.agent or a.session)
     reg = check_registration(d, a.session, a.run, role)
@@ -14409,23 +15108,10 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 # binding moves: same session, same round, same model.
                 model = str(existing.get("model_requested", "") or "")
                 seed_report_acceptance(d, a.owner)
-                try:
-                    prompt, prompt_info = compose_prompt(d, a.run, a.owner, role, model=model)
-                except SystemExit:
-                    prompt, prompt_info = "", {}
-                fresh_digest = str(prompt_info.get("digest", "") or "")
-                if fresh_digest and fresh_digest != existing_digest:
-                    history = existing.get("prompt_history", [])
-                    if not isinstance(history, list):
-                        history = []
-                    history.append({"at": stamp(), "digest": existing_digest,
-                                    "replaced_by": fresh_digest})
-                    existing["prompt_history"] = history
-                    existing["prompt_digest"] = fresh_digest
-                    existing["model_profile"] = str(prompt_info.get("model_profile", "") or "")
-                    existing["prompt_role"] = role
+                fresh_digest, prompt, prompt_file = rebind_dispatch_prompt(
+                    d, a.run, a.owner, role, rnd, existing, model)
+                if prompt_file is not None:
                     publish_json(dispatch_path(d, a.owner), existing)
-                    prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, fresh_digest)
                     machine_feedback(d, "dispatch", a.owner,
                                      "prompt rebound: the task or plan changed after dispatch")
                     print(f"rebound {a.owner} round {rnd}: its prompt changed since it was "
@@ -14460,13 +15146,12 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         if ownership:
             die(f"{a.owner} cannot dispatch: the change surface is not exclusively free:\n      "
                 + "\n      ".join(f"- {item}" for item in ownership))
-        if a.owner != "orch" and not snapshot_path(d, a.owner).is_file():
-            # A dependency-gated task deferred its baseline to this moment; an
-            # incomplete capture refuses the dispatch and writes no record.
-            require_baseline(d, a.owner, task_scope_hint(d, a.owner))
-            print(f"captured {a.owner}'s baseline at dispatch, after its dependencies")
         for dep, digest in pin_final_dependencies(d, a.owner):
             print(f"{a.owner} consumes {dep}'s approved bundle {digest} as a final input")
+        for dep in sorted(set(task_depends_on(d, a.owner))):
+            if state_of(d, dep)[1] == "waived":
+                print(f"note: {dep} was waived, not approved: {a.owner} builds on work accepted "
+                      "without a passing verification")
         with capacity_lock(d):
             # Holds the run-wide capacity lock only for the read-check-write
             # below: re-read live capacity, refuse a full cap, and publish the
@@ -14483,6 +15168,13 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             model = a.model or primary
             if allowed is not None and model not in allowed:
                 refuse_outside_policy(d, a.owner, model, allowed)
+            if a.owner != "orch" and not snapshot_path(d, a.owner).is_file():
+                # A task takes its baseline at its first dispatch, after every
+                # refusal: one refused for a full cap would otherwise fix its
+                # baseline under work that is still running. An incomplete
+                # capture refuses the dispatch and writes no record.
+                require_baseline(d, a.owner, task_scope_hint(d, a.owner))
+                print(f"captured {a.owner}'s baseline at dispatch")
             seed_report_acceptance(d, a.owner)
             prompt_file = None
             try:
@@ -14613,11 +15305,14 @@ def cmd_resume(a: argparse.Namespace) -> None:
         if not a.session:
             die("resume requires --session SESSION of a registered worker")
         try:
-            rnd, _ = state_of(d, a.owner)
+            rnd, round_state = state_of(d, a.owner)
         except (OSError, ValueError):
-            rnd = 0
+            rnd, round_state = 0, ""
         if not rnd:
             die(f"no report for {a.owner} in {a.run}; dispatch it first")
+        if round_state in TERMINAL_REPORT_STATES:
+            die(f"{a.owner} round {rnd} is {round_state}: there is no work left to resume, and "
+                "a recovery recorded for it would describe something that never happened")
         try:
             bound_round = int(dispatch.get("round", 0) or 0)
         except (TypeError, ValueError):
@@ -14735,6 +15430,32 @@ def cmd_resume(a: argparse.Namespace) -> None:
                       "the replacement")
 
 
+def rebind_dispatch_prompt(d: Path, run: str, owner: str, role: str, rnd: int,
+                           record: dict, model: str) -> tuple[str, str, Path | None]:
+    """Re-render a dispatched round's prompt and rebind the record when its bytes moved.
+
+    Returns the fresh digest, the prompt, and the prompt file when the binding changed,
+    keeping the replaced digest in `prompt_history`; the caller publishes the record.
+    """
+    old = str(record.get("prompt_digest", "") or "")
+    try:
+        prompt, info = compose_prompt(d, run, owner, role, model=model)
+    except SystemExit:
+        return "", "", None
+    fresh = str(info.get("digest", "") or "")
+    if not fresh or fresh == old:
+        return fresh, prompt, None
+    history = record.get("prompt_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append({"at": stamp(), "digest": old, "replaced_by": fresh})
+    record["prompt_history"] = history
+    record["prompt_digest"] = fresh
+    record["model_profile"] = str(info.get("model_profile", "") or "")
+    record["prompt_role"] = role
+    return fresh, prompt, write_prompt_file(d, owner, role, rnd, prompt, fresh)
+
+
 def cmd_switch_model(a: argparse.Namespace) -> None:
     """Move along the approved fallback list, or emit one compact exception."""
     d = need_run(a.run)
@@ -14751,20 +15472,30 @@ def cmd_switch_model(a: argparse.Namespace) -> None:
                 f"history: {', '.join(tried)}")
         if allowed is not None and a.model not in ordered:
             refuse_outside_policy(d, a.owner, a.model, ordered)
+        if a.session:
+            die(f"a new session is a new launch, not a model switch: run `docket resume "
+                f"{a.run} {a.owner} --session {a.session} --model {a.model}`, which records the "
+                "session history and hands the new session its prompt")
         checkpoint = write_checkpoint(d, a.owner)
         history = dispatch.get("model_history", [])
         history.append({"at": stamp(), "kind": "fallback", "model": a.model})
         dispatch["model_history"] = history
         dispatch["model_requested"] = a.model
-        if a.session:
-            reg = check_registration(d, a.session, a.run, dispatch.get("role", "implementor"))
-            dispatch["session"] = a.session
-            dispatch["session_generation"] = reg.get("generation", 1)
-            note = f" with a new session {a.session}"
-        else:
-            note = "; the harness switch is unverified until `docket set-model` confirms it"
+        # The observed model was the old one; until `set-model` sees the new one, every
+        # outcome of this round belongs to the model now requested, never the last seen.
+        dispatch["model_observed"] = "unobserved"
+        role = str(dispatch.get("role", "implementor") or "implementor")
+        rnd = int(dispatch.get("round", 0) or 0)
+        fresh, prompt, prompt_file = rebind_dispatch_prompt(
+            d, a.run, a.owner, role, rnd, dispatch, a.model)
         publish_json(dispatch_path(d, a.owner), dispatch)
-        print(f"switched {a.owner} to model {a.model}{note} (checkpoint {checkpoint.name})")
+        print(f"switched {a.owner} to model {a.model}; the harness switch is unverified until "
+              f"`docket set-model` confirms it (checkpoint {checkpoint.name})")
+        prompt_path = prompt_file or (write_prompt_file(d, a.owner, role, rnd, prompt, fresh)
+                                      if prompt and fresh else None)
+        if prompt_path is not None:
+            print(f"prompt: {prompt_path.relative_to(root())} - send these exact bytes to the "
+                  "worker on the new model")
 
 
 def exceptions_dir(d: Path) -> Path:
@@ -14980,6 +15711,13 @@ def amendment_blocks(d: Path, owner: str) -> list[str]:
 
 
 def main() -> None:
+    # A path that is not UTF-8 travels as surrogate escapes; printing one must show
+    # it, never crash the command that met it.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(prog="docket", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -284,6 +284,13 @@ new belongs in the next round. Repeating a *different verdict* while a transitio
 unfinished is refused too, so a retry can never turn an interrupted changes request
 into an approval.
 
+A recovered transition does not trust the evidence it bound, only the payload it wrote.
+One interrupted before its first artifact is checked exactly as a fresh verdict is: its bundle must be intact and still current for the round, the report body must be the one it journalled, and an approval or waiver must clear every accepting-verdict check against the live contract, inputs, amendments, and verification.
+When any of that has moved, the transition published nothing and can no longer finish honestly, so it is abandoned rather than finished or stranded: the journal records `state: abandoned` with the reasons, a copy survives under `.transitions/abandoned/`, and the reviewer decides again against current evidence.
+Skipping those checks let a retry approve a task whose contract changed after the interruption, and let `--re-review` record a body nothing froze.
+One interrupted after its decision artifact cannot be abandoned, because the decision is published; it refuses to finish while the report body differs from the one the decision reviewed, and finishes once that body is restored.
+Every path that finishes an accepting verdict, the already-applied one included, also closes the owner's open escalation.
+
 A waived-task reopen follows the same rule through its own journal. `reopen_decide()`
 detects an in-progress `reopen-waived` journal before selecting the latest report,
 so a retry after the next-round draft already exists finishes the journalled round
@@ -337,8 +344,11 @@ one durable escalation under `.escalations/` and refuses another round; it never
 auto-approves, auto-waives, or opens endless rounds. The budget is plan policy,
 so the escalation wakes the plan owner (the planner, or the coordinator in
 quick), not the reviewer that hit it: `docket escalation <run> <owner> --grant N
---reason TEXT` extends that chain, and the reviewer is then woken with
-`budget-granted` to apply its refused changes. An accepting verdict closes any
+--as <plan owner> --reason TEXT` extends that chain; `--as` is required, never
+assumed. The role whose correction was refused is then woken with `budget-granted`:
+the reviewer to apply its refused changes, or the verifier to finish its refused
+correction. A refused correction is never charged, because it returned nothing, so a
+grant of N opens exactly N more rounds. An accepting verdict closes any
 escalation it leaves open. An approval packet names the exact task
 revision, bundle digest, and verification artifact it binds. A closed
 milestone batch under `five-role-v1` is review-ready only when every
@@ -754,20 +764,27 @@ worktree mode, its content digest, and its index entry. A content hash alone can
 an executable-bit change or a staging change layered on a path that was dirty when the
 baseline was taken, and either one would then be missing from the task diff.
 
-A task assigned with a `--depends-on` edge whose dependency is not approved yet defers its task baseline to `docket dispatch`, which captures it once, whole, before the dispatch record exists, and refuses the dispatch when it cannot.
-Captured at assignment, the baseline predated the dependency's work, so the dependency's approved but uncommitted change showed up as the dependent's own out-of-scope change: the gate refused it, and the only way past was to widen the dependent's scope over the dependency's files and freeze that work into the wrong patch.
-Deferral keeps invariant 17, since the baseline still precedes the task's own dispatch and is never recaptured, and the dependency's work becomes the dependent's starting point.
+A delegated task takes its baseline at its first `docket dispatch`, not at `docket assign`.
+Dispatch captures it once, whole, after every other refusal and before the dispatch record exists, and refuses the dispatch when it cannot.
+A delegated task scoped without a dispatch is captured when `docket scope --submit` accepts its capsule, which still precedes any implementation edit.
+An orchestrator-executed task is started by the session that assigns it and may never be dispatched, so it is still captured at assignment.
+Captured at assignment, a delegated task's baseline predated every task worked before it: the playbook assigns a whole batch before any implementor starts, so an earlier task's approved but uncommitted change showed up as the later task's own out-of-scope change.
+The gate refused it, and the only way past was to widen the later task's scope over the earlier task's files and freeze that work into the wrong patch, where the final review read it twice.
+Taken at dispatch, work finished before then is the task's starting point, which is why a task should be dispatched once the work before it is done.
+A dispatch refused for a full concurrency cap or an out-of-policy model captures nothing, because a baseline fixed while earlier work is still running would count that work again.
+This keeps invariant 17: the baseline precedes the task's own work and is never recaptured.
+A task with a `--depends-on` edge is dispatchable only once its dependency is approved, so the dependency's work is always inside its baseline.
 When the dependency is approved, the orchestrator (the coordinator in quick) receives one `dispatch-ready` event for the dependent, which retires once the round is dispatched; nothing else re-entered it at that moment, because the dependent is still a draft.
 
 `docket assign` takes the run baseline before it opens the first task, because a
 baseline taken when the aggregate report is assigned has already lost the run's initial
-state. Each task then records its own baseline at assignment and never again: discovery
-only reads, so a capsule submitted later refines `scope`, never the baseline underneath
-it.
+state. Each task then records its own baseline once and never again: discovery only
+reads, so a capsule submitted later refines `scope`, never the baseline underneath it.
 
 **A baseline is captured in full or dispatch is refused.** Under `evidence_mode: git`,
-`docket assign` captures the run baseline and the task baseline *before* it creates the
-task, the report, or the discovery capsule, and dies if either is incomplete - no
+`docket assign` captures the run baseline *before* it creates the task, the report, or
+the discovery capsule, and `docket dispatch` captures the task baseline before it writes
+a dispatch record. Each dies if its capture is incomplete - no
 declared roots, a missing or re-pointed checkout, an unreadable index, or an untracked
 file over `UNTRACKED_CONTENT_LIMIT` that cannot be stored whole. A partial capture is
 discarded rather than published, so a snapshot that exists on disk is a complete
@@ -926,6 +943,9 @@ Verification binds to the same source revision the bundle pins. The source tree 
 built once before the verify command runs and again after it, and a submission whose
 checkout moved in between is refused rather than frozen: a green result that does not
 describe the frozen source is not evidence of anything.
+The aggregate pins its source against the run baseline, which is what its bundle measures.
+It once looked for a baseline of its own that never exists, found nothing, and skipped the comparison, so an integration verify that edited the tree froze green.
+Under `evidence_mode: git` a source that cannot be pinned before the verify command runs refuses the submission, because a silent fallback is exactly how that gap went unnoticed.
 
 It binds to the same documents, too. A captured result is evidence about one exact task
 contract, report, accepted scope, and record of consumed inputs, so `submission_identity`
@@ -1015,6 +1035,11 @@ prompt, so the wait happens inside the hook at no model cost. Measured on Codex 
 a supervisor's stop entered the hook, a pending wake returned one second later as a
 `hook_prompt`, and the next stop waited again. `DOCKET_WATCH_HOOK=1` tells `docket watch`
 it runs inside a hook, which suppresses the Codex poll hint meant for a manual watcher.
+
+Inside the hook a wake is exit 3, never 2, and `wake.sh` maps only 3 to the harness's 2.
+Exit 2 is also what uv and argparse return for their own errors, so a hook that execed the watcher turned a missing interpreter or a bad `DOCKET_WATCH_TIMEOUT` into a wake on every Stop, each one a full-context turn carrying the error as its prompt.
+Any other failure exits 1, which wakes nobody, and is recorded in `.docket/hook-failure-<role>` so `docket doctor` can say the hook is broken; a working run removes it.
+The watcher's default timeout sits 60 seconds under the 28800-second hook timeout, so it ends on its own instead of racing the harness's kill.
 
 Three rules keep it correct:
 
@@ -1289,7 +1314,7 @@ Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
 | commands | task validation, discovery scope, handoff, report, review, diff, bundle, depend, and preflight |
 | gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | verification | `task_env`, `parse_framework_counts`, `run_verification` |
-| transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
+| transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `guard_accepting_verdict`, `abandon_unpublished_transition`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
 | five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
 | prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
 | feedback | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `user_profiles_dir`, `profile_path`, `cmd_feedback`, `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |

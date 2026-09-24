@@ -103,6 +103,12 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
 ## Things that look like bugs but are not
 
 - The watcher exits 0 silently when nothing is actionable. That is the common case.
+- Inside the wake hook, `docket watch` exits 3 for a wake and `wake.sh` turns only 3
+  into 2. uv and argparse also exit 2, so a hook that passed 2 through woke the session
+  on every Stop with its own error as the prompt.
+- A retry of a `decide` interrupted before its first artifact can be abandoned instead
+  of finished. It published nothing, and once the evidence it bound has moved, finishing
+  it would record a verdict nobody reviewed.
 - An unarmed role is never woken. That is by design; `docket doctor` warns about it.
 - `verify:` runs after the structural checks, not before. Ordering is deliberate.
 - `docket submit` refuses a report that is already `submitted`. Also deliberate.
@@ -110,8 +116,10 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
   starts meaning a different checkout invalidates every baseline under it.
 - An unreadable `roots.json` is an error, not an empty declaration. Absent and invalid
   are different states on purpose.
-- `docket assign` refuses a `git` run it cannot baseline, and leaves no task behind.
-  That is the fail-before-dispatch rule, not a lost assignment.
+- `docket assign` refuses a `git` run whose run baseline it cannot capture, and leaves
+  no task behind. `docket dispatch` refuses a task whose own baseline it cannot capture,
+  and leaves no dispatch record. That is the fail-before-dispatch rule, not a lost
+  assignment.
 - A change list is unqualified in a single-root run and `<alias>:<path>` in a multi-root
   one. Both are the same code path; only the display differs.
 - A re-review freezes a second bundle for the same round. The round number does not
@@ -155,6 +163,8 @@ diff -r ~/.agents/skills/docket ~/Documents/Projects/docket/skills/docket
 - `docket usage` shows no session for a role that never ran a docket command inside
   its harness, and ignores harness variables whose process is not an ancestor.
   Guessing the newest session would attribute another session's tokens.
-- A task assigned with an unmet `--depends-on` has no task baseline until it is
-  dispatched. That is deliberate: its baseline must include the dependency's approved
-  work, and it is still captured once, before its own dispatch, and never recaptured.
+- A delegated task has no task baseline until it is dispatched (or its scope is
+  accepted, whichever comes first). That is deliberate: a batch is assigned up front,
+  so an assign-time baseline predated the earlier tasks' work and counted it as the
+  later task's own. It is still captured once, before the task's work, and never
+  recaptured. A dispatch refused for a full cap captures nothing.

@@ -60,13 +60,15 @@ diff. Declare a missing one with `docket roots <run> --declare <alias>=<path> ..
 while no baseline exists yet; afterwards the declaration is fixed, because an alias
 that starts meaning a different checkout invalidates every baseline under it.
 
-`docket assign` then takes the run baseline before it opens the first task and each
-task's own baseline as that task is created, both before any artifact exists. If it
-cannot capture one in full - no declared root, a missing or re-pointed checkout, an
-unreadable index, an untracked file too large to store whole - it refuses and creates
-nothing. That is not a lost assignment: fix the workspace, or declare
-`evidence_mode: documents-only` for a run that genuinely has no Git evidence, and
-assign again.
+`docket assign` then takes the run baseline before it opens the first task, and
+`docket dispatch` takes each delegated task's own baseline, before any dispatch record
+exists. Work finished before a task is dispatched is therefore its starting point, not
+its own change, so dispatch the next task only once the work before it is done. If
+either command cannot capture a baseline in full - no declared root, a missing or
+re-pointed checkout, an unreadable index, an untracked file too large to store whole -
+it refuses and writes nothing. That is not a lost assignment: fix the workspace, or
+declare `evidence_mode: documents-only` for a run that genuinely has no Git evidence,
+and run it again.
 
 Create and validate every assignment in the current batch before starting any
 implementor or watcher. A task that has not been assigned yet is invisible to

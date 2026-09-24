@@ -13,11 +13,13 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    and verification. Broader exploration is allowed when the task genuinely
    requires it; avoid exhaustive reading that does not improve the decision.
 2. Fill `Txx-scope.mdx` with proposed paths, exact verification, relevant symbols,
-   and discovery reasoning, then run `docket scope <run> <owner> --submit` before
+   and discovery reasoning. Your `verify:` adds to the assigned command and never
+   replaces it: when they differ the gate runs both, so a check you cannot pass is a
+   blocker, not something to drop. Then run `docket scope <run> <owner> --submit` before
    editing. A clean claim lets you continue without supervisor approval. On a
    collision, stop for orchestration. If later discovery requires another path,
    amend the capsule and resubmit it; Docket preserves the original diff baseline,
-   which was captured when the task was assigned. In a run with more than one
+   which was captured when the task was dispatched. In a run with more than one
    checkout root, address another checkout as `<alias>:<path>` - run `docket roots
    <run>` for the aliases - and expect changed paths, and the report's *Files
    changed* section, to use the same form. A bare path resolves to the deepest

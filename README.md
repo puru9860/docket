@@ -265,7 +265,7 @@ docket events <run> --role R --peek                  inspect events, consuming n
 docket arm <run> --role R                            arm the watcher for a waiting role
 docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
-docket watch <run> --role orchestrator|planner|verifier|reviewer
+docket watch <run> --role coordinator|checker|orchestrator|planner|verifier|reviewer
                                                      block until something needs you
 docket help <role>                                   the playbooks
 ```
@@ -299,6 +299,8 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
 Arm **every role that will wait**, then disarm when the run ends:
 
 ```bash
+docket arm R01 --role coordinator    # quick: waiting on the checker and escalations
+docket arm R01 --role checker        # quick: waiting on submitted rounds
 docket arm R01 --role orchestrator   # waiting on implementors
 docket arm R01 --role planner        # waiting on the orchestrator (split only)
 docket arm R01 --role verifier       # waiting on submissions (five-role runs)

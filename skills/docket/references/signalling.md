@@ -19,22 +19,26 @@ One `docket watch <run> --role "$DOCKET_ROLE"` returns exactly when something is
 
 The watcher exits 0 silently when its timeout passes with nothing actionable; re-arm the same wait without narrating it.
 
+Arm every role that waits. A role that is not armed is never woken by the hook.
+
 ```bash
-docket arm <run> --role orchestrator
-docket arm <run> --role planner       # split topology only
-docket arm <run> --role verifier      # five-role runs: submissions route promptly
-docket arm <run> --role reviewer      # five-role runs: milestone batches and frontiers
+docket arm <run> --role coordinator   # quick (the default): the session you talk to
+docket arm <run> --role checker       # quick: every submitted round waits on it
+docket arm <run> --role orchestrator  # standard
+docket arm <run> --role planner       # standard, split topology
+docket arm <run> --role verifier      # standard: submissions route promptly
+docket arm <run> --role reviewer      # standard: milestone batches and frontiers
 ```
 
 Every watching session must set `DOCKET_ROLE` to the one role it performs. The
-native hook (`hooks/wake.sh`) routes planner, orchestrator, verifier, and
-reviewer through the same foreground watcher; it is intentionally inert when the
+native hook (`hooks/wake.sh`) routes coordinator, checker, planner, orchestrator,
+verifier, and reviewer through the same foreground watcher; it is intentionally inert when the
 variable is absent or names another role. This prevents a verifier submission
 from waking or acting as reviewer, and keeps every role's registration and
 ledger separate.
 
 ```bash
-export DOCKET_ROLE=orchestrator        # or planner, verifier, reviewer
+export DOCKET_ROLE=checker             # or coordinator, planner, orchestrator, verifier, reviewer
 docket watch --armed --role "$DOCKET_ROLE"
 ```
 
@@ -43,8 +47,8 @@ report submissions in legacy runs. Ordinary implementor submissions are batched:
 wakes only when every currently delegated task is submitted or already decided.
 A revised report produces a new batch signature and one new wake. Blockers,
 ready partial-work checkpoints, and genuine discovery-scope collisions remain
-immediate. Successful scope claims remain silent. Combined topology uses only the
-orchestrator role. In five-role runs, submissions route promptly and individually
+immediate. Successful scope claims remain silent. A quick run uses the coordinator and
+checker roles; a legacy combined run uses only the orchestrator role. In five-role runs, submissions route promptly and individually
 to the verifier, while capable-review readiness is emitted only at configured
 milestone batches for the reviewer. A closed batch whose verified submission
 blocks a dependent derives one reviewer frontier for exactly those members,

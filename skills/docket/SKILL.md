@@ -46,8 +46,9 @@ list the tasks in `plan.mdx`, and start the orchestrator (below), which runs the
 `--harness` is the worker's harness: the one the user named, otherwise `opencode`.
 Put every constraint in the task before dispatching it: `--out-of-scope TEXT` and
 `--decision TEXT` repeat like `--criterion`. Add `--depends-on T01` when a task needs
-T01 approved first; assign every task up front, since a dependent's baseline waits for
-its dispatch, and dispatch it when its `dispatch-ready` wake arrives. If a task changes
+T01 approved first; assign every task up front, since each task's baseline waits for
+its dispatch, and dispatch a dependent when its `dispatch-ready` wake arrives. Dispatch
+the next task only once the work before it is done, so that work is its starting point. If a task changes
 after dispatch, run the same `dispatch` again: it rebinds and prints the new prompt.
 Never delete `.docket` or run files to start over.
 Repeat `assign` and `dispatch` per task; `dispatch` runs the task-intent gate,
@@ -73,8 +74,9 @@ wake hook fires. Send it this prompt, with the role filled in:
 
 ```text
 You are the <role> for docket run R01. Run `docket help <role>` and follow it.
-Wait with `docket watch R01 --role <role>` as `docket help signalling` describes
-for your harness, act on each wake, and wait again.
+Arm your wake once with `docket arm R01 --role <role>`, then wait with
+`docket watch R01 --role <role>` as `docket help signalling` describes for your
+harness, act on each wake, and wait again.
 ```
 
 Then wait yourself: `docket arm R01 --role coordinator` (or `planner`), and
