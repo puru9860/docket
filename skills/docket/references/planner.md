@@ -88,6 +88,31 @@ docket arm <run> --role planner
 docket status <run> --role planner
 ```
 
+## Standard preset window layout
+
+The standard preset builds two herdr windows once, at session setup.
+Build the planner window first, from the planner pane, as a 1:1 vertical split with planner and reviewer.
+Split the planner pane 1:1 to the right for the reviewer, read the new pane id from `result.pane.pane_id`, and start the reviewer there.
+Then create the tab that will hold the orchestrator window.
+
+```bash
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id
+herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto
+herdr tab create --cwd "$PWD" --no-focus
+```
+
+The orchestrator builds its own window inside that tab: it splits the orchestrator pane 1:1 to the right for the implementor pane and down in half for the verifier, and starts the verifier there.
+Only the planner starts the reviewer.
+Only the orchestrator starts the verifier and each implementor.
+
+```bash
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
+herdr pane split --current --direction down --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=verifier --no-focus   # JSON: result.pane.pane_id
+herdr agent start verifier --kind opencode --pane <pane_id> -- --auto
+```
+
+The quick preset merges planning and orchestration into one coordinator session and uses none of these commands.
+
 The only implementation artifact the planner consumes is the standardized
 `orch-report-NN.mdx` in legacy split runs. In `five-role-v1` runs the aggregate
 wakes the reviewer instead, and the planner receives intent and constraint

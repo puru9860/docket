@@ -146,8 +146,9 @@ ln -sfn ~/.agents/skills/docket/bin/docket ~/.local/bin/docket
 docket help planner
 ```
 
-`bin/docket` is a single stdlib-only [uv](https://docs.astral.sh/uv/) script with no
-dependencies. Replace the shebang with `#!/usr/bin/env python3` if you would rather not
+`bin/docket` is a short stdlib-only [uv](https://docs.astral.sh/uv/) script with no
+dependencies; it runs the CLI in the `docket_cli` package from bytecode cached under
+`~/.cache/docket/pycache`. Replace the shebang with `#!/usr/bin/env python3` if you would rather not
 use uv; nothing else changes.
 
 ## Quick start

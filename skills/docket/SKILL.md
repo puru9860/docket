@@ -29,7 +29,7 @@ If `docket` is not on PATH, use `~/.agents/skills/docket/bin/docket`.
 | The user asks for | Preset | You are | You start |
 | --- | --- | --- | --- |
 | a planner that spawns implementors, or names no roles | quick (default) | coordinator (planner plus orchestrator) | an implementor per task, one checker |
-| a planner that spawns a separate orchestrator | standard preset, `--mode standard` | planner | one orchestrator, which starts implementors, a verifier, and a reviewer |
+| a planner that spawns a separate orchestrator | standard preset, `--mode standard` | planner | one orchestrator (the planner starts the reviewer; the orchestrator starts the verifier and each implementor) |
 
 ```bash
 mkdir -p .docket
@@ -65,12 +65,11 @@ docket set-model R01 T01 --actual <provider/model id the pane shows> [--effort L
 Harness flags after `--`: opencode `--auto --model provider/model`, codex
 `--yolo -m MODEL`, claude `--dangerously-skip-permissions --model MODEL`.
 herdr agent names are global across tabs, so prefix them with the run (`r01-impl-1`).
+In standard, start each implementor in the layout's implementor pane instead of splitting a new pane: reuse its pane id with `herdr agent start <name> --kind opencode --pane <implementor-pane-id> -- ...`, one implementor at a time.
 A new Codex worker can stop at a directory-trust screen and a "Hooks need review" screen: trust the project directory, and continue without trusting hooks (the docket hook is for supervisors).
 
-Start each supervising session you own the same way: the checker in quick, the
-orchestrator in standard (which starts the verifier and reviewer itself). For a
-Claude Code or Codex session add `--env DOCKET_ROLE=<role>` to `pane split` so its
-wake hook fires. Send it this prompt, with the role filled in:
+Start each supervising session you own the same way: the checker in quick; in standard the planner starts the reviewer and the orchestrator starts the verifier.
+For a Claude Code or Codex session add `--env DOCKET_ROLE=<role>` to `pane split` so its wake hook fires. Send it this prompt, with the role filled in:
 
 ```text
 You are the <role> for docket run R01. Run `docket help <role>` and follow it.
@@ -89,6 +88,23 @@ cost you: `docket feedback R01 --add --role coordinator --category <kind> --body
 then `docket usage R01 --archive` keeps every role's transcript and token usage.
 `assign --model` also selects that model's learned profile; `docket models` shows
 which models are due for `docket models --review MODEL` (see the README).
+
+## Standard preset window layout
+
+The standard preset builds two herdr windows once, at session setup.
+The planner window is a 1:1 vertical split with planner and reviewer: the planner splits its pane 1:1 to the right, starts the reviewer there, and opens a new tab for the orchestrator window.
+The orchestrator splits its pane 1:1 to the right for the implementor pane and down in half for the verifier, and starts the verifier there.
+Every dispatch reuses the implementor pane, one implementor at a time.
+The full topology lives in the playbooks: `docket help planner` and `docket help orchestrator`.
+
+```bash
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id
+herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto
+herdr tab create --cwd "$PWD" --no-focus
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
+herdr pane split --current --direction down --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=verifier --no-focus   # JSON: result.pane.pane_id
+herdr agent start verifier --kind opencode --pane <pane_id> -- --auto
+```
 
 ## Read your playbook
 

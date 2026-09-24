@@ -13,6 +13,33 @@ A checker performs verification and then review as two recorded duties under `co
 The merge never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut.
 Every artifact records the merge, and a run that outgrows quick records an escalation request without migrating or recapturing any baseline.
 
+## Standard preset window layout
+
+The standard preset builds two herdr windows once, at session setup.
+The planner window is a 1:1 vertical split with planner and reviewer, and the planner creates a new tab for this window.
+Build this window from the orchestrator pane in that new tab.
+Split the orchestrator pane 1:1 to the right for the implementor pane, read the new pane id from `result.pane.pane_id`, and reuse that pane at every dispatch, one implementor at a time.
+Then split the orchestrator pane down in half for the verifier, read the new pane id the same way, and start the verifier there.
+The first split keeps focus on the orchestrator pane, so the second split still targets it.
+Only the orchestrator starts the verifier and each implementor.
+Only the planner starts the reviewer.
+
+```bash
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
+herdr pane split --current --direction down --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=verifier --no-focus   # JSON: result.pane.pane_id
+herdr agent start verifier --kind opencode --pane <pane_id> -- --auto
+```
+
+The planner window uses the same 1:1 right split plus a new tab, built from the planner pane, with the reviewer started in the split pane.
+
+```bash
+herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id
+herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto
+herdr tab create --cwd "$PWD" --no-focus
+```
+
+The quick preset merges planning and orchestration into one coordinator session and verification and review into one checker session, and uses none of these commands.
+
 ## Assign tasks
 
 Open every task with independent complexity and executor fields:
@@ -101,6 +128,7 @@ docket dispatch <run> T03 --session SESSION --agent NAME --register
 
 `--register` registers a new session for this run and role in the same call and reuses a matching registration, so a retried dispatch stays the same writer; `docket session --register` remains the way to start a new generation.
 Dispatch writes the exact prompt it bound to `.prompts/` and prints the path: send that file to the worker instead of rendering the prompt again.
+In standard, start the dispatched implementor in the layout's implementor pane instead of splitting a new pane: address the same pane id with `herdr agent start <name> --kind opencode --pane <implementor-pane-id> -- ...`, one implementor at a time.
 
 A retry with the same session and the same registration generation adopts
 the same record after a crash; the same session name with a newer generation
@@ -159,7 +187,8 @@ reviewer. With explicit closed batches, readiness follows closed membership and
 explicit dependencies instead. Blockers, scope collisions, replacement handoffs,
 and stall incidents remain immediate.
 A blocked implementor round wakes you first, so you can answer what is yours to answer; only the reviewer can settle the round.
-Hand it over with `docket route <run> --kind blocked --owner T01 --note TEXT`, which wakes the reviewer durably, instead of prompting its session.
+Hand it over with `docket route <run> --kind blocked --owner T01 --note TEXT`, which queues a durable notification for the reviewer.
+Arm the reviewer to receive it.
 Do not wait on `herdr agent wait`, `herdr agent prompt ... --wait`, or a `sleep` loop.
 They return when an agent goes idle or a timer fires, not when the lifecycle needs you, and every return is a full-context model turn.
 On Codex a blocking call is sliced into polls, so raise `background_terminal_max_timeout` and poll with a long `yield_time_ms`, as the signalling table says.

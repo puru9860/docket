@@ -84,7 +84,7 @@
 <header class="hero">
 <div class="wrap">
 <h1>Docket: five-role workflow - architecture and working</h1>
-<p class="sub">How <code>planner &rarr; orchestrator &rarr; implementor &rarr; frozen bundle &rarr; verifier &rarr; reviewer &rarr; aggregate &rarr; delivery + suite &rarr; final packet</code> holds up with cheap models doing the bulk work and capable models spending tokens only where judgment is required. Single stdlib-only CLI (<code>skills/docket/bin/docket</code>), file protocol under <code>.docket/runs/&lt;run&gt;/</code>, zero-token idle signalling.</p>
+<p class="sub">How <code>planner &rarr; orchestrator &rarr; implementor &rarr; frozen bundle &rarr; verifier &rarr; reviewer &rarr; aggregate &rarr; delivery + suite &rarr; final packet</code> holds up with cheap models doing the bulk work and capable models spending tokens only where judgment is required. Single stdlib-only CLI (the <code>skills/docket/docket_cli/</code> package, launched by <code>skills/docket/bin/docket</code>), file protocol under <code>.docket/runs/&lt;run&gt;/</code>, zero-token idle signalling.</p>
 <div class="badges">
 <span class="badge"><b>workflow</b> five-role-v1 / legacy</span>
 <span class="badge"><b>harness</b> claude / codex / opencode</span>
@@ -502,7 +502,7 @@ docket release R01 --freeze [--suite-artifact P] [--milestone M=DIGEST]</pre></d
 <li><code>verify:</code> writing non-ignored files fails the freeze (make it clean up / ignore).</li>
 <li>Root declaration one-time; post-declaration checkouts not picked up.</li>
 <li>Oversize untracked file blocks <code>git</code> assignment (ignore / move / documents-only).</li>
-<li>3-round cap is playbook advice, not code. No <code>verify:</code> sanity check at scope submit.</li>
+<li>The correction budget is enforced and exhaustion needs an explicit grant. Scope submission refuses an empty <code>verify:</code> and keeps the assigned verify floor, but does not check that a discovered command's first word resolves in <code>sh</code>.</li>
 <li>Wakes unauthenticated - confirm run exists before acting. <code>status</code> verify column truncated to 20 chars.</li>
 </ul>
 </details>

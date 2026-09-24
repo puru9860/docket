@@ -57,6 +57,7 @@ with something cleverer.
     .snapshots/<owner>.json  task baseline and accepted scope
     .snapshots/<owner>/      that baseline's patches and untracked content
     .baselines/<owner>.json  preflight verification result
+    .reopens/<owner>.json    append-only record of completed waived-task reopens
     .bundles/<owner>/rounds.json   append-only ledger of that owner's frozen bundles
     .bundles/<owner>/NN/<addr>/    one frozen task-round bundle, named by its digest
     .bundles/objects/        run-private Git object store used to rebuild trees
@@ -106,11 +107,19 @@ point at. `--redeclare` is refused once any baseline exists, and declaring afres
 a baseline whose declaration has gone missing is refused too. An alias that quietly
 starts meaning a different checkout invalidates every baseline under it.
 
+The Git runner uses `GIT_FIXED_CONFIG` for stable patch prefixes, quoting, submodule display, and color.
+`git_env()` removes caller Git directory, index, object-store, namespace, config-parameter, and diff overrides before every Git call, and sets `GIT_OPTIONAL_LOCKS=0` so status cannot refresh the measured index.
+`git_text()` and `git_raw()` preserve non-UTF-8 paths or raw patch bytes, and return an unavailable result when Git fails or times out.
+Reconstruction uses a private index and object directory under `.docket/`, with the checkout's Git objects available only as alternates.
+`retain_tree_objects()` copies every object added by a pinned tree beyond its pinned HEAD into `.bundles/objects`, including staged content that Git would otherwise leave only in the user's object store.
+The private store is never pruned, because later Git cleanup must not make an earlier bundle unrebuildable.
+`PRIVATE_STATE_DIRS` makes `.snapshots`, `.baselines`, and `.bundles` owner-only directories because captured patches, untracked bodies, and objects can contain secrets.
+
 **Frontmatter is the single source of truth.** There is deliberately no `state.json`.
 A parallel state file drifts from the documents agents actually edit, and then you have
 two truths and no way to tell which is stale. If you need new state, add a frontmatter key.
 
-The frontmatter parser (`parse`/`render` in `bin/docket`) is intentionally a flat
+The frontmatter parser (`parse`/`render` in `docket_cli/frontmatter.py`) is intentionally a flat
 `key: value` reader, not YAML. It has no dependencies and cannot execute anything. Keep it
 that way; nothing in the protocol needs nested structures.
 
@@ -183,6 +192,10 @@ Verify runs **last, and only if the structural and scope checks passed**. Spendi
 run on a report that is already incomplete is waste, and the ordering means the failure a
 subordinate sees is the most fundamental one first.
 
+The assigned `verify_hint:` is the verify floor: `gate_verify()` always retains that command when the implementor submits scope.
+An implementor may add a discovered `verify:` command, in which case both run in separate subshells joined with `&&`, so shell operators in one cannot mask the other's failure.
+Scope submission requires a nonempty verification command, and the gate runs the registered result after its structural checks.
+
 Acceptance maps to evidence through stable IDs. The task's criteria in order are
 A1, A2, and so on; a report may carry an optional `## Evidence` table with one
 row per ID holding state (`met`, `partial`, `not-met`, `not-verified`), linked
@@ -193,6 +206,8 @@ attached to a `met` row. Free-text prose is never keyword-policed: "no
 limitations" and coverage-by-integration notes pass or fail on structure, not
 wording. A blocked submission skips evidence enforcement entirely, exactly as it
 skips completion verification.
+For a normal submission with an evidence table, only `met` rows pass: a `partial`, `not-met`, or `not-verified` row must name a gap and still refuses completion.
+This met-only evidence rule keeps checked acceptance boxes from contradicting their evidence rows, while blocked work can state a gap without satisfying completion evidence.
 
 Checks 2 to 8 live in `gate_problems()`, which `cmd_submit` and the changed-evidence
 re-review both call. That sharing is the point: a report body edited after review is a
@@ -299,6 +314,8 @@ existing draft and never opens a second round; the recorded reason may be omitte
 on retry but never replaced, and concurrent retries serialize under the owner lock
 and settle as one reopen. Collision validation runs before any mutation and again
 before completion, and the prior report, decision, and bundle are never rewritten.
+`record_reopen()` appends each completed transition exactly once to `.reopens/<owner>.json`.
+`reopen_epoch()` derives later event generations from that durable reopen ledger, with the transition journal as a compatibility fallback for older runs, so replacing the one-owner journal cannot revive an old incident.
 
 ## Five-role lifecycle
 
@@ -704,6 +721,10 @@ The release manifest lists the digest of every frozen file and a complete invent
 Re-freezing identical content converges on the existing address only after the staged bytes validate and match the published unit byte for byte; conflicting content at an address refuses.
 Frozen validation reads the release's own bundle copies, so deleting or editing the live bundle store after a freeze cannot change the packet.
 Source-tree staleness for the suite and delivery qualifications is still checked, and damaged, added, removed, retargeted, mode-changed, or reused frozen evidence reports `DAMAGED` precisely.
+
+`qualification_sandbox()` runs delivery qualification in a disposable copy of the run and removes that copy afterwards.
+It leaves out the bundle object and work stores, clears only the copy's pause flag, and runs real watcher, claim, retry, and pane probes there, so qualification cannot consume a live event or lift a live operator pause.
+The resulting qualification artifact is published to the live run only after the sandbox probe, with blocked or failed status when a required capability cannot be demonstrated.
 
 Operational usage accounting is kept separate from review judgment.
 `docket metrics` keeps approval counts from reviewer decisions, prompt renders as an invocation proxy and never proven model calls, wall time as the first-to-last artifact span, and delivery receipts and duplicates as observed.
@@ -1284,11 +1305,9 @@ Stated plainly so nobody assumes otherwise.
   alternative is a baseline that cannot reconstruct what it claims to. Ignore the file,
   move it out of the checkout, or run the milestone under `documents-only`.
 - **`events --peek` reports pending work but cannot acknowledge it.** Leased
-  acknowledgement exists (`inbox --claim`, `events --ack/--retry`, `reconcile`),
-  but `watch` still announces directly from derivation without taking a lease,
-  so a delivery lost after the ledger append relies on the next derivation to
-  re-announce it rather than on lease recovery.
-- **The 3-round cap is advice**, enforced only by the orchestrator playbook.
+  acknowledgement exists (`inbox --claim`, `events --ack/--retry`, `reconcile`).
+  `watch` reconciles pending events and takes a bounded announcement lease before it appends the wake ledger.
+  An announcement that never reached the harness can be retried after lease expiry; a delivered wake is not repeated while its event identity is unchanged.
 - **No `verify:` sanity check at scope submission.** Docket could warn when the first word
   of a discovered verification command is not resolvable in `sh`. It does not yet.
 - **Wake events are not authenticated.** A wake banner telling an agent to review and
@@ -1297,38 +1316,65 @@ Stated plainly so nobody assumes otherwise.
 
 ## Code map
 
-Everything lives in `skills/docket/bin/docket`, a single stdlib-only script.
+The CLI is the stdlib-only package `skills/docket/docket_cli/`, one module per region below.
+`skills/docket/bin/docket` is a short launcher that imports the package and calls `main()`.
+Python recompiles a script it runs directly on every call, and compiling the CLI cost most of each call, so the launcher imports the package from bytecode instead.
+That bytecode is checked against each module's source hash, so an edit never runs stale code, and it lives under `PYTHONPYCACHEPREFIX` when set, otherwise `~/.cache/docket/pycache` (`XDG_CACHE_HOME` moves it), never beside the package, so a checkout docket measures gains no `__pycache__`.
+The package finds its own files through `SKILL_DIR` and re-invokes itself through `LAUNCHER`, both in `common`.
 
-| Region | Contents |
+`docket_cli/__init__.py` lists the modules in `MODULES`, lowest first, and that order is the dependency order: a module imports only from modules listed before it, with explicit `from .module import name` lines and no import cycle.
+Every top-level name is defined in exactly one module, so the package is the one namespace the single-module CLI was, and a moved function keeps its source byte for byte.
+A helper several regions share sits in the lowest module that needs it, which is why `policy` and `state` hold readers the later regions call.
+`renderer_revision` walks that whole namespace through `package_namespace`, so its hashed function set does not depend on which module a helper lives in.
+`test_the_package_modules_import_in_one_order_from_the_stdlib_only` holds the order, the stdlib-only imports, the single definition of each name, and that the launcher imports every module.
+Tests that read the CLI's constants or source read every package module through `cli_source_text`, or the one file a pre-package build keeps its CLI in when `DOCKET_BIN` names one; `load_cli` loads either layout as one namespace.
+
+| Module | Contents |
 | --- | --- |
-| frontmatter | `parse`, `render`, `sections`, `is_empty` |
-| publication | `publish_bytes`, `publish`, `publish_json`, `fault`, `perturb` |
-| paths | `root`, `run_dir`, `need_run`, reports, decisions, scopes, and handoffs |
-| templates | `TEMPLATES` dict and `template()`, which honours per-project overrides |
-| evidence | `porcelain_records`, `dirty_paths`, `evidence_mode`, `assignment_evidence`, `legacy_evidence`, `root_changes`, `baseline_states`, `evidence_digest` |
-| roots | `root_identity`, `linked_worktrees`, `nested_checkouts`, `candidate_roots`, `build_root_records`, `declare_roots`, `read_roots`, `declared_roots`, `resolve_scope`, `split_qualified` |
-| baselines | `snapshot_assignment`, `require_baseline`, `capture_root_baseline`, `capture_untracked`, `discard_capture`, `path_state`, `index_entries`, `ensure_run_baseline`, `update_snapshot_scope` |
-| bundles | `private_git_env`, `private_git`, `prune_index`, `baseline_tree`, `source_tree`, `tree_patch`, `source_identity`, `frozen_baseline_root`, `freeze_task_bundle`, `publish_bundle`, `read_ledger`, `manifest_files`, `pinned_trees`, `tree_problems`, `bundle_problems`, `current_bundle`, `require_bundle`, `run_verification` |
-| dependencies | `provisional_policy`, `parse_deps`, `deps_record_bytes`, `read_deps`, `write_deps`, `dependency_problems`, `refreshed_inputs`, `withdrawn_readiness`, `provisional_dependencies`, `consumable_problems` |
-| submission | `submission_identity`, `drifted_inputs`, `cmd_submit` and `submit_locked` under `owner_lock` |
-| commands | task validation, discovery scope, handoff, report, review, diff, bundle, depend, and preflight |
-| gate | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
-| verification | `task_env`, `parse_framework_counts`, `run_verification` |
-| transitions | `owner_lock`, `owner_lock_held`, `transition_id`, `read_transition`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `guard_accepting_verdict`, `abandon_unpublished_transition`, `open_next_round`, `commit_transition`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
-| five-role | `routes_dir`, `blocked_route`, `route_blocked`, `is_five_role`, `plan_flag`, `correction_limit_of`, `verifier_correction_allowed`, `require_five_role`, `task_executor`, `submit_op_for`, `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `latest_verification`, `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction`, `cmd_route`, `cmd_migrate` |
-| prompts | `ROLE_CONTRACTS`, `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `select_cards`, `compose_prompt`, `cmd_prompt` |
-| feedback | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `user_profiles_dir`, `profile_path`, `cmd_feedback`, `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage`, `import_operational_feedback`, `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
-| dispatch | `task_depends_on`, `read_dispatch`, `round_dispatched`, `dispatch_dependencies_unmet`, `dispatch_ownership_problems`, `policy_models`, `max_concurrency_of`, `cmd_dispatch`, `write_checkpoint`, `resumable_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
-| amendments | `list_amendments`, `amendment_consumers`, `amendment_blocks`, `cmd_propose_amendment`, `cmd_amendment` |
-| packets | `task_coverage_row`, `packet_tokens`, `cmd_review_packet` |
-| metrics | `cmd_metrics`, `run_artifact_span` |
-| delivery | `workflow_of`, `reopen_epoch`, `derive_events`, `reviewer_verifier_events`, `review_scope_states`, `review_readiness_events`, `unfinished_decision`, `announce_delivered`, `now_s`, `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
-| batches | `batch_path`, `read_batch`, `list_batches`, `batch_ready`, `cmd_batch` |
-| health | `execution_health`, `latest_verify_text`, `list_incidents`, `plan_grace_seconds`, `cmd_health` |
-| qualified delivery | `paused_flag`, `input_active_flag`, `outbox_path`, `probe_boundary`, `claim_event`, `fixed_notice`, `cmd_delivery` |
-| signalling | `armed`, `ledger_for`, `delivered_keys`, `cmd_arm`, `cmd_disarm`, `events`, `cmd_watch`, `cmd_events` |
-| doctor | `cmd_doctor` |
-| playbooks | `references/*.md`, surfaced by `cmd_help` |
+| `common` | constants every module reads, `SKILL_DIR`, `LAUNCHER`, `die`, `stamp`, `now_s` |
+| `frontmatter` | `parse`, `render`, `sections`, `set_section`, `checkbox_items`, `is_empty`, `stated`, `unwrap_markdown` |
+| `paths` | `root`, `run_dir`, `next_numbered`, reports, decisions, scopes, handoffs, `owners`, `latest`, `planned_tasks`, `read_dispatch` |
+| `publication` | `publish_bytes`, `publish`, `publish_json`, `publish_exclusive`, `fault`, `perturb` |
+| `policy` | `need_run`, `run_policy`, `workflow_of`, `mode_of`, `artifact_policy_fields`, `is_five_role`, `plan_flag`, `authority_for`, `task_executor`, `submit_op_for`, `model_policy`, `max_concurrency_of` |
+| `evidence` | Git plumbing (`git_env`, `git_text`, `git_raw`), `porcelain_records`, `dirty_paths`, `index_entries`, `path_state` |
+| `roots` | `root_identity`, `linked_worktrees`, `nested_checkouts`, `candidate_roots`, `build_root_records`, `declare_roots`, `read_roots`, `declared_roots`, `resolve_scope`, `split_qualified` |
+| `baselines` | `snapshot_assignment`, `require_baseline`, `capture_root_baseline`, `capture_untracked`, `discard_capture`, `update_snapshot_scope`, `evidence_mode`, `root_changes`, `legacy_evidence`, `assignment_evidence`, `evidence_digest`, `task_verify` |
+| `bundles` | `private_git_env`, `private_git`, `prune_index`, `baseline_tree`, `source_tree`, `tree_patch`, `source_identity`, `read_ledger`, `manifest_files`, `pinned_trees`, `tree_problems`, `bundle_problems`, `latest_bundle`, `publish_bundle` |
+| `locks` | `owner_lock`, `owner_lock_held`, `run_lock` |
+| `state` | `state_of`, `handoff_state`, `scope_state`, `scope_collisions`, `read_transition`, `unfinished_decision`, `decide_as`, `reopen_epoch`, `armed`, `list_batches`, `list_incidents`, `latest_verification`, `derive_stage`, `task_depends_on`, `list_amendments` |
+| `profiles` | `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `normalized_model`, `model_aliases` |
+| `dependencies` | `provisional_policy`, `parse_deps`, `deps_record_bytes`, `read_deps`, `write_deps`, `dependency_problems`, `refreshed_inputs`, `withdrawn_readiness`, `provisional_dependencies`, `consumable_problems`, `pin_final_dependencies` |
+| `freeze` | `frozen_baseline_root`, `freeze_task_bundle`, `current_bundle` |
+| `aggregates` | `aggregate_bundle_problems`, `current_aggregate`, `require_aggregate`, `freeze_aggregate_bundle`, `stale_aggregate` |
+| `verification` | `task_env`, `parse_framework_counts`, `run_verification`, `execute_verify`, verify slots, `latest_reusable_verification`, `matching_verifications`, `current_round_digest` |
+| `templates` | `TEMPLATES` dict and `template()`, which honours per-project overrides |
+| `feedback` | `feedback_log_path`, `log_feedback`, `machine_feedback` |
+| `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
+| `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
+| `liveness` | session registrations, `dispatch_liveness`, `round_dispatched`, `live_dispatches`, `reconcile_dispatches`, `dispatch_dependencies_unmet` |
+| `five_role` | `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `blocked_route`, `route_blocked`, `cmd_route`, `cmd_escalate_mode` |
+| `batches` | `verification_fragment`, `batch_ready`, `frontier_ready`, `cmd_batch` |
+| `events` | `derive_events`, `reviewer_verifier_events`, `review_scope_states`, `review_readiness_events` |
+| `delivery` | `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `announce_delivered`, `paused_flag`, `claim_event`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
+| `signalling` | `ledger_for`, `delivered_keys`, `cmd_arm`, `cmd_disarm`, `cmd_watch`, `cmd_events` |
+| `health` | `execution_health`, `latest_verify_text`, `cmd_health` |
+| `gate` | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `placeholder_problems`, `task_intent_problems`, `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
+| `submission` | `submission_identity`, `drifted_inputs`, `cmd_submit` and `submit_locked` under `owner_lock` |
+| `amendments` | `amendment_consumers`, `amendment_blocks`, `cmd_propose_amendment`, `cmd_amendment` |
+| `transitions` | `transition_id`, `applied_steps`, `pending_payload`, `adopt_pending_payload`, `guard_accepting_verdict`, `abandon_unpublished_transition`, `open_next_round`, `commit_transition`, `decide_locked`, `cmd_decide`, `reopen_waived`, `reopen_finish`, `reopen_decide`, `reopen_collision_problems` |
+| `verifier` | `cmd_verify`, `interrupted_verifier_correction`, `finish_verifier_correction`, `open_verifier_correction` |
+| `qualification` | `worktree_identity`, `probe_boundary`, `fixed_notice`, `cmd_delivery_qualify`, `qualification_problems`, `cmd_delivery` |
+| `doctor` | `cmd_doctor` |
+| `playbooks` | `contracts_dir`, `load_contract`, `read_contract`, and `cmd_help`, which prints `references/*.md` |
+| `prompts` | `RENDERER_SOURCE_FUNCTIONS`, `package_namespace`, `renderer_revision`, `select_guidance`, `select_cards`, `compose_prompt`, `prompt_steps`, `cmd_prompt` |
+| `improvements` | `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
+| `suite` | `parse_suite_summary`, `parse_suite_streams`, `cmd_suite`, `resolve_suite_artifact`, `suite_problems` |
+| `metrics` | `cmd_metrics`, `run_artifact_span` |
+| `release` | `packet_staleness`, `integration_verification_problems`, `validate_frozen_release`, `frozen_bundle_view`, `cmd_release` |
+| `packets` | `task_coverage_row`, `packet_tokens`, `render_bounded_packet`, `render_final_packet`, `cmd_review_packet` |
+| `dispatch` | `capacity_lock`, `dispatch_ownership_problems`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
+| `commands` | task validation, discovery scope, handoff, set-model, status, diff, bundle, depend, roots, preflight, and migrate |
+| `cli` | the argument parser and `main` |
 
 Role playbooks live in `skills/docket/references/`. `SKILL.md` routes each role to the
 relevant playbook, while `docket help <role>` exposes the same installed files.
@@ -1339,8 +1385,11 @@ relevant playbook, while `docket help <role>` exposes the same installed files.
 tests/test.sh
 ```
 
-`tests/test.sh` runs every test in its own process from a shared work queue (`tests/parallel.py`), half the CPUs by default and `DOCKET_TEST_JOBS` to override, and prints exactly one unittest summary so `docket suite --qualify` reads it unchanged.
-`DOCKET_TEST_JOBS=1` runs the plain serial suite.
+`tests/test.sh` runs the suite in reusable worker processes fed from a shared work queue (`tests/parallel.py`), half the CPUs by default and `DOCKET_TEST_JOBS` to override, and prints exactly one unittest summary so `docket suite --qualify` reads it unchanged.
+Each worker imports the suite once and runs test after test, restoring the environment and working directory after each, so a test still never sees an earlier test's leftovers.
+`DOCKET_TEST_JOBS=1` runs every test in one worker, with the same deadline and output.
+A test that runs past `DOCKET_TEST_TIMEOUT` seconds (default 300) is reported as an error, its worker's process group is killed, and a fresh worker takes the rest of the queue; a worker that dies mid-test is reported the same way.
+Tests get a `TMPDIR` the runner owns and removes, so a killed test leaves no temporary files behind.
 The suite is also the `verify:` command of Docket's own runs, and a waiting supervisor pays for every minute of it, so its wall time is a token cost, not only a convenience.
 
 The Python behavioral suite uses a fresh temporary directory per test. It covers task
@@ -1385,13 +1434,12 @@ single rename that publishes a frozen bundle, and `transition:begin`,
 `transition:decision`, `transition:report`, `transition:next-round`, and
 `transition:complete` for each step of a decision and a waived-task reopen. This is a test seam and nothing else; no command sets it.
 
-`perturb()` is its companion, for the races an abort cannot show. A window between two
-adjacent reads is real but invisible from outside the process, so `DOCKET_PERTURB` holds
-`point=command` lines and runs the command synchronously at that point. The only
-boundary is `submit:before-freeze`, which is how the suite proves that a writer landing
-between the drift recheck and the freeze never reaches the frozen contract or the frozen
-consumed-input record. It is a test seam on the same terms: inert unless named, and no
-command sets it.
+`perturb()` is its companion for races an abort cannot show.
+`DOCKET_PERTURB` holds `point=command` lines and runs a command synchronously at a named boundary.
+`submit:before-freeze` lands a writer between the drift recheck and the freeze, proving that the frozen contract and consumed-input record still use the checked bytes.
+`dispatch:before-claim` lands a competing dispatch at the capacity check while the run-wide capacity lock serializes claims.
+`arm:before-publish` lands a competing arm while `watch_conf_lock` serializes the read-modify-write of `watch.conf`.
+Each perturb seam is inert unless named; no normal command sets it.
 
 **Add a test whenever you fix a bug.** The planner-wake bug shipped precisely because the
 planner signal path had never been exercised - the suite now asserts both directions and

@@ -5,8 +5,8 @@ are canonical in `references/` and available through `docket help <role>`.
 
 Essential invariant: `progress_updates: quiet` applies in split and combined
 topologies. Supervisors wait without model-driven polling and never narrate normal
-implementor lifecycle activity. A split planner receives only the aggregate
-orchestrator report. Use only Claude Code, Codex, or OpenCode; switch an OpenCode
+implementor lifecycle activity.
+Use only Claude Code, Codex, or OpenCode; switch an OpenCode
 model in the existing session with `Ctrl+X`, then `M` (or `/models`) before
 considering a restart, and verify the live model label instead of trusting
 `--model`. Claude Code accepts full model IDs and supports in-session `/model` and
@@ -55,7 +55,4 @@ to dispatch instead of recording a partial baseline. Changed paths are
 `<alias>:<path>` once a run has more than one root, work committed during a task
 still counts as changed, so does a mode-only or staging change on a path that was
 already dirty, and an unresolved, ambiguous, missing, or incompletely captured root
-blocks any claim of diff coverage instead of reporting an empty diff. Before
-replacing an implementor, require a ready standardized `docket handoff` checkpoint
-and have the replacement resume directly from it, the accepted scope capsule, and
-the task-local diff.
+blocks any claim of diff coverage instead of reporting an empty diff.

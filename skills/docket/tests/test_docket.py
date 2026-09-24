@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -21,6 +24,13 @@ from pathlib import Path
 # `DOCKET_BIN` points the suite at another build of the CLI. It exists so a change
 # can be demonstrated failing against the previous implementation before it ships.
 DOCKET = Path(os.environ.get("DOCKET_BIN") or Path(__file__).parents[1] / "bin" / "docket")
+# `bin/docket` only launches the CLI; its code lives in the `docket_cli` package beside
+# `bin/`. An earlier build keeps it in one `docket_cli.py`, and a build before that has
+# no module and is its own source. `CLI_FILES` is the whole CLI source in each layout.
+CLI_PACKAGE = DOCKET.resolve().parents[1] / "docket_cli"
+_CLI_MODULE = DOCKET.resolve().parents[1] / "docket_cli.py"
+CLI_FILES = (sorted(CLI_PACKAGE.glob("*.py")) if CLI_PACKAGE.is_dir()
+             else [_CLI_MODULE] if _CLI_MODULE.is_file() else [DOCKET])
 HOOK = Path(__file__).parents[1] / "hooks" / "wake.sh"
 # Variables a harness gives the commands it runs. A suite run inside a harness
 # strips them so docket never notes that harness's own session as a test role.
@@ -28,11 +38,76 @@ HARNESS_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CODEX_THREAD_ID", "CODEX
                "OPENCODE_PID", "OPENCODE")
 
 
+def cli_source_text() -> str:
+    """The CLI's whole source as one text, however the build lays it out."""
+    return "".join(path.read_text() for path in CLI_FILES)
+
+
+def cli_function_source(name: str) -> str:
+    """One top-level function's source, up to the next top-level def in its file."""
+    for path in CLI_FILES:
+        text = path.read_text()
+        start = text.find(f"\ndef {name}(")
+        if start != -1:
+            end = text.find("\ndef ", start + 1)
+            return text[start + 1:end if end != -1 else len(text)]
+    raise AssertionError(f"{name} not found in {CLI_FILES}")
+
+
+class _PackageView:
+    """A package build read as the one namespace the single-module CLI was.
+
+    A name is read from the module that holds it. Assigning one rebinds it in every
+    module that imported it, which is what patching the single module's global did.
+    """
+
+    def __init__(self, modules: tuple) -> None:  # type: ignore[type-arg]
+        object.__setattr__(self, "_modules", modules)
+
+    def __getattr__(self, name: str) -> object:
+        for module in self._modules:
+            if name in vars(module):
+                return vars(module)[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        holders = [module for module in self._modules if name in vars(module)]
+        if not holders:
+            raise AttributeError(name)
+        for module in holders:
+            setattr(module, name, value)
+
+
+def load_cli(name: str):  # type: ignore[no-untyped-def]
+    """The CLI under test as an importable namespace, without running main or caching it."""
+    # A bytecode cache would land beside the source, inside the checkout under test.
+    saved, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        if CLI_PACKAGE.is_dir():
+            for loaded in [key for key in sys.modules if key == name or key.startswith(name + ".")]:
+                del sys.modules[loaded]
+            spec = importlib.util.spec_from_file_location(
+                name, CLI_PACKAGE / "__init__.py", submodule_search_locations=[str(CLI_PACKAGE)])
+            assert spec is not None and spec.loader is not None
+            package = importlib.util.module_from_spec(spec)
+            sys.modules[name] = package
+            spec.loader.exec_module(package)
+            return _PackageView(package.MODULES)
+        loader = importlib.machinery.SourceFileLoader(name, str(CLI_FILES[0]))
+        spec = importlib.util.spec_from_loader(name, loader)
+        assert spec is not None
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+    finally:
+        sys.dont_write_bytecode = saved
+
+
 def _docket_constant(name: str) -> str:
     """Reference a constant from the CLI binary itself, not a duplicated literal."""
-    text = Path(DOCKET).read_text()
+    text = cli_source_text()
     match = re.search(rf"^{name}\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
-    assert match is not None, f"{name} not found in {DOCKET}"
+    assert match is not None, f"{name} not found in {CLI_FILES}"
     return match.group(1)
 
 
@@ -64,12 +139,32 @@ class DocketCLI(unittest.TestCase):
         self._feedback_tmp = tempfile.TemporaryDirectory()
         os.environ["DOCKET_FEEDBACK_LOG"] = str(Path(self._feedback_tmp.name) / "feedback.jsonl")
         self._harness_env = {k: os.environ.pop(k) for k in HARNESS_ENV if k in os.environ}
+        # A suite run inside a docket role session must never inherit that
+        # session's role or wake configuration. The wake hook reads
+        # DOCKET_ROLE to decide whether to wake, and DOCKET_WATCH_TIMEOUT for
+        # its default timeout, while docket watch reads DOCKET_WATCH_HOOK to
+        # choose its wake exit code. Tests that need a role set it explicitly
+        # in their subprocess env instead.
+        self._docket_role_env = {k: os.environ.pop(k) for k in (
+            "DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT") if k in os.environ}
+        # A suite run inside a herdr pane must never split, drive, or close the user's
+        # real panes; a test that needs panes installs `fake_herdr_panes` instead.
+        self._herdr_env = {k: os.environ.pop(k) for k in list(os.environ)
+                           if k.startswith("HERDR_")}
+        self._fake_herdr_path: str | None = None
         # Profiles the user adopted must never shape a test's prompts.
         self._profiles = os.environ.get("DOCKET_MODEL_PROFILES")
         os.environ["DOCKET_MODEL_PROFILES"] = str(Path(self._feedback_tmp.name) / "profiles")
 
     def tearDown(self) -> None:
+        if self._fake_herdr_path is not None:
+            os.environ["PATH"] = self._fake_herdr_path
+            os.environ.pop("HERDR_ENV", None)
+        os.environ.update(self._herdr_env)
         os.environ.update(self._harness_env)
+        for _key in ("DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT"):
+            os.environ.pop(_key, None)
+        os.environ.update(self._docket_role_env)
         if self._profiles is None:
             os.environ.pop("DOCKET_MODEL_PROFILES", None)
         else:
@@ -80,6 +175,34 @@ class DocketCLI(unittest.TestCase):
             os.environ["DOCKET_FEEDBACK_LOG"] = self._feedback_log
         self._feedback_tmp.cleanup()
         self.tmp.cleanup()
+
+    def fake_herdr_panes(self) -> None:
+        """Put a herdr on PATH whose one disposable pane runs, echoes, and closes.
+
+        Delivery qualification splits a real pane, runs a marker command in it, and
+        reads it back. Against the user's terminal that is a side effect, and under
+        load the read-back raced the pane and blocked the qualification.
+        """
+        fake = Path(self._feedback_tmp.name) / "herdr-bin"
+        fake.mkdir(exist_ok=True)
+        (fake / "herdr").write_text(
+            "#!/bin/sh\n"
+            "pane=\"$(dirname \"$0\")/pane\"\n"
+            "case \"$1 $2\" in\n"
+            "  'pane split') : >\"$pane\"; "
+            "echo '{\"result\": {\"pane\": {\"pane_id\": \"fake-1\"}}}'; exit 0 ;;\n"
+            "  'pane run') shift 3; sh -c \"$*\" >\"$pane\" 2>&1; exit 0 ;;\n"
+            "  'pane read') cat \"$pane\"; exit 0 ;;\n"
+            "  'pane close') rm -f \"$pane\"; exit 0 ;;\n"
+            "  'pane get') [ -e \"$pane\" ] && exit 0; echo 'error: pane_not_found'; exit 1 ;;\n"
+            "esac\n"
+            "[ \"$1\" = --version ] && echo 'herdr 9.9.9-fake' && exit 0\n"
+            "exit 1\n")
+        (fake / "herdr").chmod(0o755)
+        if self._fake_herdr_path is None:
+            self._fake_herdr_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{fake}{os.pathsep}{self._fake_herdr_path}"
+        os.environ["HERDR_ENV"] = "1"
 
     def assert_disposable(self, target: Path) -> Path:
         """Mechanically refuse to destroy anything outside this test's temp root.
@@ -517,6 +640,55 @@ class DocketCLI(unittest.TestCase):
         rejected = self.cli("submit", "demo", "T01", ok=False)
         self.assertIn("outside the task scope: outside.py", rejected.stderr)
 
+    def test_t07_generated_outside_scope_paths_get_cleanup_hint(self) -> None:
+        self.repo()
+        self.cli("init", "generated", "--mode", "standard", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "generated"
+        self.assign_simple_in(run, "generated", "T01")
+        generated = self.root / "src" / "__pycache__" / "sample.pyc"
+        generated.parent.mkdir()
+        generated.write_bytes(b"sample bytecode")
+        loose_pyc = self.root / "build" / "loose.pyc"
+        loose_pyc.parent.mkdir()
+        loose_pyc.write_bytes(b"loose bytecode")
+        module = self.root / "node_modules" / "package" / "index.js"
+        module.parent.mkdir(parents=True)
+        module.write_text("export default 1;\n")
+        ordinary = self.root / "notes.txt"
+        ordinary.write_text("retain this note\n")
+        diff = self.cli("diff", "generated", "T01").stdout
+        self.assertIn("[OUTSIDE SCOPE] src/__pycache__/sample.pyc", diff)
+        self.assertIn("[OUTSIDE SCOPE] build/loose.pyc", diff)
+        self.assertIn("[OUTSIDE SCOPE] node_modules/package/index.js", diff)
+        self.assertIn("[OUTSIDE SCOPE] notes.txt", diff)
+        self.assertIn("Ignore them if disposable, or delete only files you created", diff)
+        self.assertIn("src/__pycache__/sample.pyc", diff)
+        self.assertNotIn("notes.txt", diff.split("Generated-looking path(s):", 1)[1])
+        self.fill_task_report(run / "T01-report-01.mdx")
+        refused = self.cli("submit", "generated", "T01", "--as", "implementor", ok=False)
+        self.assertIn("outside the task scope", refused.stderr)
+        self.assertIn("Ignore them if disposable, or delete only files you created", refused.stderr)
+        self.assertEqual(b"sample bytecode", generated.read_bytes())
+        self.assertEqual(b"loose bytecode", loose_pyc.read_bytes())
+        self.assertEqual("export default 1;\n", module.read_text())
+        self.assertEqual("retain this note\n", ordinary.read_text())
+
+    def test_t07_submit_hint_for_generated_outside_scope_path(self) -> None:
+        self.repo()
+        self.cli("init", "generatedgate", "--mode", "standard", "--evidence-mode", "git")
+        run = self.root / ".docket" / "runs" / "generatedgate"
+        self.assign_simple_in(run, "generatedgate", "T01")
+        generated = self.root / "node_modules" / "package" / "index.js"
+        generated.parent.mkdir(parents=True)
+        generated.write_text("export default 2;\n")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        refused = self.cli("submit", "generatedgate", "T01", "--as", "implementor",
+                           ok=False)
+        self.assertIn("outside the task scope: node_modules/package/index.js", refused.stderr)
+        self.assertIn("Ignore them if disposable, or delete only files you created", refused.stderr)
+        self.assertEqual("export default 2;\n", generated.read_text())
+        self.assertIn("status: draft", (run / "T01-report-01.mdx").read_text())
+
     def test_preflight_records_a_failing_baseline_without_failing_the_command(self) -> None:
         self.init()
         self.cli(
@@ -530,6 +702,437 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("failing (exit 7)", result.stdout)
         baseline = self.root / ".docket" / "runs" / "demo" / ".baselines" / "T01.json"
         self.assertIn('"returncode": 7', baseline.read_text())
+
+    def test_t13_verify_slot_refuses_a_second_preflight_and_releases(self) -> None:
+        """A live preflight owns the slot until its gated command and result finish."""
+        run = self.init(evidence_mode="documents-only")
+        gate = Path(self._feedback_tmp.name) / "t13-slot-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-slot-shell.pid"
+        gate.unlink(missing_ok=True)
+        shell_pid.unlink(missing_ok=True)
+        command = self._gated_command(gate, shell_pid)
+        self.cli(
+            "assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", command, "--verify-timeout", "120",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        metadata = run / ".locks" / "T01.verify.json"
+        metadata.unlink(missing_ok=True)
+        first = subprocess.Popen(
+            [sys.executable, str(DOCKET), "preflight", "demo", "T01"],
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(metadata.is_file())
+            self.assertTrue(shell_pid.is_file())
+            self.assertTrue(self._pid_alive(int(shell_pid.read_text())))
+            info = json.loads(metadata.read_text())
+            second = self.cli("preflight", "demo", "T01", ok=False)
+            self.assertIn(f"pid {info['pid']}", second.stderr)
+            self.assertIn(command, second.stderr)
+            self.assertNotIn("running baseline verify", second.stdout)
+            gate.touch()
+            first_out, first_err = first.communicate(timeout=30)
+        finally:
+            gate.touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+            if shell_pid.is_file() and self._pid_alive(int(shell_pid.read_text())):
+                try:
+                    os.kill(int(shell_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertEqual(0, first.returncode, first_err)
+        self.assertIn("baseline recorded: passing", first_out)
+        self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+
+    def test_t13_signals_end_the_whole_verify_process_group(self) -> None:
+        """TERM, HUP, and INT stop the command tree before docket leaves."""
+        run = self.init(evidence_mode="documents-only")
+        gate = Path(self._feedback_tmp.name) / "t13-signal-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-signal-shell.pid"
+        child_pid = Path(self._feedback_tmp.name) / "t13-signal-child.pid"
+        command = self._gated_command(gate, shell_pid, child_pid)
+        self.cli(
+            "assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", command, "--verify-timeout", "120",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=sig.name):
+                gate.unlink(missing_ok=True)
+                shell_pid.unlink(missing_ok=True)
+                child_pid.unlink(missing_ok=True)
+                metadata = run / ".locks" / "T01.verify.json"
+                metadata.unlink(missing_ok=True)
+                proc = subprocess.Popen(
+                    [sys.executable, str(DOCKET), "preflight", "demo", "T01"],
+                    cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                shell = 0
+                child = 0
+                try:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and (
+                        not metadata.is_file() or not shell_pid.is_file() or not child_pid.is_file()
+                    ):
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(metadata.is_file())
+                    self.assertTrue(shell_pid.is_file())
+                    self.assertTrue(child_pid.is_file())
+                    shell = int(shell_pid.read_text())
+                    child = int(child_pid.read_text())
+                    self.assertTrue(self._pid_alive(child))
+                    proc.send_signal(sig)
+                    proc.communicate(timeout=10)
+                    deadline = time.monotonic() + 30
+                    while self._pid_alive(child) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertFalse(self._pid_alive(child), "the verify process group outlived docket")
+                finally:
+                    gate.touch()
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate(timeout=5)
+                    for pid in (child, shell):
+                        if pid and self._pid_alive(pid):
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    self._kill_pid_file(shell_pid)
+                    self._kill_pid_file(child_pid)
+
+    def test_t13_sigkill_keeps_the_slot_until_the_command_ends(self) -> None:
+        """A killed docket cannot release a slot its gated verify child still owns."""
+        run = self.init(evidence_mode="documents-only")
+        gate = Path(self._feedback_tmp.name) / "t13-sigkill-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-sigkill-shell.pid"
+        child_pid = Path(self._feedback_tmp.name) / "t13-sigkill-child.pid"
+        gate.unlink(missing_ok=True)
+        shell_pid.unlink(missing_ok=True)
+        child_pid.unlink(missing_ok=True)
+        command = self._gated_command(gate, shell_pid, child_pid)
+        self.cli(
+            "assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", command, "--verify-timeout", "120",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        metadata = run / ".locks" / "T01.verify.json"
+        metadata.unlink(missing_ok=True)
+        first = subprocess.Popen(
+            [sys.executable, str(DOCKET), "preflight", "demo", "T01"],
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        shell = 0
+        child = 0
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and (
+                not metadata.is_file() or not shell_pid.is_file() or not child_pid.is_file()
+            ):
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(metadata.is_file())
+            self.assertTrue(shell_pid.is_file())
+            self.assertTrue(child_pid.is_file())
+            shell = int(shell_pid.read_text())
+            child = int(child_pid.read_text())
+            self.assertTrue(self._pid_alive(shell))
+            self.assertTrue(self._pid_alive(child))
+            first.kill()
+            first.communicate(timeout=5)
+            self.assertTrue(self._pid_alive(shell))
+            self.assertTrue(self._pid_alive(child))
+            second = self.cli("preflight", "demo", "T01", ok=False)
+            self.assertIn(f"pid {first.pid}", second.stderr)
+            self.assertIn(command, second.stderr)
+            self.assertTrue(self._pid_alive(child))
+            gate.touch()
+            deadline = time.monotonic() + 30
+            while (self._pid_alive(shell) or self._pid_alive(child)) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(self._pid_alive(shell))
+            self.assertFalse(self._pid_alive(child))
+            self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+        finally:
+            gate.touch()
+            if first.poll() is None:
+                first.kill()
+                first.communicate(timeout=5)
+            for pid in (child, shell):
+                if pid and self._pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            self._kill_pid_file(shell_pid)
+            self._kill_pid_file(child_pid)
+
+    def test_t13_submit_refuses_a_running_preflight_slot(self) -> None:
+        """Submit cannot start a second verify while preflight owns the slot."""
+        run = self.init(evidence_mode="documents-only")
+        gate = Path(self._feedback_tmp.name) / "t13-submit-preflight-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-submit-preflight-shell.pid"
+        gate.unlink(missing_ok=True)
+        shell_pid.unlink(missing_ok=True)
+        command = self._gated_command(gate, shell_pid)
+        self.cli(
+            "assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", command, "--verify-timeout", "120",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        metadata = run / ".locks" / "T01.verify.json"
+        metadata.unlink(missing_ok=True)
+        first = subprocess.Popen(
+            [sys.executable, str(DOCKET), "preflight", "demo", "T01"],
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(metadata.is_file())
+            self.assertTrue(shell_pid.is_file())
+            self.assertTrue(self._pid_alive(int(shell_pid.read_text())))
+            info = json.loads(metadata.read_text())
+            refused = self.cli("submit", "demo", "T01", "--as", "implementor", ok=False)
+            self.assertIn(f"pid {info['pid']}", refused.stderr)
+            self.assertIn(command, refused.stderr)
+            gate.touch()
+            first_out, first_err = first.communicate(timeout=30)
+        finally:
+            gate.touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+            if shell_pid.is_file() and self._pid_alive(int(shell_pid.read_text())):
+                try:
+                    os.kill(int(shell_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertEqual(0, first.returncode, first_err)
+        self.assertIn("baseline recorded: passing", first_out)
+        self.assertEqual("draft", parse_meta(run / "T01-report-01.mdx")["status"])
+        self.assertEqual([], self.ledger())
+        self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+
+    def test_t13_second_submit_refuses_a_live_verify_slot(self) -> None:
+        """A second submit is refused while the first submit's verify runs."""
+        run = self.init(evidence_mode="documents-only")
+        gate = Path(self._feedback_tmp.name) / "t13-submit-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-submit-shell.pid"
+        gate.unlink(missing_ok=True)
+        shell_pid.unlink(missing_ok=True)
+        command = self._gated_command(gate, shell_pid)
+        self.cli(
+            "assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+            "--verify", command, "--verify-timeout", "120",
+        )
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        metadata = run / ".locks" / "T01.verify.json"
+        metadata.unlink(missing_ok=True)
+        first = subprocess.Popen(
+            [sys.executable, str(DOCKET), "submit", "demo", "T01", "--as", "implementor"],
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(metadata.is_file())
+            self.assertTrue(shell_pid.is_file())
+            self.assertTrue(self._pid_alive(int(shell_pid.read_text())))
+            info = json.loads(metadata.read_text())
+            second = self.cli("submit", "demo", "T01", "--as", "implementor", ok=False)
+            self.assertIn(f"pid {info['pid']}", second.stderr)
+            self.assertIn(command, second.stderr)
+            self.assertIn("reports stay draft until submit", second.stderr)
+            gate.touch()
+            first_out, first_err = first.communicate(timeout=30)
+        finally:
+            gate.touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+            if shell_pid.is_file() and self._pid_alive(int(shell_pid.read_text())):
+                try:
+                    os.kill(int(shell_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertEqual(0, first.returncode, first_err)
+        self.assertIn("frozen task-round bundle", first_out)
+        self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            with open(f"/proc/{pid}/stat") as fh:
+                return fh.read().split()[2] != "Z"
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+
+    @staticmethod
+    def _kill_pid_file(path: Path) -> None:
+        try:
+            pid = int(path.read_text().strip().splitlines()[0])
+        except (OSError, ValueError, IndexError):
+            return
+        if DocketCLI._pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    @staticmethod
+    def _gated_command(gate: Path, shell_pid: Path, child_pid: Path | None = None) -> str:
+        gate_text = shlex.quote(str(gate))
+        shell_text = shlex.quote(str(shell_pid))
+        prefix = f"printf '%s\\n' \"$$\" > {shell_text}; "
+        loop = f"while [ ! -f {gate_text} ]; do sleep 0.05; done"
+        if child_pid is None:
+            return prefix + loop + "; printf ok"
+        return prefix + f"(while [ ! -f {gate_text} ]; do sleep 0.05; done) & " \
+            f"echo $! > {shlex.quote(str(child_pid))}; wait"
+
+    def test_t13_re_review_refuses_a_running_preflight_slot(self) -> None:
+        """Changed-evidence re-review cannot bypass a live verify slot."""
+        run = self.init(evidence_mode="documents-only")
+        self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        report = run / "T01-report-01.mdx"
+        self.fill_task_report(report)
+        self.cli("submit", "demo", "T01")
+        report.write_text(report.read_text().replace(
+            "Implemented the feature and verified its behavior.",
+            "Reimplemented the feature and verified its behavior.",
+        ))
+        gate = Path(self._feedback_tmp.name) / "t13-rereview-gate"
+        shell_pid = Path(self._feedback_tmp.name) / "t13-rereview-shell.pid"
+        gate.unlink(missing_ok=True)
+        shell_pid.unlink(missing_ok=True)
+        command = self._gated_command(gate, shell_pid)
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace("verify: printf \"T01 ok\\n\"", f"verify: {command}"))
+        metadata = run / ".locks" / "T01.verify.json"
+        metadata.unlink(missing_ok=True)
+        first = subprocess.Popen(
+            [sys.executable, str(DOCKET), "preflight", "demo", "T01"],
+            cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+                if first.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(metadata.is_file())
+            self.assertTrue(shell_pid.is_file())
+            self.assertTrue(self._pid_alive(int(shell_pid.read_text())))
+            info = json.loads(metadata.read_text())
+            refused = self.cli("decide", "demo", "T01", "--approve", "--re-review", ok=False)
+            self.assertIn(f"pid {info['pid']}", refused.stdout + refused.stderr)
+            self.assertIn(command, refused.stdout + refused.stderr)
+            gate.touch()
+            first_out, first_err = first.communicate(timeout=30)
+        finally:
+            gate.touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+            if shell_pid.is_file() and self._pid_alive(int(shell_pid.read_text())):
+                try:
+                    os.kill(int(shell_pid.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.assertEqual(0, first.returncode, first_err)
+        self.assertIn("running baseline verify:", first_out)
+        self.assertEqual("submitted", parse_meta(report)["status"])
+        self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+
+    def test_t13_preflight_reuses_only_matching_frozen_evidence(self) -> None:
+        """Each mismatch changes one identity dimension from a reusable baseline."""
+        self.repo()
+        source = self.root / "src" / "b.py"
+        source_original = "second = 1\n"
+        source.write_text(source_original)
+        self.git("add", "src/b.py")
+        self.git("commit", "-qm", "second file")
+        counter = Path(self._feedback_tmp.name) / "preflight-counter"
+        command = f"printf x >> {shlex.quote(str(counter))}; printf ok"
+        run = self.init(evidence_mode="git")
+        self.assign_with_verify("T01", command, file="src/a.py", executor="implementor")
+        t01 = run / "T01-task.mdx"
+        t01.write_text(t01.read_text().replace("env: \n", "env: T13_INPUT=one\n"))
+        self.fill_task(t01)
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        digest = self.frozen("T01")[0]["digest"]
+        self.assign_with_verify("T02", command, file="src/b.py", executor="implementor")
+        task = run / "T02-task.mdx"
+        task.write_text(task.read_text().replace("env: \n", "env: T13_INPUT=one\n"))
+        self.fill_task(task)
+
+        reused = self.cli("preflight", "demo", "T02")
+        baseline = json.loads((run / ".baselines" / "T02.json").read_text())
+        self.assertEqual("x", counter.read_text())
+        self.assertIn(f"reused bundle {digest}", reused.stdout)
+        self.assertEqual(digest, baseline["reused_bundle"])
+        self.assertEqual("T01", baseline["reused_owner"])
+        self.assertNotIn("running baseline verify", reused.stdout)
+
+        source.write_text("second = 2\n")
+        changed_source = self.cli("preflight", "demo", "T02")
+        self.assertEqual("xx", counter.read_text())
+        self.assertIn("running baseline verify", changed_source.stdout)
+
+        source.write_text(source_original)
+        restored = self.cli("preflight", "demo", "T02")
+        self.assertEqual("xx", counter.read_text())
+        self.assertIn(f"reused bundle {digest}", restored.stdout)
+
+        changed_command = f"printf y >> {shlex.quote(str(counter))}; printf changed"
+        task.write_text(task.read_text().replace(f"verify: {command}", f"verify: {changed_command}"))
+        changed = self.cli("preflight", "demo", "T02")
+        self.assertEqual("xxy", counter.read_text())
+        self.assertIn("running baseline verify", changed.stdout)
+
+        task.write_text(task.read_text().replace(f"verify: {changed_command}", f"verify: {command}"))
+        restored_command = self.cli("preflight", "demo", "T02")
+        self.assertEqual("xxy", counter.read_text())
+        self.assertIn(f"reused bundle {digest}", restored_command.stdout)
+
+        task.write_text(task.read_text().replace("env: T13_INPUT=one\n", "env: T13_INPUT=two\n"))
+        changed_env = self.cli("preflight", "demo", "T02")
+        self.assertEqual("xxyx", counter.read_text())
+        self.assertIn("running baseline verify", changed_env.stdout)
 
     def test_concurrent_watchers_atomically_claim_one_role_event(self) -> None:
         self.init()
@@ -587,6 +1190,29 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(2, orchestrator.returncode)
         self.assertIn("review batch ready", orchestrator.stderr)
         self.assertIn("Process normal review batches silently", orchestrator.stderr)
+
+    def test_test_environment_strips_role_and_wake_config(self) -> None:
+        """Regression: no test inherits the caller's role or wake configuration.
+
+        setUp strips DOCKET_ROLE, DOCKET_WATCH_HOOK, and DOCKET_WATCH_TIMEOUT
+        from the test process, so the suite passes from inside any docket role
+        session. The child below replays the wake-hook test with all three set,
+        the way an orchestrator session exports them; without the strip the
+        unscoped hook run wakes and the child fails.
+        """
+        for key in ("DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT"):
+            self.assertNotIn(key, os.environ)
+        env = dict(os.environ, DOCKET_ROLE="orchestrator", DOCKET_WATCH_HOOK="1",
+                   DOCKET_WATCH_TIMEOUT="8h", DOCKET_BIN=str(DOCKET))
+        env["PYTHONPYCACHEPREFIX"] = str(Path(self._feedback_tmp.name) / "child-pycache")
+        proc = subprocess.run(
+            [sys.executable, "-m", "unittest",
+             "test_docket.DocketCLI.test_wake_hook_requires_and_respects_session_role"],
+            cwd=str(Path(__file__).parent), text=True, capture_output=True,
+            env=env, timeout=120,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr[-2000:])
+        self.assertIn("OK", proc.stderr)
 
     def test_a_failing_hook_launcher_never_reads_as_a_wake(self) -> None:
         """Regression: uv and argparse exit 2 on their own errors, and 2 means wake.
@@ -5691,7 +6317,7 @@ class DocketCLI(unittest.TestCase):
         for r in refused:
             self.assertIn("concurrency", r.stderr)
             self.assertIn("1/1", r.stderr)
-        text = Path(DOCKET).read_text()
+        text = cli_source_text()
         self.assertIn("capacity_lock", text)
         self.assertIn("read-check-write", text)
         self.assertIn("run-wide capacity", text)
@@ -6131,15 +6757,8 @@ class DocketCLI(unittest.TestCase):
 
     def docket_mod(self):  # type: ignore[no-untyped-def]
         """The CLI binary as an importable module, cached per test."""
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
         if getattr(self, "_docket_mod", None) is None:
-            _loader = _SFL("docket_test_mod", str(DOCKET))
-            _spec = _ilu.spec_from_loader("docket_test_mod", _loader)
-            assert _spec is not None
-            _mod = _ilu.module_from_spec(_spec)
-            _loader.exec_module(_mod)
-            self._docket_mod = _mod
+            self._docket_mod = load_cli("docket_test_mod")
         return self._docket_mod
 
     def test_aggregate_retry_safety(self) -> None:
@@ -6480,6 +7099,19 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual("blocked", record["status"])
         self.assertEqual("no-actionable-event", record["blocked_capability"])
 
+    def test_a_test_never_reaches_the_users_herdr(self) -> None:
+        """Regression: release tests split and drove panes in the terminal running the suite.
+
+        Under load the real pane's read-back raced its output and blocked the delivery
+        qualification the release tests need, so they failed only on a busy machine.
+        """
+        self.assertEqual([], sorted(k for k in os.environ if k.startswith("HERDR_")))
+        self.fake_herdr_panes()
+        self.assertEqual("1", os.environ["HERDR_ENV"])
+        herdr = shutil.which("herdr")
+        self.assertIsNotNone(herdr)
+        self.assertTrue(str(herdr).startswith(self._feedback_tmp.name), herdr)
+
     def test_qualify_blocks_when_pane_lifecycle_unavailable(self) -> None:
         """Without herdr panes, qualification names the unavailable capability."""
         run = self.init("split", evidence_mode="documents-only")
@@ -6525,13 +7157,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_worktree_identity_preserves_paths_and_types(self) -> None:
         """Untracked renames, modes, symlinks, and odd names all move the identity."""
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
-        _loader = _SFL("docket_mod3", str(DOCKET))
-        _spec = _ilu.spec_from_loader("docket_mod3", _loader)
-        assert _spec is not None
-        mod = _ilu.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_mod3")
         repo = self.repo(self.root / "idrepo")
         ident = lambda: mod.worktree_identity(cwd=repo)
         base = ident()
@@ -6702,6 +7328,7 @@ class DocketCLI(unittest.TestCase):
 
     def release_setup(self, run: Path) -> None:
         """Pane qualification and a green suite artifact."""
+        self.fake_herdr_panes()
         qualified = self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
         self.assertEqual(0, qualified.returncode)
         self.qualify_suite(run)
@@ -6874,13 +7501,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_suite_problems_rejects_tampering(self) -> None:
         """Edited commands, times, trees, and outputs fail validation with reasons."""
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
-        _loader = _SFL("docket_suite_mod", str(DOCKET))
-        _spec = _ilu.spec_from_loader("docket_suite_mod", _loader)
-        assert _spec is not None
-        mod = _ilu.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_suite_mod")
         run = self.init("split", evidence_mode="documents-only")
         artifact = self.qualify_suite(run)
         base = json.loads(artifact.read_text())
@@ -6953,13 +7574,7 @@ class DocketCLI(unittest.TestCase):
         self.assertNotEqual(0, contra.returncode)
         self.assertIn("contradictory", contra.stderr)
         # Tampered stderr is damaged, not silently trusted.
-        import importlib.util as _ilu2
-        from importlib.machinery import SourceFileLoader as _SFL2
-        _loader = _SFL2("docket_suite_stderr_mod", str(DOCKET))
-        _spec = _ilu2.spec_from_loader("docket_suite_stderr_mod", _loader)
-        assert _spec is not None
-        mod = _ilu2.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_suite_stderr_mod")
         err_path = arts[-1].parent / record["stderr_file"]
         saved = err_path.read_bytes()
         err_path.write_bytes(saved + b"tamper")
@@ -7095,13 +7710,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_unknown_source_identities_are_unqualified_and_block_release(self) -> None:
         """Equal-unknown and SHA-versus-unknown sources never support release."""
-        import importlib.util as _ilu3
-        from importlib.machinery import SourceFileLoader as _SFL3
-        _loader = _SFL3("docket_unknown_mod", str(DOCKET))
-        _spec = _ilu3.spec_from_loader("docket_unknown_mod", _loader)
-        assert _spec is not None
-        mod = _ilu3.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_unknown_mod")
         # Suite artifacts frozen outside git bind equal unknown trees and are
         # honest diagnostics, but they are unqualified release evidence.
         run = self.init("split", evidence_mode="documents-only")
@@ -7171,13 +7780,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_resolve_suite_artifact_missing_and_multiple(self) -> None:
         """Resolution names absence and ambiguity instead of guessing."""
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
-        _loader = _SFL("docket_suite_mod2", str(DOCKET))
-        _spec = _ilu.spec_from_loader("docket_suite_mod2", _loader)
-        assert _spec is not None
-        mod = _ilu.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_suite_mod2")
         run = self.init("split", evidence_mode="documents-only")
         missing, problems = mod.resolve_suite_artifact(run, "")
         self.assertIsNone(missing)
@@ -7197,13 +7800,7 @@ class DocketCLI(unittest.TestCase):
         self.submit_orch_verified(run)
         orch_entries = json.loads((run / ".bundles" / "orch" / "rounds.json").read_text())["entries"]
         bdir = run / ".bundles" / "orch" / orch_entries[-1]["dir"]
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
-        _loader = _SFL("docket_mod", str(DOCKET))
-        _spec = _ilu.spec_from_loader("docket_mod", _loader)
-        assert _spec is not None
-        mod = _ilu.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_mod")
         manifest = json.loads((bdir / "bundle.json").read_text())
         manifest["verification"] = dict(manifest["verification"], status="failed")
         failing = mod.integration_verification_problems(run, orch_entries[-1], manifest)
@@ -7392,6 +7989,7 @@ class DocketCLI(unittest.TestCase):
         (self.root / "src" / "a.py").write_text("allowed = 2\n")
         self.fill_task_report(run / "T01-report-01.mdx")
         self.cli("submit", "demo", "T01")
+        self.fake_herdr_panes()
         self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
         self.qualify_suite(run)
         self.cli("decide", "demo", "T01", "--approve")
@@ -7422,6 +8020,7 @@ class DocketCLI(unittest.TestCase):
         self.repo()
         run = self.init("split", evidence_mode="documents-only")
         self.submit_simple(run, "T01")
+        self.fake_herdr_panes()
         self.cli("delivery", "demo", "--role", "orchestrator", "--qualify")
         self.qualify_suite(run)
         (self.root / "src" / "a.py").write_text("allowed = 999\n")
@@ -7628,13 +8227,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_installation_state_reports_not_installed(self) -> None:
         """The installation check names absence instead of assuming setup."""
-        import importlib.util as _ilu
-        from importlib.machinery import SourceFileLoader as _SFL
-        _loader = _SFL("docket_mod2", str(DOCKET))
-        _spec = _ilu.spec_from_loader("docket_mod2", _loader)
-        assert _spec is not None
-        mod = _ilu.module_from_spec(_spec)
-        _loader.exec_module(mod)
+        mod = load_cli("docket_mod2")
         saved_home = os.environ.get("HOME", "")
         os.environ["HOME"] = str(self.root / "nohome")
         try:
@@ -8347,6 +8940,46 @@ class DocketCLI(unittest.TestCase):
         arch = (repo / "ARCHITECTURE.md").read_text()
         self.assertIn("at-least-once", arch)
 
+    def test_t09_architecture_records_the_shipped_evidence_rules(self) -> None:
+        """The maintainer guide names the evidence boundaries the CLI implements."""
+        repo = Path(__file__).resolve().parents[3]
+        arch = (repo / "ARCHITECTURE.md").read_text()
+        for phrase in (
+            "verify floor", "GIT_FIXED_CONFIG", "GIT_OPTIONAL_LOCKS",
+            "retain_tree_objects", "qualification_sandbox", ".reopens/<owner>.json",
+            "PRIVATE_STATE_DIRS", "only `met`", "arm:before-publish",
+            "dispatch:before-claim", "submit:before-freeze",
+        ):
+            self.assertIn(phrase, arch, phrase)
+
+    def test_t09_agent_and_guides_reject_obsolete_instructions(self) -> None:
+        """Stale watcher, budget, and replacement instructions stay removed."""
+        repo = Path(__file__).resolve().parents[3]
+        arch = (repo / "ARCHITECTURE.md").read_text()
+        current = (repo / "docs" / "docket-current-system.mdx").read_text()
+        html = (repo / "docs" / "docket-architecture.html").read_text()
+        for path, content in (("ARCHITECTURE.md", arch),
+                              ("docs/docket-current-system.mdx", current),
+                              ("docs/docket-architecture.html", html)):
+            self.assertNotIn("round cap is advice", content, path)
+            self.assertNotIn("3-round cap is playbook advice", content, path)
+            self.assertNotIn("watch still announces directly from derivation", content, path)
+            self.assertNotIn("direct watcher announcement does not claim an inbox lease",
+                             content, path)
+        skill_agents = (repo / "skills" / "docket" / "AGENTS.md").read_text()
+        self.assertNotIn("A split planner receives only the aggregate", skill_agents)
+        self.assertNotIn("Before\nreplacing an implementor, require a ready", skill_agents)
+        self.assertNotIn("No <code>verify:</code> sanity check at scope submit", html)
+
+    def test_t09_sync_recipe_excludes_bytecode(self) -> None:
+        """The repository's installed-copy recipe cannot copy generated bytecode."""
+        repo = Path(__file__).resolve().parents[3]
+        agents = (repo / "AGENTS.md").read_text()
+        self.assertIn("rsync -a", agents)
+        self.assertIn("--exclude='__pycache__/'", agents)
+        self.assertIn("--exclude='*.pyc'", agents)
+        self.assertNotIn("cp -r ~/Documents/Projects/docket/skills/docket/.", agents)
+
     def test_the_docs_arm_every_role_the_default_preset_waits_on(self) -> None:
         """Regression: no doc told anyone to arm the quick checker, so it was never woken."""
         repo = Path(DOCKET).parents[3]
@@ -8366,7 +8999,7 @@ class DocketCLI(unittest.TestCase):
         skill = (self._skill_root() / "SKILL.md").read_text()
         self.assertIn("docket help", skill)
         self.assertIn("references/", skill)
-        self.assertLess(len(skill.splitlines()), 120,
+        self.assertLess(len(skill.splitlines()), 136,
                         f"SKILL.md is still a protocol duplicate at {len(skill.splitlines())} lines")
         self.assertNotIn("docket dispatch <run> T03 --session", skill)
         self.assertNotIn("One owner submits at a time", skill)
@@ -9167,6 +9800,95 @@ class DocketCLI(unittest.TestCase):
             for needle in needles:
                 self.assertIn(needle, text, f"{path} does not document {needle}")
 
+    def test_t12_standard_preset_documents_and_renders_two_window_layout(self) -> None:
+        """Standard windows share exact herdr steps in docs and help; prompts carry none; quick is still."""
+        split_reviewer = ('herdr pane split --current --direction right --ratio 0.5 '
+                          '--cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id')
+        start_reviewer = 'herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto'
+        new_tab = 'herdr tab create --cwd "$PWD" --no-focus'
+        split_impl = ('herdr pane split --current --direction right --ratio 0.5 '
+                      '--cwd "$PWD" --no-focus   # JSON: result.pane.pane_id')
+        split_verifier = ('herdr pane split --current --direction down --ratio 0.5 '
+                          '--cwd "$PWD" --env DOCKET_ROLE=verifier --no-focus   # JSON: result.pane.pane_id')
+        start_verifier = 'herdr agent start verifier --kind opencode --pane <pane_id> -- --auto'
+        layout = (split_reviewer, start_reviewer, new_tab,
+                  split_impl, split_verifier, start_verifier)
+        skill = self._skill_root() / "SKILL.md"
+        planner_ref = self._skill_root() / "references" / "planner.md"
+        orch_ref = self._skill_root() / "references" / "orchestrator.md"
+        for path in (skill, planner_ref, orch_ref):
+            text = path.read_text()
+            for command in layout:
+                self.assertIn(command, text, f"{path} misses {command[:48]}")
+            self.assertNotIn("\u2014", text, f"em dash in {path}")
+        self.assertIn("1:1 vertical split", planner_ref.read_text())
+        self.assertIn("1:1 vertical split", skill.read_text())
+        self.assertIn("down in half", orch_ref.read_text())
+        self.assertIn("Only the planner starts the reviewer", planner_ref.read_text())
+        self.assertIn("Only the orchestrator starts the verifier", orch_ref.read_text())
+        # Help renders the same bytes: fences survive unwrapping.
+        orch_help = self.cli("help", "orchestrator").stdout
+        planner_help = self.cli("help", "planner").stdout
+        for command in layout:
+            self.assertIn(command, orch_help, f"help orchestrator misses {command[:48]}")
+            self.assertIn(command, planner_help, f"help planner misses {command[:48]}")
+        # The generic quick dispatch snippet is untouched.
+        self.assertIn('herdr pane split --current --direction right --cwd "$PWD" --no-focus',
+                      skill.read_text())
+        self.cli("init", "t12std", "--mode", "standard",
+                 "--evidence-mode", "documents-only")
+        std = self.root / ".docket" / "runs" / "t12std"
+        self.assign_simple_in(std, "t12std", "T01")
+        for role in ("implementor", "orchestrator", "planner"):
+            prompt = self.prompt_text_in("t12std", "T01", role)
+            for command in layout:
+                self.assertNotIn(command, prompt, f"{role} task prompt carries layout")
+        aggregate = self.prompt_text_in("t12std", "orch", "orchestrator")
+        for command in layout:
+            self.assertNotIn(command, aggregate)
+        # Worked-before: task and aggregate prompts still carry their own steps.
+        impl_prompt = self.prompt_text_in("t12std", "T01", "implementor")
+        self.assertIn("docket scope t12std T01 --submit", impl_prompt)
+        self.assertIn("docket preflight t12std T01", impl_prompt)
+        self.assertIn("Fill every section", aggregate)
+        # Correction, resume, and review stages carry no layout either.
+        self.fill_task_report(std / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "t12std", "T01", "--as", "implementor")
+        self.request_changes(std, "t12std", "T01")
+        for role in ("implementor", "orchestrator"):
+            correction = self.prompt_text_in("t12std", "T01", role)
+            for command in layout:
+                self.assertNotIn(command, correction, f"{role} correction carries layout")
+        resumed = self.cli("prompt", "t12std", "T01", "--role", "implementor",
+                           "--stage", "resume")
+        self.assertEqual(0, resumed.returncode, resumed.stderr)
+        for command in layout:
+            self.assertNotIn(command, resumed.stdout)
+        self.assign_simple_in(std, "t12std", "T02")
+        self.fill_task_report(std / "T02-report-01.mdx", blocked=True,
+                              files="- `src/t02.py:1` - blocked change.")
+        self.cli("submit", "t12std", "T02", "--blocked", "--as", "implementor")
+        for role in ("implementor", "orchestrator", "planner"):
+            review = self.prompt_text_in("t12std", "T02", role)
+            for command in layout:
+                self.assertNotIn(command, review, f"{role} review carries layout")
+        submitted = self.prompt_text_in("t12std", "T02", "verifier")
+        self.assertIn("The round is blocked", submitted)
+        self.cli("init", "t12quick", "--mode", "quick",
+                 "--evidence-mode", "documents-only")
+        quick = self.root / ".docket" / "runs" / "t12quick"
+        self.assign_simple_in(quick, "t12quick", "T01")
+        coord_prompt = self.prompt_text_in("t12quick", "T01", "coordinator")
+        checker_prompt = self.prompt_text_in("t12quick", "T01", "checker")
+        for prompt in (coord_prompt, checker_prompt):
+            for command in layout:
+                self.assertNotIn(command, prompt)
+        self.assertIn("Combine planning and orchestration", coord_prompt)
+        coordinator_ref = self._skill_root() / "references" / "coordinator.md"
+        for command in layout:
+            self.assertNotIn(command, coordinator_ref.read_text())
+
     def test_t61_quick_roles_register_and_prompt_per_preset(self) -> None:
         """Quick coordinator and checker register and prompt in quick, refuse elsewhere."""
         self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
@@ -9610,6 +10332,19 @@ class DocketCLI(unittest.TestCase):
         self.fail("no renderer line in prompt")
         return ""
 
+    def _uncached_entry(self) -> Path:
+        """A script that runs the CLI under test without the launcher or any bytecode."""
+        if not CLI_PACKAGE.is_dir():
+            return CLI_FILES[0]
+        entry = self.root / "uncached-docket"
+        entry.write_text(
+            "import sys\n"
+            "sys.dont_write_bytecode = True\n"
+            f"sys.path[0] = {str(CLI_PACKAGE.parent)!r}\n"
+            "from docket_cli import main\n"
+            "main()\n")
+        return entry
+
     def _prompt_with_bin(self, binary: Path, owner: str, role: str) -> str:
         result = subprocess.run(
             [sys.executable, str(binary), "prompt", "demo", owner,
@@ -9619,11 +10354,25 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
-    def _stage_patched_bin(self, name: str, patched_text: str) -> Path:
+    def _stage_patched_bin(self, name: str, old: str, new: str) -> Path:
+        """A copy of the CLI build with `old` replaced by `new` in the one file holding it."""
         skill = self.root / name
         (skill / "bin").mkdir(parents=True)
         binary = skill / "bin" / "docket"
-        binary.write_text(patched_text)
+        holders = [path for path in CLI_FILES if old in path.read_text()]
+        self.assertEqual(1, len(holders), f"{old!r} must sit in exactly one CLI file")
+        if CLI_FILES == [DOCKET]:
+            binary.write_text(DOCKET.read_text().replace(old, new, 1))
+        else:
+            # The launcher beside the copied source runs it.
+            if CLI_PACKAGE.is_dir():
+                shutil.copytree(CLI_PACKAGE, skill / CLI_PACKAGE.name,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                target = skill / CLI_PACKAGE.name / holders[0].name
+            else:
+                target = skill / holders[0].name
+            target.write_text(holders[0].read_text().replace(old, new, 1))
+            shutil.copy2(DOCKET, binary)
         binary.chmod(0o755)
         os.symlink(self._skill_root() / "references", skill / "references",
                    target_is_directory=True)
@@ -9640,31 +10389,81 @@ class DocketCLI(unittest.TestCase):
         self.assertTrue(rev1.strip())
         self.assertEqual(rev1, rev2)
         self.assertNotEqual("t43-p4-v1", rev1)
-        docket_text = Path(DOCKET).read_text()
-        renderer_text = docket_text.replace(
+        docket_text = cli_source_text()
+        self.assertIn('    """Render one role prompt', docket_text)
+        renderer_bin = self._stage_patched_bin(
+            "patched-renderer",
             '    """Render one role prompt',
-            '    # T71 renderer probe - composition tracking\n    """Render one role prompt',
-            1)
-        self.assertNotEqual(docket_text, renderer_text)
-        renderer_bin = self._stage_patched_bin("patched-renderer", renderer_text)
+            '    # T71 renderer probe - composition tracking\n    """Render one role prompt')
         patched_text = self._prompt_with_bin(renderer_bin, "T01", "implementor")
         patched_rev = self._renderer_of(patched_text)
         self.assertNotEqual(rev1, patched_rev)
         if '    """A checkout with one commit' in docket_text:
-            unrelated_text = docket_text.replace(
-                '    """A checkout with one commit',
-                '    # T71 unrelated probe - must not churn renderer\n    """A checkout with one commit',
-                1)
+            unrelated = ('    """A checkout with one commit',
+                         '    # T71 unrelated probe - must not churn renderer\n'
+                         '    """A checkout with one commit')
         else:
-            unrelated_text = docket_text.replace(
-                'def capture_root_baseline',
-                '# T71 unrelated probe - must not churn renderer\ndef capture_root_baseline',
-                1)
-        self.assertNotEqual(docket_text, unrelated_text)
-        unrelated_bin = self._stage_patched_bin("patched-unrelated", unrelated_text)
+            unrelated = ('def capture_root_baseline',
+                         '# T71 unrelated probe - must not churn renderer\ndef capture_root_baseline')
+        self.assertIn(unrelated[0], docket_text)
+        unrelated_bin = self._stage_patched_bin("patched-unrelated", *unrelated)
         unrelated_out = self._prompt_with_bin(unrelated_bin, "T01", "implementor")
         unrelated_rev = self._renderer_of(unrelated_out)
         self.assertEqual(rev1, unrelated_rev)
+
+    def test_renderer_revision_tracks_profile_candidate_helper(self) -> None:
+        """Changing a helper that selects prompt guidance changes the renderer revision."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        overlay = self.root / "profiles"
+        overlay.mkdir()
+        (overlay / "probe.md").write_text(
+            "---\nprofile: probe\nversion: 1\nmodels: vendor/probe\n---\n\n"
+            "Distinct profile guidance.\n")
+        previous = os.environ.get("DOCKET_PROFILES_ROOT")
+        os.environ["DOCKET_PROFILES_ROOT"] = str(overlay)
+        try:
+            args = ("prompt", "demo", "T01", "--role", "implementor",
+                    "--model", "vendor/probe")
+            base = self.cli(*args).stdout
+            self.assertIn("Distinct profile guidance.", base)
+            self.assertEqual(self._renderer_of(base),
+                             self._renderer_of(self.cli(*args).stdout))
+            source = cli_source_text()
+            target = 'def profile_candidates() -> list[Path]:\n'
+            self.assertIn(target, source)
+            patched = self._stage_patched_bin("patched-profile-candidates",
+                                              target, target + '    return []\n')
+            result = subprocess.run([sys.executable, str(patched), *args], cwd=self.root,
+                                    text=True, capture_output=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertNotIn("Distinct profile guidance.", result.stdout)
+            self.assertNotEqual(self._renderer_of(base), self._renderer_of(result.stdout))
+        finally:
+            if previous is None:
+                os.environ.pop("DOCKET_PROFILES_ROOT", None)
+            else:
+                os.environ["DOCKET_PROFILES_ROOT"] = previous
+
+    def test_prompts_are_byte_identical_through_the_launcher(self) -> None:
+        """The launcher, the module run as a script, and a prior build render the same bytes.
+
+        Renderer revisions hash function source and prompt digests hash the prompt, so
+        moving the CLI into a module must not change a single byte of either.
+        `DOCKET_BIN_PRIOR` names a pre-move single-file build to compare against.
+        """
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        builds = [DOCKET, self._uncached_entry()]
+        if os.environ.get("DOCKET_BIN_PRIOR"):
+            builds.append(Path(os.environ["DOCKET_BIN_PRIOR"]))
+        for role in ("implementor", "verifier", "reviewer", "orchestrator"):
+            with self.subTest(role=role):
+                prompts = [self._prompt_with_bin(build, "T01", role) for build in builds]
+                self.assertTrue(self._renderer_of(prompts[0]).startswith("derived-"))
+                for build, prompt in zip(builds[1:], prompts[1:]):
+                    self.assertEqual(prompts[0], prompt, f"{build} renders differently")
+                self.assertEqual(sha(prompts[0].encode()), sha(prompts[-1].encode()))
 
     def test_t71_prompt_states_identity_exactly_once(self) -> None:
         """Workflow, stage and renderer each render exactly once and stay present."""
@@ -9744,6 +10543,244 @@ class DocketCLI(unittest.TestCase):
         self.cli("submit", "demo", "T02", "--as", "implementor")
         selected = self.prompt_text(run, "T02", "verifier")
         self.assertIn("obligation: offline-operation", selected)
+
+    def test_t02_obligation_trigger_at_word_start_is_selected(self) -> None:
+        """A stem trigger at the start of a word selects, matching card behavior."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.",
+            "The service aggregates JWT claims across regions."))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        selected = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", selected)
+        self.assertIn("obligation: event-aggregation", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    def test_t02_disparity_selects_no_obligation(self) -> None:
+        """An infix like parity inside disparity matches no obligation trigger."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.",
+            "The disparity between replicas exceeds the tolerance budget."))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        selected = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", selected)
+        self.assertNotIn("obligation: offline-operation", selected)
+        self.assertNotIn("obligation: changed-oracle", selected)
+        self.assertNotIn("obligation: event-aggregation", selected)
+        self.assertNotIn("obligation: content-fingerprint", selected)
+        self.assertNotIn("obligation: configuration", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    def test_t02_jwt_claims_sentence_is_kept(self) -> None:
+        """A behavioral sentence about JWT claims survives the claim filter."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.",
+            "The service preserves JWT claims across token refresh without network access."))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        selected = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", selected)
+        self.assertIn("obligation: offline-operation", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    def test_t02_inflected_markers_still_drop_meta_sentences(self) -> None:
+        """Meta sentences using inflected markers stay dropped, not behavior claims."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        task = run / "T01-task.mdx"
+        task.write_text(task.read_text().replace(
+            "Implement the feature.",
+            "Offline obligations are handled by another task. "
+            "Discussion of offline behavior belongs to T09. "
+            "The fixture discusses offline mode only as background."))
+        self.fill_task_report(run / "T01-report-01.mdx",
+                              files="- `src/t01.py:1` - implemented T01.")
+        self.cli("submit", "demo", "T01", "--as", "implementor")
+        selected = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("obligation: honest-acceptance", selected)
+        self.assertNotIn("obligation: offline-operation", selected)
+        self.assertNotIn("obligation: changed-oracle", selected)
+        self.assertNotIn("obligation: event-aggregation", selected)
+        self.assertNotIn("obligation: content-fingerprint", selected)
+        self.assertNotIn("obligation: configuration", selected)
+        self.assertIn("Discovery may reveal another relevant obligation or risk", selected)
+
+    @staticmethod
+    def _t03_fn_source(name: str) -> str:
+        """The CLI binary's own source for one function, for lock-holding checks."""
+        return cli_function_source(name)
+
+    def test_t03_edits_hold_owner_or_run_lock(self) -> None:
+        """depend, set-model, and escalate-mode serialize their read-modify-write."""
+        self.assertIn("owner_lock", self._t03_fn_source("cmd_depend"))
+        self.assertIn("owner_lock", self._t03_fn_source("cmd_set_model"))
+        self.assertIn("run_lock", self._t03_fn_source("cmd_escalate_mode"))
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        recorded = self.cli("set-model", "demo", "T01", "--actual", "live-m")
+        self.assertIn("recorded in T01-report-01.mdx", recorded.stdout)
+        self.assertIn("actual_model: live-m", (run / "T01-report-01.mdx").read_text())
+
+    def test_t03_concurrent_depends_keep_every_pin(self) -> None:
+        """A depend record waits for the owner lock; concurrent records serialize."""
+        import fcntl
+        run = self.init5()
+        self.allow_provisional(run)
+        self.submit5(run, "T01")
+        self.assign_simple(run, "T04")
+        lock_path = run / ".locks" / "T04.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, str(DOCKET), "depend", "demo", "T04", "--on", "T01"],
+                    cwd=str(self.root), text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=dict(os.environ))
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    blocked = True
+                else:
+                    blocked = False
+                self.assertTrue(blocked, "depend recorded while the owner lock was held")
+            finally:
+                fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(0, proc.returncode, f"depend failed after release: {err}")
+        self.assertIn("T04 consumes T01", out)
+        recorded = [entry["on"] for entry in
+                    json.loads((run / ".deps" / "T04.json").read_text())["dependencies"]]
+        self.assertEqual(["T01"], recorded)
+
+    def test_t03_verification_gap_chooses_above_highest(self) -> None:
+        """A missing lower verification number never causes an overwrite."""
+        run = self.init5()
+        self.submit5(run, "T01")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "first pass")
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "second pass")
+        second = run / "T01-verification-02.mdx"
+        second_bytes = second.read_bytes()
+        (run / "T01-verification-01.mdx").unlink()
+        self.cli("verify", "demo", "T01", "--result", "pass", "--as", "verifier",
+                 "--detail", "third pass")
+        self.assertTrue((run / "T01-verification-03.mdx").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_mode_escalation_gap_chooses_above_highest(self) -> None:
+        """A missing lower escalation request never causes an overwrite."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("escalate-mode", "demo", "--reason", "first reason")
+        self.cli("escalate-mode", "demo", "--reason", "second reason")
+        second = run / ".mode-escalations" / "request-02.mdx"
+        second_bytes = second.read_bytes()
+        (run / ".mode-escalations" / "request-01.mdx").unlink()
+        self.cli("escalate-mode", "demo", "--reason", "third reason")
+        self.assertTrue((run / ".mode-escalations" / "request-03.mdx").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_handoff_gap_cannot_overwrite(self) -> None:
+        """A missing lower handoff never causes the next open to overwrite."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-01.mdx")
+        self.cli("handoff", "demo", "T01", "--submit")
+        self.cli("handoff", "demo", "T01")
+        self.fill_handoff(run / "T01-handoff-02.mdx")
+        self.cli("handoff", "demo", "T01", "--submit")
+        second_bytes = (run / "T01-handoff-02.mdx").read_bytes()
+        (run / "T01-handoff-01.mdx").unlink()
+        self.cli("handoff", "demo", "T01")
+        self.assertTrue((run / "T01-handoff-03.mdx").is_file())
+        self.assertEqual(second_bytes, (run / "T01-handoff-02.mdx").read_bytes())
+
+    def test_t03_feedback_gap_uses_highest_plus_one(self) -> None:
+        """Feedback ids advance past the highest surviving id after a gap."""
+        run = self.init5()
+        for body in ("first", "second"):
+            self.cli("feedback", "demo", "--add", "--role", "implementor",
+                     "--category", "other", "--body", body)
+        second = run / "feedback" / "F02.mdx"
+        second_bytes = second.read_bytes()
+        (run / "feedback" / "F01.mdx").unlink()
+        self.cli("feedback", "demo", "--add", "--role", "implementor",
+                 "--category", "other", "--body", "third")
+        self.assertTrue((run / "feedback" / "F03.mdx").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_prompt_gap_cannot_overwrite(self) -> None:
+        """A missing lower prompt record never causes the next render to overwrite."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.cli("prompt", "demo", "T01", "--role", "implementor")
+        self.cli("prompt", "demo", "T01", "--role", "implementor")
+        second = run / ".prompts" / "T01-implementor-02.json"
+        second_bytes = second.read_bytes()
+        (run / ".prompts" / "T01-implementor-01.json").unlink()
+        self.cli("prompt", "demo", "T01", "--role", "implementor")
+        self.assertTrue((run / ".prompts" / "T01-implementor-03.json").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_checkpoint_gap_cannot_overwrite(self) -> None:
+        """A missing lower checkpoint never causes the next resume to overwrite."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        for session in ("w1", "w2", "w3", "w4"):
+            self.cli("session", "demo", "--register", "--session", session,
+                     "--name", f"worker-{session}", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        self.cli("resume", "demo", "T01", "--session", "w2", "--reason", "first move")
+        self.cli("resume", "demo", "T01", "--session", "w3", "--reason", "second move")
+        second = run / ".checkpoints" / "T01-02.json"
+        second_bytes = second.read_bytes()
+        (run / ".checkpoints" / "T01-01.json").unlink()
+        self.cli("resume", "demo", "T01", "--session", "w4", "--reason", "third move")
+        self.assertTrue((run / ".checkpoints" / "T01-03.json").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_improvement_gap_uses_highest_plus_one(self) -> None:
+        """An improvements gap never causes the next add to reuse a number."""
+        self.cli("improvements", "--add", "--title", "first finding")
+        self.cli("improvements", "--add", "--title", "second finding")
+        directory = self.assert_disposable(self.root / ".docket" / "improvements")
+        second = directory / "I02.mdx"
+        second_bytes = second.read_bytes()
+        (directory / "I01.mdx").unlink()
+        self.cli("improvements", "--add", "--title", "third finding")
+        self.assertTrue((directory / "I03.mdx").is_file())
+        self.assertEqual(second_bytes, second.read_bytes())
+
+    def test_t03_stall_gap_uses_filenames(self) -> None:
+        """An unreadable stall incident still reserves its number."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        incidents = run / ".incidents"
+        incidents.mkdir(parents=True, exist_ok=True)
+        (incidents / "T01-2.json").write_text("corrupted{")
+        second_bytes = (incidents / "T01-2.json").read_bytes()
+        flagged = self.cli("health", "demo", "--flag-stall", "T01", "--cause", "provider hung")
+        self.assertIn("flagged stall T01-3", flagged.stdout)
+        self.assertTrue((incidents / "T01-3.json").is_file())
+        self.assertEqual(second_bytes, (incidents / "T01-2.json").read_bytes())
+        record = json.loads((incidents / "T01-3.json").read_text())
+        self.assertEqual("provider hung", record["cause"])
 
     def test_t81_skipped_verification_cannot_support_approval(self) -> None:
         """An approving verdict over skipped verification is refused; waiving still works."""
@@ -10303,6 +11340,106 @@ class DocketCLI(unittest.TestCase):
         dec.write_text(dec.read_text().replace(self.DECISION_PLACEHOLDER, self.REQUIREMENT))
         self.cli("decide", run_id, owner, "--changes", "--as", reviewer)
 
+    def test_t04_one_call_changes_records_numbered_changes(self) -> None:
+        """Repeatable --change numbers every item and applies in one invocation."""
+        run = self.init5_in("t04a")
+        self.submit5_in(run, "t04a", "T01")
+        applied = self.cli(
+            "decide", "t04a", "T01", "--changes", "--as", "reviewer",
+            "--change", "Guard `src/t01.py:1` against empty input.",
+            "--change", "Add a regression test for the guard.")
+        self.assertIn("needs changes -> T01-decision-01.mdx", applied.stdout)
+        self.assertIn("opened next round -> T01-report-02.mdx", applied.stdout)
+        self.assertNotIn("opened decision draft", applied.stdout)
+        body = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("1. Guard `src/t01.py:1` against empty input.", body)
+        self.assertIn("2. Add a regression test for the guard.", body)
+        self.assertIn("status: changes-requested", (run / "T01-report-01.mdx").read_text())
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run, "T01"))
+
+    def test_t04_applied_changes_message_names_preset_handoff(self) -> None:
+        """The applied message states the preset handoff, never a write-again prompt."""
+        run = self.init5_in("t04b")
+        self.submit5_in(run, "t04b", "T01")
+        opened = self.cli("decide", "t04b", "T01", "--changes", "--as", "reviewer")
+        self.assertIn("opened decision draft", opened.stdout)
+        dec = run / "T01-decision-01.mdx"
+        dec.write_text(dec.read_text().replace(self.DECISION_PLACEHOLDER, self.REQUIREMENT))
+        applied = self.cli("decide", "t04b", "T01", "--changes", "--as", "reviewer")
+        self.assertIn(
+            "recorded 1 required change in T01-decision-01.mdx; the orchestrator receives "
+            "a `correction-ready` wake and re-dispatches the implementor into "
+            "T01-report-02.mdx.", applied.stdout)
+        self.assertNotIn("Write the required changes", applied.stdout)
+
+    def test_t04_one_call_changes_names_coordinator_in_quick(self) -> None:
+        """In quick runs the one-call handoff names the coordinator, not the orchestrator."""
+        run = self.init5_in("t04c", mode="quick")
+        self.submit5_in(run, "t04c", "T01")
+        applied = self.cli(
+            "decide", "t04c", "T01", "--changes", "--as", "checker",
+            "--reviewer", "checker",
+            "--change", "Tighten `src/t01.py:1` per the oracle.")
+        self.assertIn(
+            "recorded 1 required change in T01-decision-01.mdx; the coordinator receives "
+            "a `correction-ready` wake and re-dispatches the implementor into "
+            "T01-report-02.mdx.", applied.stdout)
+        self.assertNotIn("Write the required changes", applied.stdout)
+        self.assertIn("1. Tighten `src/t01.py:1` per the oracle.",
+                      (run / "T01-decision-01.mdx").read_text())
+
+    def test_t04_change_without_changes_is_refused(self) -> None:
+        """--change records required changes, so it needs --changes."""
+        run = self.init5_in("t04d")
+        self.submit5_in(run, "t04d", "T01")
+        refused = self.cli("decide", "t04d", "T01", "--approve", "--as", "reviewer",
+                           "--change", "Stray.", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("--change needs --changes", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+
+    def test_t04_interrupted_one_call_changes_recovers_exactly(self) -> None:
+        """An interrupted one-call correction finishes as journalled, never rewritten."""
+        run = self.init5_in("t04e")
+        self.submit5_in(run, "t04e", "T01")
+        crashed = self.cli(
+            "decide", "t04e", "T01", "--changes", "--as", "reviewer",
+            "--change", "A.", "--change", "B.", ok=False, fault="transition:begin")
+        self.assertEqual(70, crashed.returncode)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        refused = self.cli(
+            "decide", "t04e", "T01", "--changes", "--as", "reviewer",
+            "--change", "C.", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("already recorded its required changes", refused.stderr)
+        self.assertFalse((run / "T01-decision-01.mdx").exists())
+        self.assertEqual(["T01-report-01.mdx"], self.rounds(run, "T01"))
+        finished = self.cli("decide", "t04e", "T01", "--changes", "--as", "reviewer")
+        self.assertIn("needs changes -> T01-decision-01.mdx", finished.stdout)
+        decision = (run / "T01-decision-01.mdx").read_text()
+        self.assertIn("applied: yes", decision)
+        self.assertIn("1. A.", decision)
+        self.assertIn("2. B.", decision)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx"], self.rounds(run, "T01"))
+        # Repeating the same items after a later crash still finishes with one new round.
+        self.fill_task_report(run / "T01-report-02.mdx",
+                              files="- `src/t01.py:2` - applied the correction.")
+        self.cli("submit", "t04e", "T01", "--as", "implementor")
+        crashed2 = self.cli(
+            "decide", "t04e", "T01", "--changes", "--as", "reviewer",
+            "--change", "A2.", "--change", "B2.", ok=False, fault="transition:decision")
+        self.assertEqual(70, crashed2.returncode)
+        repeated = self.cli(
+            "decide", "t04e", "T01", "--changes", "--as", "reviewer",
+            "--change", "A2.", "--change", "B2.")
+        self.assertIn("needs changes -> T01-decision-02.mdx", repeated.stdout)
+        decision2 = (run / "T01-decision-02.mdx").read_text()
+        self.assertIn("applied: yes", decision2)
+        self.assertIn("1. A2.", decision2)
+        self.assertIn("2. B2.", decision2)
+        self.assertEqual(["T01-report-01.mdx", "T01-report-02.mdx", "T01-report-03.mdx"],
+                         self.rounds(run, "T01"))
+
     def derived_keys(self, run_id: str, role: str) -> list[str]:
         """Event keys derived for one role, read through non-consuming inspection."""
         out = self.cli("events", run_id, "--role", role, "--peek").stdout
@@ -10555,12 +11692,22 @@ class DocketCLI(unittest.TestCase):
         self.fill_task_report(run / "T01-report-01.mdx", blocked=True)
         self.cli("submit", "rb", "T01", "--blocked", "--as", "implementor")
         self.assertEqual(["T01:1:blocked"], self.derived_keys("rb", "coordinator"))
-        self.assertIn("`docket route rb --kind blocked --owner T01` wakes the checker",
-                      self.cli("events", "rb", "--role", "coordinator", "--peek").stdout)
+        with self.subTest("coordinator route instruction"):
+            self.assertIn(
+                "`docket route rb --kind blocked --owner T01` queues a notification for the checker",
+                self.cli("events", "rb", "--role", "coordinator", "--peek").stdout)
         self.assertEqual([], self.derived_keys("rb", "checker"))
         routed = self.cli("route", "rb", "--kind", "blocked", "--owner", "T01",
                           "--note", "keep the default port")
         self.assertIn("routed T01 round 1 to the checker", routed.stdout)
+        self.assertIn("notification queued", routed.stdout)
+        self.assertIn("checker is unarmed for rb", routed.stdout)
+        self.assertFalse((self.root / ".docket" / "watch.conf").exists())
+        route_record = run / ".routes" / "T01-01-blocked.json"
+        first_record = route_record.read_bytes()
+        repeated = self.cli("route", "rb", "--kind", "blocked", "--owner", "T01")
+        self.assertIn("notification queued", repeated.stdout)
+        self.assertEqual(first_record, route_record.read_bytes())
         self.assertEqual([], self.derived_keys("rb", "coordinator"))
         self.assertEqual(["T01:1:blocked-routed"], self.derived_keys("rb", "checker"))
         self.assertIn("orchestrator answer: keep the default port",
@@ -10569,6 +11716,47 @@ class DocketCLI(unittest.TestCase):
                  "--as", "checker")
         self.assertEqual([], self.derived_keys("rb", "checker"))
         self.assertTrue(self.derived_keys("rb", "coordinator")[0].startswith("all:decided:"))
+
+    def test_t07_route_names_preset_role_and_armed_state(self) -> None:
+        quick = self.init5_in("routequick", mode="quick")
+        for kind, role in (("plan-gap", "coordinator"), ("collision", "coordinator"),
+                           ("dispute", "checker")):
+            with self.subTest(kind=kind):
+                advisory = self.cli("route", "routequick", "--kind", kind)
+                self.assertIn(f"destination: {role}", advisory.stdout)
+                self.assertIn("action:", advisory.stdout)
+                self.assertIn("no event queued; this route is advisory", advisory.stdout)
+                self.assertIn(f"{role} is unarmed for routequick", advisory.stdout)
+        self.assertFalse((self.root / ".docket" / "watch.conf").exists())
+        self.cli("arm", "routequick", "--role", "coordinator")
+        armed = self.cli("route", "routequick", "--kind", "plan-gap")
+        self.assertNotIn("unarmed", armed.stdout)
+        standard = self.init5_in("routestd")
+        named = self.cli("route", "routestd", "--kind", "plan-gap")
+        self.assertIn("destination: planner", named.stdout)
+        self.assertIn("planner is unarmed for routestd", named.stdout)
+
+    def test_t07_block_route_playbooks_describe_the_queue(self) -> None:
+        references = DOCKET.resolve().parents[1] / "references"
+        for role in ("coordinator", "orchestrator"):
+            with self.subTest(role=role):
+                text = (references / f"{role}.md").read_text()
+                self.assertIn("queues a durable notification" if role == "orchestrator"
+                              else "queues a notification", text)
+                self.assertIn("Arm the" if role == "orchestrator" else "must be armed", text)
+
+    def test_t07_prompt_uses_absolute_cli_without_path_entry(self) -> None:
+        run = self.init5_in("nopath")
+        self.assign_simple_in(run, "nopath", "T01")
+        normal = self.prompt_text_in("nopath", "T01", "implementor")
+        self.assertIn("`docket scope nopath T01 --submit`", normal)
+        absent = self.cli_env({"PATH": ""}, "prompt", "nopath", "T01",
+                              "--role", "implementor").stdout
+        launcher = str(DOCKET.resolve())
+        self.assertIn(f"`{launcher} scope nopath T01 --submit`", absent)
+        self.assertIn(f"task-local diff: {launcher} diff nopath T01", absent)
+        self.assertNotIn("`docket scope nopath", absent)
+        self.assertIn("goal: Implement the feature.", absent)
 
     def test_a_grant_after_a_verifier_exhaustion_opens_exactly_that_correction(self) -> None:
         """Regression: a refused verifier correction was still charged, so a grant freed nothing.
@@ -11263,6 +12451,57 @@ class DocketCLI(unittest.TestCase):
             (Path(row["archive"]) / "opencode-session.json.gz").read_bytes()))
         self.assertEqual(["ses_mine", "ses_child"], [s["id"] for s in rows["sessions"]])
 
+    def test_opencode_running_session_reads_recent_sessions_through_part_index(self) -> None:
+        """The newest active session wins, and SQLite looks up its parts by session."""
+        db = self.root / "opencode.db"
+        now = int(time.time() * 1000)
+        con = sqlite3.connect(db)
+        con.executescript(
+            "create table session (id text primary key, version text, time_updated integer);"
+            "create index session_recent_idx on session(time_updated desc);"
+            "create table part (id text primary key, session_id text, "
+            "time_updated integer, data text);"
+            "create index part_session_idx on part(session_id);")
+        con.executemany("insert into session values (?, ?, ?)", [
+            ("ses_old", "1.0", now - 1000),
+            ("ses_new", "2.0", now),
+        ])
+        command = json.dumps({"type": "tool", "state": {"status": "running",
+                              "input": {"command": "docket submit demo T08"}}})
+        con.executemany("insert into part values (?, ?, ?, ?)", [
+            ("prt_old", "ses_old", now, command),
+            ("prt_new", "ses_new", now - 500, command),
+        ])
+        con.executemany("insert into part values (?, ?, ?, ?)",
+                        [(f"noise_{i}", "ses_old", now, "{}") for i in range(500)])
+        con.commit()
+        con.close()
+        module = load_cli("docket_session_probe")
+        module.opencode_db = lambda: db
+        statements: list[str] = []
+        original_connect = sqlite3.connect
+
+        def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            connection = original_connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        sqlite3.connect = traced_connect
+        try:
+            found = module.opencode_running_session(["submit", "T08"])
+            self.assertEqual(("", ""), module.opencode_running_session(["absent"]))
+        finally:
+            sqlite3.connect = original_connect
+        query = next(statement for statement in statements
+                     if "part" in statement and "session_id" in statement)
+        con = sqlite3.connect(db)
+        plan = [row[3] for row in con.execute("explain query plan " + query)]
+        con.close()
+        indexed = any("USING INDEX part_session_idx" in step for step in plan)
+        scanned = any("SCAN p" in step or "SCAN part" in step for step in plan)
+        self.assertEqual((("ses_new", "2.0"), True, False),
+                         (found, indexed, scanned), plan)
+
     def test_final_aggregate_verdict_archives_every_noted_session(self) -> None:
         """Settling the run keeps each noted session's transcript before retention drops it."""
         run = self.setup_aggregate_run()
@@ -11447,3 +12686,594 @@ class DocketCLI(unittest.TestCase):
                            "--role", "implementor", "--body", "not logged")
         self.assertIn("recorded observation", off.stdout)
         self.assertNotIn("not logged", log.read_text())
+
+    def test_first_auto_archive_creates_missing_parents_with_0700(self) -> None:
+        """The first archive on a fresh machine creates its state chain at 0700."""
+        run = self.init5()
+        env, _transcript = self.fake_claude_session()
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        fresh_log = Path(self._feedback_tmp.name) / "fresh" / "nested" / "feedback.jsonl"
+        self.assertFalse(fresh_log.parent.exists())
+        out = self.cli_env({**env, "DOCKET_FEEDBACK_LOG": str(fresh_log)},
+                           "usage", "demo", "--archive")
+        self.assertIn("archived 1 session(s)", out.stdout)
+        base = fresh_log.parent / "sessions"
+        self.assertTrue(base.is_dir())
+        kept = list(base.rglob("transcript.jsonl.gz"))
+        self.assertEqual(1, len(kept))
+        target = kept[0].parent
+        chain = [fresh_log.parent.parent, fresh_log.parent, base]
+        probe = target
+        while True:
+            chain.append(probe)
+            if probe == base:
+                break
+            probe = probe.parent
+        for directory in chain:
+            self.assertEqual(0o700, stat.S_IMODE(directory.stat().st_mode), str(directory))
+
+    def test_log_feedback_flushes_before_releasing_lock(self) -> None:
+        """log_feedback flushes its writes before releasing the lock."""
+        src = cli_function_source("log_feedback")
+        self.assertIn("fh.flush()", src)
+        self.assertIn("os.fsync", src)
+        self.assertLess(src.find("fh.flush()"), src.find("LOCK_UN"))
+        self.assertLess(src.find("os.fsync"), src.find("LOCK_UN"))
+        run = self.init5()
+        self.cli("feedback", "demo", "--add", "--role", "implementor",
+                 "--category", "other", "--body", "flush check log")
+        self.assertIn("flush check log", Path(os.environ["DOCKET_FEEDBACK_LOG"]).read_text())
+
+    def test_note_harness_session_flushes_before_releasing_lock(self) -> None:
+        """note_harness_session flushes its writes before releasing the lock."""
+        src = cli_function_source("note_harness_session")
+        self.assertIn("fh.flush()", src)
+        self.assertIn("os.fsync", src)
+        self.assertLess(src.find("fh.flush()"), src.find("LOCK_UN"))
+        self.assertLess(src.find("os.fsync"), src.find("LOCK_UN"))
+        run = self.init5()
+        env, _transcript = self.fake_claude_session()
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        ledger = (run / ".harness-sessions.jsonl").read_text()
+        self.assertIn(env["CLAUDE_CODE_SESSION_ID"], ledger)
+
+    def test_feedback_add_locates_transcript_without_parsing_transcript(self) -> None:
+        """feedback --add finds the transcript path without parsing the whole transcript."""
+        src = cli_function_source("cmd_feedback")
+        self.assertIn("session_transcript_path", src)
+        self.assertNotIn("session_usage", src)
+        run = self.init5()
+        env, transcript = self.fake_claude_session()
+        self.cli_env(env, "arm", "demo", "--role", "orchestrator")
+        self.cli_env(env, "feedback", "demo", "--add", "--role", "orchestrator",
+                     "--category", "other", "--body", "transcript lookup check")
+        observation = next(run.rglob("F01.mdx")).read_text()
+        self.assertIn(f"transcript: {transcript}", observation)
+
+    def test_feedback_log_leaves_existing_parent_mode_alone(self) -> None:
+        """An existing feedback log parent keeps its mode; only created dirs get 0700."""
+        run = self.init5()
+        existing = Path(self._feedback_tmp.name) / "existing-parent"
+        existing.mkdir()
+        os.chmod(existing, 0o755)
+        log = existing / "feedback.jsonl"
+        out = self.cli_env({"DOCKET_FEEDBACK_LOG": str(log)}, "feedback", "demo",
+                           "--add", "--role", "implementor",
+                           "--category", "other", "--body", "existing parent kept")
+        self.assertIn("recorded observation", out.stdout)
+        self.assertEqual(0o755, stat.S_IMODE(existing.stat().st_mode))
+        self.assertIn("existing parent kept", log.read_text())
+
+
+    def test_t05_health_rejects_unassigned_owners_without_creating_state(self) -> None:
+        run = self.init("split", evidence_mode="documents-only")
+        before = sorted(str(p.relative_to(run)) for p in run.rglob("*"))
+        for args in (("--owner", "T99"),
+                     ("--flag-stall", "T99", "--cause", "hung")):
+            result = self.cli("health", "demo", *args, ok=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("no task 'T99'", result.stderr)
+        self.assertEqual(before, sorted(str(p.relative_to(run)) for p in run.rglob("*")))
+        self.cli("assign", "demo", "T01", "--goal", "one", "--criterion", "done",
+                 "--file", "one.txt", "--verify", "true")
+        self.assertIn("T01", self.cli("health", "demo", "--owner", "T01").stdout)
+        self.assertIn("flagged stall T01-1", self.cli(
+            "health", "demo", "--flag-stall", "T01", "--cause", "hung").stdout)
+
+    def test_t05_stall_identity_is_open_cause_and_reopen_generation(self) -> None:
+        run = self.init("split", evidence_mode="documents-only")
+        self.cli("assign", "demo", "T01", "--goal", "one", "--criterion", "done",
+                 "--file", "one.txt", "--verify", "true")
+        self.cli("health", "demo", "--flag-stall", "T01", "--cause", "hung")
+        first = run / ".incidents" / "T01-1.json"
+        record = json.loads(first.read_text())
+        record["detected_at_epoch"] = 1
+        first.write_text(json.dumps(record))
+        repeated = self.cli("health", "demo", "--flag-stall", "T01", "--cause", "hung")
+        self.assertIn("already flagged: T01-1", repeated.stdout)
+        self.assertEqual(1, len(list((run / ".incidents").glob("*.json"))))
+        distinct = self.cli("health", "demo", "--flag-stall", "T01", "--cause", "quota")
+        self.assertIn("flagged stall T01-2", distinct.stdout)
+        reopens = run / ".reopens"
+        reopens.mkdir()
+        (reopens / "T01.json").write_text(json.dumps({"owner": "T01", "reopens": [
+            {"transition": "test-reopen", "round": 0}]}))
+        new_epoch = self.cli("health", "demo", "--flag-stall", "T01", "--cause", "hung")
+        self.assertIn("flagged stall T01-3", new_epoch.stdout)
+        self.assertEqual(2, json.loads((run / ".incidents" / "T01-3.json").read_text())["epoch"])
+
+    def test_t05_doctor_names_each_wake_settings_location(self) -> None:
+        home = self.root / "home"
+        home.mkdir()
+        project = self.root / ".claude" / "settings.json"
+        local = self.root / ".claude" / "settings.local.json"
+        user = home / ".claude" / "settings.json"
+        codex = home / ".codex" / "hooks.json"
+        claude_locations = ((project, ".claude/settings.json"),
+                            (local, ".claude/settings.local.json"),
+                            (user, "~/.claude/settings.json"))
+
+        def configure(path: Path, *, claude: bool) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            hook = {"type": "command", "command": "docket/hooks/wake.sh"}
+            if claude:
+                hook["asyncRewake"] = True
+            path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [hook]}]}}))
+
+        for path, label in claude_locations:
+            for other, _ in claude_locations:
+                other.unlink(missing_ok=True)
+            configure(path, claude=True)
+            result = self.cli_env({"HOME": str(home)}, "doctor")
+            lines = [line for line in result.stdout.splitlines()
+                     if "Stop hook (Claude)" in line]
+            self.assertEqual([f"  [  ok  ] Stop hook (Claude) in {label}"], lines)
+
+        for path, _ in claude_locations:
+            path.unlink(missing_ok=True)
+        configure(codex, claude=False)
+        result = self.cli_env({"HOME": str(home)}, "doctor")
+        self.assertIn("[  ok  ] Stop hook (Codex) in ~/.codex/hooks.json", result.stdout)
+        lines = [line for line in result.stdout.splitlines()
+                 if "Stop hook (Claude)" in line]
+        self.assertEqual(1, len(lines))
+        self.assertIn("[ note ]", lines[0])
+        for _, label in claude_locations:
+            self.assertIn(label, lines[0])
+        self.assertIn("docket help signalling", lines[0])
+
+        project.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "other.sh", "asyncRewake": True}]}]}}))
+        result = self.cli_env({"HOME": str(home)}, "doctor")
+        self.assertIn("[ note ] Stop hook (Claude) absent in", result.stdout)
+        configure(user, claude=True)
+        result = self.cli_env({"HOME": str(home)}, "doctor")
+        self.assertIn("[  ok  ] Stop hook (Claude) in ~/.claude/settings.json", result.stdout)
+        self.assertFalse(any("[ note ]" in line for line in result.stdout.splitlines()
+                             if "Stop hook (Claude)" in line))
+
+        configure(project, claude=True)
+        configure(local, claude=True)
+        result = self.cli_env({"HOME": str(home)}, "doctor")
+        lines = [line for line in result.stdout.splitlines()
+                 if "Stop hook (Claude)" in line]
+        self.assertEqual(1, len(lines))
+        for _, label in claude_locations:
+            self.assertIn(label, lines[0])
+        self.assertIn("[  ok  ]", lines[0])
+
+    def test_t05_doctor_probe_bounds_an_unresponsive_process_tree(self) -> None:
+        fake = self.root / "bin"
+        fake.mkdir()
+        herdr = fake / "herdr"
+        herdr.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(20)\n")
+        herdr.chmod(0o755)
+        env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
+        started = time.monotonic()
+        try:
+            result = subprocess.run([sys.executable, str(DOCKET), "doctor"],
+                                    cwd=self.root, env=env, text=True,
+                                    capture_output=True, timeout=6)
+        except subprocess.TimeoutExpired:
+            self.fail("doctor did not finish within six seconds")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertIn("mode: manual", result.stdout)
+
+    def test_t05_suite_counts_only_literal_failures_and_errors(self) -> None:
+        run = self.init("split", evidence_mode="documents-only")
+        result = self.cli("suite", "demo", "--qualify", "--command",
+                          "printf 'Ran 5 tests in 0.1s\\n\\nFAILED (expected failures=2, failures=1, errors=1)\\n' >&2; exit 1")
+        self.assertIn("2 failures", result.stdout)
+        artifact = sorted((run / ".suite").glob("qual-*.json"))[-1]
+        self.assertEqual(2, json.loads(artifact.read_text())["failures"])
+        passed = self.cli("suite", "demo", "--qualify", "--command",
+                          "printf 'Ran 2 tests in 0.1s\\n\\nOK (expected failures=2)\\n' >&2")
+        self.assertIn("0 failures", passed.stdout)
+
+    def test_t05_probe_executes_the_advertised_flag(self) -> None:
+        self.init("split", evidence_mode="documents-only")
+        fake = self.root / "bin"
+        fake.mkdir()
+        herdr = fake / "herdr"
+        herdr.write_text("#!/bin/sh\n"
+                         "if [ \"$1\" = --version ]; then echo 'herdr test'; exit 0; fi\n"
+                         "if [ \"$*\" = 'agent prompt --help' ]; then echo '--queue'; exit 0; fi\n"
+                         "if [ \"$*\" = 'agent prompt --queue --help' ]; then echo '--queue'; exit 0; fi\n"
+                         "exit 2\n")
+        herdr.chmod(0o755)
+        env = {"PATH": f"{fake}{os.pathsep}{os.environ.get('PATH', '')}"}
+        queued = self.cli_env(env, "delivery", "demo", "--role", "orchestrator",
+                              "--probe")
+        self.assertIn("boundary: verified-queue", queued.stdout)
+        herdr.write_text(herdr.read_text().replace("--queue", "--send-if-idle"))
+        idle = self.cli_env(env, "delivery", "demo", "--role", "orchestrator",
+                            "--probe")
+        self.assertIn("boundary: verified-queue", idle.stdout)
+
+
+    def test_t06_status_lists_artifact_and_journal_recovery_with_commands(self) -> None:
+        run = self.init(evidence_mode="documents-only")
+        self.assertNotIn("unfinished decision transitions", self.cli("status", "demo").stdout)
+        (run / "T01-report-01.mdx").write_text(
+            "---\nrun: demo\nowner: T01\nround: 1\nstatus: changes-requested\n---\n\nreport\n"
+        )
+        one = self.cli("status", "demo").stdout
+        self.assertIn("T01 round 1 changes-requested", one)
+        self.assertIn("docket decide demo T01 --changes", one)
+        for owner, status in (("T01", "changes-requested"), ("T02", "submitted"),
+                              ("T03", "submitted"), ("T04", "submitted"),
+                              ("T05", "waived"), ("orch", "submitted")):
+            (run / f"{owner}-report-01.mdx").write_text(
+                f"---\nrun: demo\nowner: {owner}\nround: 1\nstatus: {status}\n---\n\nreport\n"
+            )
+        (run / "orch-decision-01.mdx").write_text(
+            "---\napplied: yes\nverdict: approved\ntransition: txn:orch\n---\n"
+        )
+        transitions = run / ".transitions"
+        transitions.mkdir()
+        for owner, verdict in (("T02", "approved"), ("T03", "approved"),
+                               ("T04", "waived"), ("T05", "reopen-waived")):
+            (transitions / f"{owner}.json").write_text(json.dumps({
+                "state": "in-progress", "round": 1, "verdict": verdict,
+                "transition": f"txn:{owner}", "completed": [],
+            }))
+
+        # The old artifact path has no journal, while the journal path was already
+        # shown. Both must carry a usable finishing command.
+        shown = self.cli("status", "demo").stdout
+        self.assertIn("T01 round 1 changes-requested", shown)
+        self.assertIn("docket decide demo T01 --changes", shown)
+        self.assertIn("T02 round 1 approved", shown)
+        self.assertIn("docket decide demo T02 --approve", shown)
+        self.assertIn("T03 round 1 approved", shown)
+        self.assertIn("docket decide demo T04 --waive", shown)
+        self.assertIn("docket decide demo T05 --reopen", shown)
+        self.assertIn("docket decide demo orch --approve", shown)
+
+        # A live owner lock means the transition is still being written. Inspection
+        # must leave the lock and its journal alone and must not offer a retry.
+        import fcntl
+        lock_path = run / ".locks" / "T03.lock"
+        lock_path.parent.mkdir()
+        with lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            try:
+                locked = self.cli("status", "demo").stdout
+            finally:
+                fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        self.assertIn("T01 round 1 changes-requested", locked)
+        self.assertIn("T02 round 1 approved", locked)
+        self.assertNotIn("T03 round 1 approved", locked)
+        self.assertIn("T03 round 1 approved", self.cli("status", "demo").stdout)
+
+    def test_t06_redeclare_preserves_old_bytes_on_invalid_spec(self) -> None:
+        self.repo()
+        run = self.init(evidence_mode="git")
+        declaration = run / ".snapshots" / "roots.json"
+        old = declaration.read_bytes()
+        refused = self.cli("roots", "demo", "--redeclare", "new=.",
+                           "missing=does-not-exist", ok=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertEqual(old, declaration.read_bytes())
+        self.assertIn("root", self.cli("roots", "demo").stdout)
+        self.assertFalse(list(declaration.parent.glob(".roots.json.*.tmp")))
+
+        # A valid replacement was already supported and remains supported.
+        self.cli("roots", "demo", "--redeclare", "new=.")
+        self.assertEqual(["new"], [item["alias"] for item in
+                         json.loads(declaration.read_text())["roots"]])
+
+    def test_t06_argparse_rejects_invalid_owners_and_dependency_ids(self) -> None:
+        run = self.init(evidence_mode="documents-only")
+        required = {
+            "set-model": ("--actual", "model"), "verify": ("--result", "pass"),
+            "prompt": ("--role", "implementor"), "escalation": ("--grant", "1"),
+            "dispatch": ("--session", "worker"), "resume": ("--session", "worker"),
+            "switch-model": ("--model", "model"), "decide": ("--approve",),
+        }
+        for command in ("assign", "validate-task", "scope", "handoff", "set-model",
+                        "submit", "verify", "prompt", "escalation", "dispatch",
+                        "resume", "switch-model", "propose-amendment", "decide",
+                        "diff", "bundle", "depend", "preflight"):
+            with self.subTest(command=command):
+                result = self.cli(command, "demo", "T01/../bad", *required.get(command, ()),
+                                  ok=False)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn("argument target" if command == "diff" else "argument owner",
+                              result.stderr)
+        for command, args in (("route", ("--kind", "blocked", "--owner", "bad")),
+                              ("health", ("--owner", "bad")),
+                              ("health", ("--flag-stall", "bad"))):
+            with self.subTest(option=args):
+                result = self.cli(command, "demo", *args, ok=False)
+                self.assertEqual(2, result.returncode, result.stderr)
+        for arg in ("T01,bad", "T01,orch", "T01,", "bad"):
+            with self.subTest(depends_on=arg):
+                result = self.cli("assign", "demo", "T02", "--depends-on", arg,
+                                  ok=False)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn("--depends-on", result.stderr)
+        for arg in ("bad:T01", "T02:bad", "T02:orch"):
+            with self.subTest(batch_depends_on=arg):
+                result = self.cli("batch", "demo", "--depends-on", arg, ok=False)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn("--depends-on", result.stderr)
+        for command, args in (("depend", ("demo", "T01", "--on", "bad")),
+                              ("batch", ("demo", "--members", "T01,bad")),
+                              ("review-packet", ("demo", "--correction", "bad")),
+                              ("feedback", ("demo", "--task", "bad"))):
+            result = self.cli(command, *args, ok=False)
+            self.assertEqual(2, result.returncode, result.stderr)
+        self.assertFalse((run / "T02-task.mdx").exists())
+
+        # Valid task IDs and a comma separated dependency worked before this fix.
+        self.cli("assign", "demo", "T01", "--file", "src/a.py", "--verify", "true")
+        self.cli("assign", "demo", "T03", "--file", "src/c.py", "--verify", "true")
+        self.cli("assign", "demo", "T02", "--depends-on", "T01,T03", "--file", "src/b.py",
+                 "--verify", "true")
+        self.assertEqual("T01,T03", parse_meta(run / "T02-task.mdx")["depends_on"])
+        self.assertEqual(0, self.cli("diff", "demo", "orch").returncode)
+        self.assertIn("diff coverage unavailable", self.cli("diff", "demo", "run").stdout)
+
+
+class CLILauncher(unittest.TestCase):
+    """`bin/docket` launches the CLI module, from anywhere, without recompiling it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.skill = DOCKET.resolve().parents[1]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def env(self, **extra: str) -> dict[str, str]:
+        """The caller's environment with no bytecode settings of its own."""
+        env = {k: v for k, v in os.environ.items() if k not in (
+            "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "XDG_CACHE_HOME",
+            "DOCKET_CONTRACTS_ROOT", "DOCKET_PROFILES_ROOT", *HARNESS_ENV)}
+        env["XDG_CACHE_HOME"] = str(self.root / "cache")
+        env.update(extra)
+        return env
+
+    def copy_skill(self, into: Path) -> Path:
+        """A copy of the skill under test, without caches or tests; returns its launcher."""
+        shutil.copytree(self.skill, into,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
+        return into / "bin" / "docket"
+
+    def run_cli(self, launcher: Path, *args: str, flags: tuple[str, ...] = (),
+                cwd: Path | None = None, env: dict[str, str] | None = None
+                ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, *flags, str(launcher), *args],
+                              cwd=str(cwd or self.root), env=env or self.env(),
+                              capture_output=True, text=True, timeout=120)
+
+    def module(self):  # type: ignore[no-untyped-def]
+        return load_cli("docket_launcher_mod")
+
+    def test_bin_docket_is_a_short_launcher_over_the_module(self) -> None:
+        """The executable imports the `docket_cli` package and calls its main; the CLI lives there."""
+        launcher = DOCKET.read_text()
+        self.assertLess(len(launcher.splitlines()), 80)
+        self.assertIn('"docket_cli"', launcher)
+        self.assertIn("module.main()", launcher)
+        self.assertTrue(launcher.startswith("#!/usr/bin/env -S uv run --script\n"))
+        self.assertEqual(self.skill / "docket_cli", CLI_PACKAGE)
+        self.assertFalse((self.skill / "docket_cli.py").exists(), "the single module is gone")
+        self.assertIn("\ndef main() -> None:\n", (CLI_PACKAGE / "cli.py").read_text())
+
+    def test_the_package_modules_import_in_one_order_from_the_stdlib_only(self) -> None:
+        """`MODULES` names every module, and each imports only earlier ones and the stdlib.
+
+        Every name is defined in one module, so the package is still the one namespace
+        the CLI was, and the launcher imports all of it.
+        """
+        import ast
+        self.assertTrue(CLI_PACKAGE.is_dir(), f"no CLI package at {CLI_PACKAGE}")
+        init = ast.parse((CLI_PACKAGE / "__init__.py").read_text())
+        listed = [node.value for node in init.body if isinstance(node, ast.Assign)
+                  and [getattr(target, "id", "") for target in node.targets] == ["MODULES"]]
+        self.assertEqual(1, len(listed), "__init__.py declares MODULES once")
+        order = [element.id for element in listed[0].elts]
+        self.assertEqual(sorted(path.stem for path in CLI_PACKAGE.glob("*.py")
+                                if path.name != "__init__.py"), sorted(order))
+        self.assertEqual("cli", order[-1], "main sits above every module it dispatches to")
+        allowed = set(sys.stdlib_module_names) | {"__future__"}
+        defined: dict[str, str] = {}
+        for index, name in enumerate(order):
+            tree = ast.parse((CLI_PACKAGE / f"{name}.py").read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    self.assertIn(node.module, order[:index], f"{name} imports {node.module}")
+                elif isinstance(node, ast.ImportFrom):
+                    self.assertIn(str(node.module).split(".")[0], allowed, f"{name}: {node.module}")
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertIn(alias.name.split(".")[0], allowed, f"{name}: {alias.name}")
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    names = [node.name]
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names = [leaf.id for target in targets for leaf in ast.walk(target)
+                             if isinstance(leaf, ast.Name)]
+                else:
+                    continue
+                for defined_name in names:
+                    self.assertNotIn(defined_name, defined,
+                                     f"{defined_name} is defined in {defined.get(defined_name)} and {name}")
+                    defined[defined_name] = name
+        out = self.run_cli(DOCKET, "--help", flags=("-X", "importtime"))
+        self.assertEqual(0, out.returncode, out.stderr)
+        imported = re.findall(r"\|\s+docket_cli\.(\w+)$", out.stderr, re.MULTILINE)
+        self.assertEqual(sorted(order), sorted(imported), "the launcher imports every module")
+
+    def test_every_self_located_path_resolves_as_before(self) -> None:
+        """References, contracts, profiles, obligations, and re-invocation stay put."""
+        import types
+        saved = {k: os.environ.pop(k) for k in ("DOCKET_CONTRACTS_ROOT", "DOCKET_PROFILES_ROOT")
+                 if k in os.environ}
+        self.addCleanup(os.environ.update, saved)
+        mod = self.module()
+        references = self.skill / "references"
+        self.assertEqual(references / "contracts", mod.contracts_dir())
+        self.assertEqual(references / "model-profiles", mod.profiles_dir())
+        self.assertEqual(references / "verification-obligations.md",
+                         mod.verification_obligations_path())
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.root)
+        try:
+            self.assertEqual(f"not installed (using repo CLI at {DOCKET.resolve().parent})",
+                             mod.installation_state())
+        finally:
+            if home is None:
+                os.environ.pop("HOME")
+            else:
+                os.environ["HOME"] = home
+        calls: list[list[str]] = []
+        mod.subprocess = types.SimpleNamespace(
+            run=lambda argv, **_: calls.append(argv))
+        mod.root = lambda: self.root
+        mod.docket_subprocess("--help")
+        self.assertEqual([[sys.executable, str(DOCKET.resolve()), "--help"]], calls)
+        playbook = self.run_cli(DOCKET, "help", "implementor")
+        self.assertEqual(0, playbook.returncode, playbook.stderr)
+        self.assertIn((references / "implementor.md").read_text().splitlines()[0],
+                      playbook.stdout)
+
+    def test_the_cli_runs_from_any_directory_and_through_a_symlink(self) -> None:
+        """A relative or symlinked launcher resolves the same skill from any cwd."""
+        direct = self.run_cli(DOCKET, "help", "implementor")
+        self.assertEqual(0, direct.returncode, direct.stderr)
+        link = self.root / "path" / "docket"
+        link.parent.mkdir()
+        link.symlink_to(DOCKET.resolve())
+        for cwd in (Path("/"), self.root, self.skill / "references"):
+            with self.subTest(cwd=str(cwd)):
+                linked = self.run_cli(link, "help", "implementor", cwd=cwd)
+                self.assertEqual(0, linked.returncode, linked.stderr)
+                self.assertEqual(direct.stdout, linked.stdout)
+        relative = subprocess.run(
+            [sys.executable, os.path.relpath(DOCKET.resolve(), self.skill.parent), "--help"],
+            cwd=str(self.skill.parent), env=self.env(), capture_output=True, text=True,
+            timeout=120)
+        self.assertEqual(0, relative.returncode, relative.stderr)
+        self.assertIn("usage: docket", relative.stdout)
+
+    def test_the_installed_layout_reads_its_own_files(self) -> None:
+        """A copy at ~/.agents/skills/docket, reached by the README symlink, reads itself."""
+        home = self.root / "home"
+        launcher = self.copy_skill(home / ".agents" / "skills" / "docket")
+        playbook = launcher.parents[1] / "references" / "implementor.md"
+        playbook.write_text(playbook.read_text() + "\nInstalled-copy marker line.\n")
+        link = home / ".local" / "bin" / "docket"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(launcher)
+        out = self.run_cli(link, "help", "implementor", env=self.env(HOME=str(home)))
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertIn("Installed-copy marker line.", out.stdout)
+        self.assertNotIn("Installed-copy marker line.",
+                         self.run_cli(DOCKET, "help", "implementor").stdout)
+
+    def test_t07_prompt_quotes_spaced_launcher_without_path_entry(self) -> None:
+        launcher = self.copy_skill(self.root / "skill copy" / "docket")
+        created = self.run_cli(launcher, "init", "spaced", "--mode", "standard",
+                               "--evidence-mode", "documents-only")
+        self.assertEqual(0, created.returncode, created.stderr)
+        assigned = self.run_cli(
+            launcher, "assign", "spaced", "T01", "--harness", "codex",
+            "--file", "src/a.py", "--verify", "true", "--title", "Copy path",
+            "--goal", "Use the copied CLI", "--criterion", "The CLI runs")
+        self.assertEqual(0, assigned.returncode, assigned.stderr)
+        prompt = self.run_cli(launcher, "prompt", "spaced", "T01", "--role",
+                              "implementor", env=self.env(PATH=""))
+        self.assertEqual(0, prompt.returncode, prompt.stderr)
+        expected_launcher = str(launcher.resolve())
+        quoted_launcher = shlex.quote(expected_launcher)
+        self.assertNotEqual(expected_launcher, quoted_launcher)
+        self.assertIn(f"`{quoted_launcher} scope spaced T01 --submit`", prompt.stdout)
+        command = re.search(r"`([^`]* scope spaced T01 --submit)`", prompt.stdout)
+        self.assertIsNotNone(command)
+        assert command is not None
+        self.assertEqual([expected_launcher, "scope", "spaced", "T01", "--submit"],
+                         shlex.split(command.group(1)))
+
+    def test_the_uv_shebang_runs_the_launcher(self) -> None:
+        """Executing `bin/docket` directly goes through its `uv run --script` shebang."""
+        if shutil.which("uv") is None:
+            self.skipTest("uv is not installed")
+        out = subprocess.run([str(DOCKET.resolve()), "help", "implementor"], cwd=str(self.root),
+                             env=self.env(), capture_output=True, text=True, timeout=300)
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual(self.run_cli(DOCKET, "help", "implementor").stdout, out.stdout)
+
+    def test_a_repeated_call_compiles_nothing_and_caches_outside_the_skill(self) -> None:
+        """The second call loads hash-checked bytecode from the user cache, not the checkout."""
+        launcher = self.copy_skill(self.root / "tree" / "skills" / "docket")
+        package = launcher.parents[1] / "docket_cli"
+        cache = self.root / "cache" / "docket" / "pycache"
+        pycs = [cache / str(package.resolve()).lstrip("/") /
+                f"{source.stem}.{sys.implementation.cache_tag}.pyc"
+                for source in sorted(package.glob("*.py"))]
+        self.assertIn("__init__", [pyc.name.split(".")[0] for pyc in pycs])
+        first = self.run_cli(launcher, "--help")
+        self.assertEqual(0, first.returncode, first.stderr)
+        for pyc in pycs:
+            self.assertTrue(pyc.is_file(), f"no bytecode at {pyc}")
+            self.assertEqual(0b11, int.from_bytes(pyc.read_bytes()[4:8], "little"),
+                             "bytecode must be checked against the source hash")
+        again = self.run_cli(launcher, "--help", flags=("-v",))
+        self.assertEqual(0, again.returncode, again.stderr)
+        self.assertEqual(first.stdout, again.stdout)
+        for pyc in pycs:
+            self.assertIn(f"code object from {str(pyc)!r}", again.stderr)
+        self.assertNotIn("docket_cli", "\n".join(
+            line for line in again.stderr.splitlines() if line.startswith("# wrote")))
+        self.assertEqual([], sorted(str(p) for p in (self.root / "tree").rglob("__pycache__")))
+        prefix = self.root / "prefix"
+        chosen = self.run_cli(launcher, "--help", env=self.env(PYTHONPYCACHEPREFIX=str(prefix)))
+        self.assertEqual(0, chosen.returncode, chosen.stderr)
+        for pyc in pycs:
+            self.assertTrue((prefix / pyc.relative_to(cache)).is_file())
+
+    def test_an_edit_in_the_same_second_never_runs_stale_bytecode(self) -> None:
+        """Same size, same mtime, new text: the hash check still sees the edit."""
+        launcher = self.copy_skill(self.root / "tree" / "skills" / "docket")
+        module = launcher.parents[1] / "docket_cli" / "cli.py"
+        self.assertIn("run the suite once", module.read_text())
+        self.assertIn("run the suite once", self.run_cli(launcher, "--help").stdout)
+        stat_before = module.stat()
+        text = module.read_text()
+        module.write_text(text.replace("run the suite once", "run the suite ONCE", 1))
+        os.utime(module, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+        self.assertEqual(stat_before.st_size, module.stat().st_size)
+        edited = self.run_cli(launcher, "--help")
+        self.assertEqual(0, edited.returncode, edited.stderr)
+        self.assertIn("run the suite ONCE", edited.stdout)
+
+    def test_pycache_stays_ignored_in_this_repository(self) -> None:
+        """The repository's .gitignore keeps `__pycache__/` out of version control."""
+        ignore = DOCKET.resolve().parents[3] / ".gitignore"
+        self.assertIn("__pycache__/", ignore.read_text().splitlines())

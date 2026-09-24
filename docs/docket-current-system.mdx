@@ -11,7 +11,7 @@ It describes the implemented system and the operating contracts.
 It is not a replacement for the executable CLI or its tests.
 
 For improvement requirements in this repository, [`improvements/workflow-improvement-plan.md`](../improvements/workflow-improvement-plan.md) is the declared source of truth.
-For current behavior, [`skills/docket/bin/docket`](../skills/docket/bin/docket) and [`skills/docket/tests/test_docket.py`](../skills/docket/tests/test_docket.py) are the executable truth.
+For current behavior, [`skills/docket/docket_cli/`](../skills/docket/docket_cli/) and [`skills/docket/tests/test_docket.py`](../skills/docket/tests/test_docket.py) are the executable truth.
 [`ARCHITECTURE.md`](../ARCHITECTURE.md) explains the mechanics and invariants, while [`skills/docket/SKILL.md`](../skills/docket/SKILL.md) and the role references define how agents operate the system.
 
 ## 1. Mental model
@@ -238,7 +238,6 @@ Optional flat policy fields include:
 primary_model: provider/model
 fallback_models: provider/model-a,provider/model-b
 max_concurrency: 2
-stall_grace_seconds: <seconds>
 ```
 
 The planner defines functional intent and observable acceptance.
@@ -879,7 +878,8 @@ Use `docket <command> --help` for the current argument contract.
 | [`signalling.md`](../skills/docket/references/signalling.md) | Hook, watcher, inbox, lease, registration, and quiet-wait behavior |
 | [`verification-obligations.md`](../skills/docket/references/verification-obligations.md) | Reusable adversarial verification principles |
 | [`workflow-improvement-plan.md`](../improvements/workflow-improvement-plan.md) | Sole product requirements source for the improvement program |
-| [`bin/docket`](../skills/docket/bin/docket) | Stdlib-only executable implementation |
+| [`docket_cli/`](../skills/docket/docket_cli/) | Stdlib-only implementation, one module per code-map region |
+| [`bin/docket`](../skills/docket/bin/docket) | Launcher that runs the `docket_cli` package from cached bytecode |
 | [`test_docket.py`](../skills/docket/tests/test_docket.py) | Behavioral regression suite |
 | [`docket-architecture.html`](./docket-architecture.html) | Existing visual single-file architecture guide |
 
@@ -893,10 +893,10 @@ The following are documented limits rather than accidental omissions:
 - A verification command that writes non-ignored source files causes submission to fail.
 - Checkout roots cannot be redeclared after a baseline exists.
 - Oversized untracked files block Git evidence capture rather than producing incomplete evidence.
-- `events --peek` is inspection only; direct watcher announcement does not claim an inbox lease.
+- `events --peek` is inspection only; `watch` reconciles pending events and claims a bounded announcement lease before recording a wake.
 - Delivery is at-least-once and wake events are not authenticated.
 - Manual delivery remains necessary when no positively verified safe turn boundary exists.
-- The three-round cap in the orchestrator playbook is advice; the configurable correction budget is the enforced mechanism.
+- The configurable correction budget is enforced and exhaustion routes to the plan owner for an explicit grant.
 - Scope submission does not yet sanity-check whether the first word of `verify:` resolves in `/bin/sh`.
 - `docket status` truncates displayed verification commands.
 

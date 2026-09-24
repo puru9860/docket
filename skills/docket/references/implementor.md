@@ -33,6 +33,9 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    reports its diff coverage. Unavailable coverage under `evidence_mode: git` is a
    rejection, not an empty diff: fix the workspace so the task diff is readable, or
    report the blocker. Do not describe unverifiable work as verified.
+   Run every `docket preflight`, `docket submit`, and `docket verify` with the
+   longest shell timeout available.
+   Never re-run one that may still be running; read its result before retrying.
    If the task consumes another task's work, record it with `docket depend <run>
    <owner> --on <other>` before you rely on it. That pins the exact evidence you
    read; if the other task later freezes something different, your own submission is
