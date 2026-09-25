@@ -146,8 +146,9 @@ ln -sfn ~/.agents/skills/docket/bin/docket ~/.local/bin/docket
 docket help planner
 ```
 
-`bin/docket` is a single stdlib-only [uv](https://docs.astral.sh/uv/) script with no
-dependencies. Replace the shebang with `#!/usr/bin/env python3` if you would rather not
+`bin/docket` is a short stdlib-only [uv](https://docs.astral.sh/uv/) script with no
+dependencies; it runs the CLI in the `docket_cli` package from bytecode cached under
+`~/.cache/docket/pycache`. Replace the shebang with `#!/usr/bin/env python3` if you would rather not
 use uv; nothing else changes.
 
 ## Quick start
@@ -265,7 +266,7 @@ docket events <run> --role R --peek                  inspect events, consuming n
 docket arm <run> --role R                            arm the watcher for a waiting role
 docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
-docket watch <run> --role orchestrator|planner|verifier|reviewer
+docket watch <run> --role coordinator|checker|orchestrator|planner|verifier|reviewer
                                                      block until something needs you
 docket help <role>                                   the playbooks
 ```
@@ -299,6 +300,8 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
 Arm **every role that will wait**, then disarm when the run ends:
 
 ```bash
+docket arm R01 --role coordinator    # quick: waiting on the checker and escalations
+docket arm R01 --role checker        # quick: waiting on submitted rounds
 docket arm R01 --role orchestrator   # waiting on implementors
 docket arm R01 --role planner        # waiting on the orchestrator (split only)
 docket arm R01 --role verifier       # waiting on submissions (five-role runs)
@@ -350,6 +353,25 @@ docket usage R01 --archive    # also keep a copy of every transcript and log its
 
 The final aggregate verdict archives automatically, into `~/.local/state/docket/sessions/` beside the log, with private permissions because transcripts can hold secrets.
 The digest then reports token usage by role across runs.
+
+### Per-model learning
+
+Every time a task's work is rejected, docket records a case about the model that did it: a submit refused by the gate, a failed verification, requested changes (with the checker's numbered required changes), a block, or an escalation.
+Verdicts are recorded too, so every rate has a denominator.
+Review them periodically and turn what recurs into a short profile for that model:
+
+```bash
+docket models                              # scorecard per model: first-pass rate, rounds, rejects, tokens
+docket models --review deepseek/deepseek-flash   # evidence packet: new cases since the last review
+docket models --adopt profile.md           # install the reviewed profile for that model
+docket models --import                     # once per project: backfill cases from existing runs
+docket models --alias 'DeepSeek V4.1 Flash=deepseek/deepseek-flash'  # one model, two names
+```
+
+Hand the review packet to a strong session ("review this docket model packet and draft the profile"); it ends with the exact format and rules.
+A rule is kept only when cases from at least two tasks support it, and raw cases never enter prompts.
+An adopted profile lives in `~/.config/docket/model-profiles/` (`DOCKET_MODEL_PROFILES` moves it), survives skill updates, and is carried by every later prompt for a task assigned with that exact `--model`.
+Prompts record the profile revision they carried, so the next review shows each model's first-pass rate per profile revision, and the feedback digest says when a model has enough new cases to review.
 
 `DOCKET_FEEDBACK_LOG=path` moves the log and `DOCKET_FEEDBACK_LOG=off` disables it and the archive; `DOCKET_SESSION_CAPTURE=off` stops noting sessions; feedback never blocks a run.
 
