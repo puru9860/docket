@@ -190,7 +190,7 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
         for entry in open_escalations(d, ("granted",)):
             owner = str(entry.get("owner", ""))
             grnd, gst = state_of(d, owner)
-            if gst != "submitted":
+            if gst not in ("submitted", "blocked"):
                 continue
             draft = d / f"{owner}-decision-{grnd:02d}.mdx"
             try:

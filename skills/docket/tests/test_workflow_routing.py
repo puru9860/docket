@@ -25,7 +25,7 @@ class WorkflowRouting(unittest.TestCase):
     def events(self, run, role):
         return {str(e["key"]): e for e in self.module.derive_events(run, role)}
 
-    def prepare(self, name, mode="standard", dependent=False):
+    def prepare(self, name, mode="standard", dependent=False, blocked=False):
         self.cli("init", name, "--mode", mode, "--evidence-mode", "documents-only")
         run = self.f.root / ".docket/runs" / name
         for owner in (("T01", "T02") if dependent else ("T01",)):
@@ -43,13 +43,14 @@ class WorkflowRouting(unittest.TestCase):
                  "T01,T02" if dependent else "T01", "--milestone", "--command", "true",
                  "--as", "planner")
         self.cli("batch", name, "--close", "M1", "--as", "planner")
-        self.submit(run, mode=mode)
+        self.submit(run, mode=mode, blocked=blocked)
         return run
 
-    def submit(self, run, rnd=1, mode="standard"):
-        self.f.fill_task_report(run / f"T01-report-{rnd:02d}.mdx")
-        self.cli("submit", run.name, "T01", "--as", "implementor")
-        if mode == "standard":
+    def submit(self, run, rnd=1, mode="standard", blocked=False):
+        self.f.fill_task_report(run / f"T01-report-{rnd:02d}.mdx", blocked=blocked)
+        self.cli("submit", run.name, "T01", "--as", "implementor",
+                 *(("--blocked",) if blocked else ()))
+        if mode == "standard" and not blocked:
             self.cli("verify", run.name, "T01", "--result", "pass", "--as", "verifier")
 
     def suite(self, run, command="true", mode="standard", ok=True):
@@ -188,6 +189,55 @@ class WorkflowRouting(unittest.TestCase):
         self.assertEqual(first, retry)
         with self.assertRaises(SystemExit):
             self.module.claim_event(run, run.name, "implementor", "second", key="launch:reviewer")
+
+    def check_blocked_budget_grant(self, mode):
+        run = self.prepare(f"blocked-budget-{mode}", mode=mode, blocked=True)
+        for rnd in (1, 2, 3):
+            if rnd > 1:
+                self.submit(run, rnd=rnd, mode=mode, blocked=True)
+            self.cli("route", run.name, "--kind", "blocked", "--owner", "T01")
+            self.consume_review(run)
+            correction = self.cli("decide", run.name, "T01", "--changes", "--change",
+                                  "Resolve the blocked boundary condition.", "--as", "reviewer",
+                                  ok=False)
+            self.assertEqual(1 if rnd == 3 else 0, correction.returncode, correction.stderr)
+        report = run / "T01-report-03.mdx"
+        self.assertEqual("blocked", fixtures.parse_meta(report)["status"])
+        before_report = report.read_bytes()
+        bundle_dir = run / ".bundles/T01/03"
+        before_bundle = {p.relative_to(bundle_dir): p.read_bytes()
+                         for p in bundle_dir.rglob("*") if p.is_file()}
+        self.assertTrue(before_bundle)
+        self.assertTrue(any("escalated" in k for k in self.events(run, "planner")))
+        self.cli("escalation", run.name, "T01", "--grant", "1", "--as", "planner",
+                 "--reason", "Resolve the outstanding blocker.")
+        key = "T01:3:budget-granted:T01-r01"
+        events = self.events(run, "reviewer")
+        self.assertIn(key, events)
+        self.assertFalse(any("budget-granted" in k for k in self.events(run, "verifier")))
+        self.assertEqual(before_report, report.read_bytes())
+        self.assertEqual(before_bundle, {p.relative_to(bundle_dir): p.read_bytes()
+                                        for p in bundle_dir.rglob("*") if p.is_file()})
+        self.assertIn("Resolve the blocked boundary condition.",
+                      (run / "T01-decision-03.mdx").read_text())
+        wake = self.cli("watch", run.name, "--role", "reviewer", "--timeout", "0", ok=False)
+        self.assertEqual(2, wake.returncode, wake.stderr)
+        self.assertIn("was granted", wake.stderr)
+        command = events[key]["message"].split("`")[1]
+        self.cli(*shlex.split(command)[1:])
+        self.assertEqual("changes-requested", fixtures.parse_meta(report)["status"])
+        self.assertEqual("draft", fixtures.parse_meta(run / "T01-report-04.mdx")["status"])
+        self.assertNotIn(key, self.events(run, "reviewer"))
+        runner = "implementor" if mode == "quick" else "orchestrator"
+        self.assertIn("T01:4:correction-ready", self.events(run, runner))
+        self.cli(*shlex.split(command)[1:])
+        self.assertFalse((run / "T01-report-05.mdx").exists())
+
+    def test_quick_blocked_budget_grant_wakes_reviewer(self):
+        self.check_blocked_budget_grant("quick")
+
+    def test_standard_blocked_budget_grant_wakes_reviewer(self):
+        self.check_blocked_budget_grant("standard")
 
     def test_suite_ready_retires_while_running_and_failure_routes_only_recovery(self):
         run = self.prepare("suite-states")

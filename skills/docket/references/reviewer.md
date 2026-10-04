@@ -102,7 +102,8 @@ for legacy runs. A frontier is a wake, never a combined verdict: approving one
    the default budget; exhaustion opens one durable escalation, never an
    automatic approval or waiver. The escalation wakes the planner, who owns the
    budget as plan policy and may grant rounds with `docket escalation`; a grant
-   wakes you with `budget-granted` to apply the refused changes. A verification
+   wakes you with `budget-granted` to apply the refused changes for a submitted
+   or blocked report. The grant leaves its frozen evidence untouched. A verification
    fail is charged to the budget only when it opens the correction itself.
 4. A plan that cannot meet the objective goes back as a planner amendment with
    the objective and contract gap explained, not as an implementation defect.
