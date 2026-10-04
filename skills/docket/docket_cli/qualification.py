@@ -23,8 +23,9 @@ from .publication import fault, publish, publish_json
 from .policy import need_run, require_preset_role
 from .evidence import git_argv, git_env, state_prefix
 from .bundles import check_frozen_digest, freeze_record, source_tree
-from .liveness import read_registration
+from .liveness import live_dispatches, read_registration
 from .events import derive_events
+from .verification import write_checkpoint
 from .delivery import (
     announce_active, announce_delivered, claim_event, delivery_dir, delivery_lock,
     delivery_log, input_active_flag, outbox_path, paused_flag, read_lease, sweep_role,
@@ -866,6 +867,15 @@ def cmd_delivery(a: argparse.Namespace) -> None:
     if a.pause:
         publish(paused_flag(d, role), f"paused_at: {stamp()}\n")
         print(f"paused delivery for {a.run} {role}; implementation continues, events queue")
+        for record in live_dispatches(d):
+            owner = str(record.get("owner", "") or "")
+            if not owner:
+                continue
+            try:
+                checkpoint = write_checkpoint(d, owner)
+                print(f"automatic checkpoint {checkpoint.name} for paused {owner}")
+            except (OSError, ValueError):
+                pass
         return
     if a.resume:
         paused_flag(d, role).unlink(missing_ok=True)
@@ -890,7 +900,11 @@ def cmd_delivery(a: argparse.Namespace) -> None:
         return
     if a.service_status:
         boundary, mode, _ = probe_boundary()
-        print(f"supervised delivery service: none (never a model-launched background job)")
+        print("supervised delivery service: none - by design, never a model-launched "
+              "background job; native Stop hooks and `docket watch` replaced it")
+        print("delivery: native hooks and blocking watch; explicit "
+              "`docket inbox --claim` when queued; unattended only when "
+              "`docket delivery --probe` reports unattended")
         print(f"mode: {mode} (boundary: {boundary})")
         for known in KNOWN_EVENT_ROLES:
             flag = "paused" if paused_flag(d, known).is_file() else "live"

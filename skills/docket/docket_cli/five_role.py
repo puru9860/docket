@@ -9,15 +9,15 @@ from pathlib import Path
 
 from .common import MODE_QUICK, MODE_STANDARD, die, stamp
 from .frontmatter import render
-from .paths import _ordered, decisions, next_numbered, root
+from .paths import _ordered, decisions, next_numbered, planned_tasks, root
 from .publication import publish_exclusive, publish_json
 from .policy import (
-    artifact_policy_fields, correction_limit_of, is_five_role, mode_of, need_run,
+    artifact_policy_fields, correction_limit_of, is_five_role, is_quick_milestone, mode_of, need_run,
     plan_owner_role, task_executor, verifier_role_of,
 )
 from .bundles import digest_of
 from .locks import owner_lock, run_lock
-from .state import armed, corrections_path, latest_verification, read_corrections, state_of
+from .state import armed, corrections_path, latest_verification, list_batches, read_corrections, state_of
 from .feedback import machine_feedback
 from .models import record_outcome
 
@@ -125,6 +125,31 @@ def run_complete_event(d: Path) -> tuple[str, str, str, int, str] | None:
     The plan owner is the session the user talks to; without this wake it keeps
     waiting after the reviewer settles the run and never reports the outcome.
     """
+    if is_quick_milestone(d):
+        from .batches import batch_verification_historical_valid, current_member_bundles
+        planned = set(planned_tasks(d))
+        if not planned or any(state_of(d, owner)[1] not in ("approved", "waived", "completed")
+                              for owner in planned):
+            return None
+        milestones = [batch for batch in list_batches(d) if batch.get("milestone")]
+        covered = [str(member) for batch in milestones for member in batch.get("members", [])]
+        if sorted(covered) != sorted(planned):
+            return None
+        for batch in milestones:
+            decision = batch.get("milestone_decision") or {}
+            verification = batch.get("verification") or {}
+            if (batch.get("state") != "closed" or decision.get("verdict") != "approved"
+                    or decision.get("batch_verification") != verification.get("digest")
+                    or decision.get("member_bundles") != current_member_bundles(d, batch)
+                    or not batch_verification_historical_valid(d, batch)):
+                return None
+        signature = ";".join(f"{batch.get('batch')}:{(batch.get('verification') or {}).get('digest')}"
+                             for batch in sorted(milestones, key=lambda item: str(item.get("batch"))))
+        revision = "sha256:" + hashlib.sha256(signature.encode()).hexdigest()
+        return (f"milestones:complete:{revision[7:19]}",
+                f"run {d.name} is complete: {len(milestones)} milestone(s) approved. Tell the "
+                f"user the outcome, record feedback, run `docket usage {d.name} --archive`, "
+                f"and `docket disarm {d.name}`", "", 0, revision)
     rnd, st = state_of(d, "orch")
     if st not in ("approved", "waived", "completed"):
         return None
@@ -171,7 +196,7 @@ def cmd_escalation(a: argparse.Namespace) -> None:
     if gst == "submitted" and refused_verifier_correction(d, a.owner, grnd) is not None:
         woken = f"the {verifier_role_of(d)} is woken to finish the correction it was refused"
     else:
-        reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+        reviewer = "checker" if mode_of(d) == MODE_QUICK and not is_quick_milestone(d) else "reviewer"
         woken = f"the {reviewer} is woken to apply the correction it was refused"
     print(f"granted {a.owner} {a.grant} more correction round(s): "
           f"{correction_attempts(record)} used of {correction_budget(d, a.owner, record)}; "
@@ -319,7 +344,7 @@ def route_blocked(d: Path, run: str, owner: str, note: str) -> None:
             routes_dir(d).mkdir(parents=True, exist_ok=True)
             publish_json(path, {"owner": owner, "round": rnd, "kind": "blocked",
                                 "note": note.strip(), "routed_at": stamp()})
-    reviewer = "checker" if mode_of(d) == MODE_QUICK else "reviewer"
+    reviewer = "checker" if mode_of(d) == MODE_QUICK and not is_quick_milestone(d) else "reviewer"
     print(f"routed {owner} round {rnd} to the {reviewer}; notification queued for its watcher")
     if (run, reviewer) not in armed():
         print(f"warning: {reviewer} is unarmed for {run}; arm it to receive the queued notification")
@@ -334,7 +359,7 @@ def cmd_route(a: argparse.Namespace) -> None:
         route_blocked(d, a.run, a.owner or "", a.note or "")
         return
     dest, action = ROUTE_TABLE[a.kind]
-    if mode_of(d) == MODE_QUICK:
+    if mode_of(d) == MODE_QUICK and not is_quick_milestone(d):
         dest = {"planner": "coordinator", "orchestrator": "coordinator",
                 "reviewer": "checker"}.get(dest, dest)
     owner = a.owner or ""

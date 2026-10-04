@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import hashlib
+import io
+import json
+import os
 import re
 import shlex
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from .common import (
     COVERAGE_AVAILABLE, COVERAGE_UNAVAILABLE, DOCUMENTS_ONLY, MODE_CUSTOM,
     MODE_NEW_RUN_DEFAULT, MODE_QUICK, MODE_STANDARD, REQUIRED_HANDOFF_SECTIONS,
-    REQUIRED_SCOPE_SECTIONS, REVIEW_COMBINED_CHECKER, REVIEW_INDEPENDENT, ROOTS_DECLARED,
-    ROOTS_INVALID, STATE_DIR, SUPPORTED_HARNESSES, WORKFLOW_FIVE_ROLE,
-    WORKFLOW_LEGACY_DECODE, WORKFLOW_NEW_RUN_DEFAULT, die, stamp,
+    REQUIRED_SCOPE_SECTIONS, REVIEW_COMBINED_CHECKER, REVIEW_INDEPENDENT,
+    REVIEW_QUICK_MILESTONE, REVIEW_TIERED,
+    ROOTS_DECLARED, ROOTS_INVALID, STATE_DIR, SUPPORTED_HARNESSES, WORKFLOW_FIVE_ROLE,
+    WORKFLOW_LEGACY_DECODE, WORKFLOW_NEW_RUN_DEFAULT, die, now_s, stamp,
 )
 from .frontmatter import parse, render, set_section
 from .paths import (
@@ -23,8 +30,8 @@ from .paths import (
 )
 from .publication import fault, publish, publish_exclusive, publish_json
 from .policy import (
-    artifact_policy_fields, max_concurrency_of, mode_of, need_run, require_preset_role,
-    role_sessions_for,
+    artifact_policy_fields, is_tiered, max_concurrency_of, mode_of, need_run, require_preset_role,
+    is_quick_milestone, role_effort, role_model, role_sessions_for,
 )
 from .evidence import git_root
 from .roots import candidate_roots, declare_roots, read_roots, resolve_scope, root_identity
@@ -39,7 +46,7 @@ from .bundles import (
 from .locks import owner_lock
 from .state import (
     DECIDE_FLAGS, _cycle_for_new_edges, decide_as, generated_path_hint, handoff_state,
-    list_batches, list_incidents, normalized_scope, read_transition, scope_collisions,
+    latest_checkpoint, list_batches, list_incidents, normalized_scope, read_transition, scope_collisions,
     scope_state, seed_report_acceptance, state_of, unfinished_decision,
 )
 from .dependencies import (
@@ -48,16 +55,34 @@ from .dependencies import (
 )
 from .aggregates import aggregate_bundle_problems, stale_aggregate
 from .verification import (
-    claim_verify_slot, execute_verify, latest_reusable_verification, task_env,
-    verification_run_env, verify_slot_path,
+    claim_verify_slot, execute_verify, latest_reusable_verification,
+    parse_framework_counts, task_env, verification_run_env, verify_slot_path,
+    write_checkpoint,
 )
 from .templates import template
-from .sessions import calling_harness
-from .liveness import live_dispatches
-from .batches import batch_ready
+from .sessions import (
+    calling_harness, codex_limit_lines, codex_rate_limits, harness_process_ref, harness_session,
+    run_harness_sessions,
+)
+from .liveness import dispatch_dependencies_unmet, dispatch_liveness, live_dispatches
+from .batches import batch_ready, cmd_batch as _batches_cmd_batch
 from .delivery import delivery_lock, sweep_role
 from .health import execution_health
 from .gate import required_section_problems, task_intent_problems
+
+
+def cmd_batch_entry(a: argparse.Namespace) -> None:
+    """Batch entry point: milestone approval runs the decision transition.
+
+    Batches (creation, closing, verification) live before transitions in MODULES,
+    so approval - which runs decide_locked per member - lives in transitions and
+    is reached here. Commands sits after both and can call either.
+    """
+    if str(getattr(a, "approve", "") or "").strip():
+        from .transitions import cmd_batch_decide as _decide_batch
+        _decide_batch(a, need_run(a.run))
+        return
+    _batches_cmd_batch(a)
 
 
 def init_policy(a: argparse.Namespace) -> dict[str, str]:
@@ -80,9 +105,9 @@ def init_policy(a: argparse.Namespace) -> dict[str, str]:
         if requested_workflow and requested_workflow != WORKFLOW_FIVE_ROLE:
             die("quick mode requires workflow five-role-v1; mode and workflow are "
                 "separate, and this preset cannot be weakened to legacy")
-        if requested_topology and requested_topology != "combined":
-            die("quick mode requires topology combined for its coordinator session")
-        workflow, selected_topology = WORKFLOW_FIVE_ROLE, "combined"
+        if requested_topology and requested_topology != "split":
+            die("quick mode requires topology split for its separate planner session")
+        workflow, selected_topology = WORKFLOW_FIVE_ROLE, "split"
     elif selected_mode == MODE_STANDARD:
         if agents not in (0, 5):
             die("standard mode is the five-role preset; --agents must be 5")
@@ -99,20 +124,27 @@ def init_policy(a: argparse.Namespace) -> dict[str, str]:
         if not requested_workflow and not requested_topology:
             selected_mode = MODE_NEW_RUN_DEFAULT
             workflow = WORKFLOW_NEW_RUN_DEFAULT
-            selected_topology = "combined" if selected_mode == MODE_QUICK else "split"
+            selected_topology = "split"
         else:
             workflow = requested_workflow or WORKFLOW_NEW_RUN_DEFAULT
             selected_topology = requested_topology or "split"
             selected_mode = MODE_CUSTOM
-    review_policy = (REVIEW_COMBINED_CHECKER if selected_mode == MODE_QUICK
-                     else ("legacy-completion" if workflow == WORKFLOW_LEGACY_DECODE
-                           else REVIEW_INDEPENDENT))
+    if selected_mode == MODE_QUICK:
+        review_policy = REVIEW_QUICK_MILESTONE
+    elif selected_mode == MODE_STANDARD:
+        review_policy = REVIEW_TIERED
+    elif workflow == WORKFLOW_LEGACY_DECODE:
+        review_policy = "legacy-completion"
+    else:
+        review_policy = REVIEW_INDEPENDENT
     return {
         "mode": selected_mode,
         "workflow": workflow,
         "topology": selected_topology,
-        "role_sessions": role_sessions_for(selected_mode, workflow, selected_topology),
+        "role_sessions": role_sessions_for(selected_mode, workflow, selected_topology,
+                                            review_policy),
         "review_policy": review_policy,
+        "verifier_correction": "allowed" if review_policy == REVIEW_TIERED else "forbidden",
     }
 
 
@@ -168,8 +200,17 @@ def cmd_init(a: argparse.Namespace) -> None:
         print(f"\nNext: fill in the plan, then `docket status {a.run}`.")
 
 
+DEFAULT_REVIEW_CRITERIA = (
+    "sibling sites with the same defect are fixed or shown unaffected by focused tests.",
+    "existing behavior that this change can affect remains proven by regression tests.",
+    "side effects on pre-existing data and unrelated outputs are tested or documented.",
+)
+
+
 def cmd_assign(a: argparse.Namespace) -> None:
     d = need_run(a.run)
+    if is_quick_milestone(d) and a.as_role != "planner":
+        die("new quick runs require --as planner when defining tasks")
     if a.tier:
         a.complexity = "low" if a.tier == "small" else "high"
         a.executor = "implementor" if a.tier == "small" else "orchestrator"
@@ -186,6 +227,13 @@ def cmd_assign(a: argparse.Namespace) -> None:
             a.harness = "opencode"
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
+    # Per-role policy supplies defaults when the assign flags are empty; an
+    # explicit flag still wins. Unconfigured roles leave the fields empty.
+    assign_role = "orchestrator" if (a.owner == "orch" or a.executor == "orchestrator") else "implementor"
+    if not (a.model or "").strip():
+        a.model = role_model(d, assign_role)
+    if not (a.effort or "").strip():
+        a.effort = role_effort(d, assign_role)
     # These become frontmatter lines, and a line break would write a key of its own.
     for label, value in (("--verify", a.verify), ("--model", a.model), ("--effort", a.effort),
                          *(("--file", item) for item in a.file),
@@ -195,6 +243,8 @@ def cmd_assign(a: argparse.Namespace) -> None:
             die(f"{label} cannot contain a line break, since it becomes one frontmatter "
                 f"line: {str(value)!r}. Nothing was assigned")
     criteria = [c.strip() for c in (a.criterion or []) if c.strip()]
+    if a.owner != "orch" and criteria and is_tiered(d) and not a.no_default_criteria:
+        criteria.extend(item for item in DEFAULT_REVIEW_CRITERIA if item not in criteria)
     if a.owner == "orch" and ((a.title or "").strip() or (a.goal or "").strip() or criteria
                               or a.out_of_scope or a.decision):
         die("--title, --goal, --criterion, --out-of-scope, and --decision describe a task; "
@@ -230,6 +280,7 @@ def cmd_assign(a: argparse.Namespace) -> None:
         delegated = a.executor == "implementor"
         text = template("task").format(
             run=a.run, owner=a.owner, complexity=a.complexity,
+            risk=getattr(a, "risk", "low") or "low",
             executor=a.executor, harness=a.harness, model=a.model,
             effort=a.effort,
             scope_status="discovery" if delegated else "ready",
@@ -438,6 +489,11 @@ def cmd_handoff(a: argparse.Namespace) -> None:
         meta["status"] = "ready"
         publish(current, render(meta, body))
         print(f"{current.name}: ready for a replacement implementor")
+        try:
+            checkpoint = write_checkpoint(d, a.owner)
+            print(f"automatic checkpoint {checkpoint.name} for handing off {a.owner}")
+        except (OSError, ValueError):
+            pass
         with owner_lock(d, a.owner):
             dispatch = read_dispatch(d, a.owner)
             if isinstance(dispatch, dict) and dispatch.get("state") == "dispatched":
@@ -534,10 +590,15 @@ def cmd_set_model(a: argparse.Namespace) -> None:
         if task.is_file():
             record_actual_model(task, a.actual, a.effort)
 
+        dispatch_record = read_dispatch(d, a.owner)
+        unpinned = bool(dispatch_record) and not str(dispatch_record.get("model_requested", "") or "")
         if previous and previous != a.actual:
             print(f"model switched in existing session: {previous} -> {a.actual}")
-        elif requested and requested != a.actual:
+        elif requested and requested != a.actual and not unpinned:
             print(f"WARNING: requested model {requested!r} is not active; harness is using {a.actual!r}")
+        elif requested and requested != a.actual and unpinned:
+            print(f"launched unpinned: requested {requested!r} was not pinned at dispatch; "
+                  f"active model verified: {a.actual}")
         else:
             print(f"active model verified: {a.actual}")
         if a.effort:
@@ -557,6 +618,10 @@ def cmd_set_model(a: argparse.Namespace) -> None:
             history.append({"at": stamp(), "kind": "observed", "model": a.actual})
             dispatch["model_history"] = history
             dispatch["model_observed"] = a.actual
+            if os.environ.get("DOCKET_ROLE", "").strip() == dispatch.get("role"):
+                process = harness_process_ref()
+                if process:
+                    dispatch["worker_process"] = process
             publish_json(dispatch_path(d, a.owner), dispatch)
 
 
@@ -580,10 +645,80 @@ def print_unfinished_decisions(d: Path, candidates: list[str]) -> None:
               f"(repeat `{command}` to finish it)")
 
 
+def run_uses_codex(d: Path) -> bool:
+    """Whether a Codex session plays, or is assigned to play, any role in the run."""
+    if any(ref.get("harness") == "codex" for ref in run_harness_sessions(d)):
+        return True
+    for task in d.glob("*-task.mdx"):
+        try:
+            if parse(task.read_text())[0].get("harness") == "codex":
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def status_repeat_note(d: Path, run: str, body: str) -> str:
+    """A nudge when the calling session re-reads a status that has not changed."""
+    ref = harness_session([run, "status"])
+    if not ref:
+        return ""
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    seen_file = d / ".status-seen" / f"{ref['harness']}-{ref['session_id']}.json"
+    try:
+        seen = json.loads(seen_file.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    if not isinstance(seen, dict) or seen.get("digest") != digest:
+        seen = {"digest": digest, "at": int(now_s()), "calls": 0}
+    seen["calls"] = int(seen.get("calls", 0) or 0) + 1
+    try:
+        seen_file.parent.mkdir(parents=True, exist_ok=True)
+        publish_json(seen_file, seen)
+    except OSError:
+        return ""
+    if seen["calls"] < 2:
+        return ""
+    age = int(max(0, now_s() - int(seen.get("at", 0) or 0)))
+    return (f"\nunchanged: this session has read this same status {seen['calls']} times over "
+            f"{age // 60}m{age % 60:02d}s. Re-reading an unchanged status is polling, and each "
+            "read is a full-context model turn. Wait with `docket watch` as `docket help "
+            "signalling` describes; a session that only launched this run ends its turn instead.")
+
+
 def cmd_status(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     if a.role:
         require_preset_role(d, a.role)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_status(a, d)
+    body = out.getvalue()
+    sys.stdout.write(body)
+    if calling_harness() == "codex" or run_uses_codex(d):
+        limits = codex_rate_limits()
+        if limits:
+            print("\n" + "\n".join(codex_limit_lines(limits)))
+    note = status_repeat_note(d, a.run, body)
+    if note:
+        print(note)
+
+
+def checkpoint_age(d: Path, owner: str) -> str:
+    path = latest_checkpoint(d, owner)
+    if path is None:
+        return "none"
+    try:
+        taken_at = json.loads(path.read_text()).get("taken_at", "")
+        taken = datetime.fromisoformat(str(taken_at).replace("Z", "+00:00"))
+        if taken.tzinfo is None:
+            return "unknown"
+        return f"{int(max(0, now_s() - taken.timestamp())) // 60}m"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "unknown"
+
+
+def print_status(a: argparse.Namespace, d: Path) -> None:
     plan = d / "plan.mdx"
     pmeta = parse(plan.read_text())[0] if plan.is_file() else {}
     print(
@@ -616,11 +751,26 @@ def cmd_status(a: argparse.Namespace) -> None:
         hn, hs = handoff_state(d, o)
         handoff = f"{hn}:{hs}" if hn else "-"
         exec_state, _ = execution_health(d, o)
+        dispatch = read_dispatch(d, o) or {}
+        live = dispatch_liveness(d, dispatch)[0]
+        if live and st == "draft" and exec_state != "stalled":
+            exec_state = "dispatched"
         print(
             f"  {o:<8} {rnd:>5}  {st:<18} {exec_state:<18} {scope_state(d, o):<10} {handoff:<10} "
             f"{tm.get('complexity', tm.get('tier', '-')):<10} "
             f"{tm.get('executor', '-'):<12} {tm.get('verify', '-')}"
         )
+        if live:
+            observed = str(dispatch.get("model_observed", "") or "")
+            requested = str(dispatch.get("model_requested", "") or "")
+            model = observed if observed and observed != "unobserved" else requested or "unknown"
+            print(f"    {o} agent: {dispatch.get('agent') or '-'}  model: {model}  "
+                  f"session: {dispatch.get('session') or '-'}  "
+                  f"checkpoint age: {checkpoint_age(d, o)}")
+        unmet = dispatch_dependencies_unmet(d, o)
+        if unmet:
+            names = ", ".join(problem.split(" (", 1)[0] for problem in unmet)
+            print(f"    {o} waiting on {names}")
     terminal = {"approved", "waived", "completed"}
     decided = [o for o in rows if state_of(d, o)[1] in terminal]
     approved = [o for o in rows if state_of(d, o)[1] in {"approved", "completed"}]
@@ -699,7 +849,12 @@ def cmd_status(a: argparse.Namespace) -> None:
 def cmd_diff(a: argparse.Namespace) -> None:
     """Show task-local changes, or say plainly that there is no diff evidence."""
     d = need_run(a.run)
-    coverage, detail, changed, outside = assignment_evidence(d, a.target)
+    # The orchestrator has no assignment snapshot of its own; its change
+    # surface is the whole run measured from the run baseline.
+    evidence_target = "run" if a.target == "orch" else a.target
+    coverage, detail, changed, outside = assignment_evidence(d, evidence_target)
+    if a.target == "orch" and "run baseline" not in detail:
+        detail = f"run baseline - {detail}"
     if coverage == DOCUMENTS_ONLY:
         print(f"{a.target}: diff coverage unavailable - {detail}")
         print("Review the submitted documents. Docket is not claiming an unchanged worktree.")
@@ -874,16 +1029,25 @@ def cmd_depend(a: argparse.Namespace) -> None:
                 + "\n      ".join(f"- {item}" for item in unusable)
                 + f"\n    Consume {a.on} once it freezes a round whose verification passed."
             )
+        from .batches import tiered_settled
+        from .policy import is_tiered
+        settled = is_tiered(d) and tiered_settled(d, a.on)
         policy = provisional_policy(d)
-        if not final and policy != PROVISIONAL_ALLOWED:
+        if not final and not settled and policy != PROVISIONAL_ALLOWED:
             die(
                 f"{a.on} is {state}, not approved, and this run declares provisional_integration: "
                 f"{policy}. Declare `provisional_integration: allowed` in plan.mdx to consume "
                 "verified-but-unapproved work deliberately, or wait for the reviewer"
             )
+        if final:
+            kind = "final"
+        elif settled:
+            kind = "settled"
+        else:
+            kind = "provisional"
         entry = {
             "on": a.on,
-            "kind": "final" if final else "provisional",
+            "kind": kind,
             "state": state,
             "round": str(latest.get("round", "")),
             "bundle": str(latest.get("digest", "")),
@@ -894,6 +1058,13 @@ def cmd_depend(a: argparse.Namespace) -> None:
         print(f"{a.owner} consumes {a.on} round {entry['round']} at {entry['bundle']}")
     if final:
         print(f"{a.on} is {state}, so this input is final.")
+    elif kind == "settled":
+        print(
+            f"{a.on} is {state} with resolved verification. This is tiered settlement: "
+            "readiness, never reviewer approval.\n"
+            f"If {a.on} freezes different evidence, {a.owner} must reverify against it and\n"
+            f"record it again before {a.owner} can be submitted or approved."
+        )
     else:
         print(
             f"{a.on} is {state}. This is provisional integration: readiness, never approval.\n"
@@ -958,6 +1129,36 @@ def cmd_roots(a: argparse.Namespace) -> None:
     print(f"\nrun baseline: {'captured' if snap.is_file() else 'not captured yet'}")
 
 
+def classify_preflight(code: int | None, stdout: str, stderr: str) -> str:
+    """Richer preflight outcome than passed, failed, or timeout.
+
+    Infrastructure means the command could not run (missing binary, missing
+    dependency); existing-failure means tests ran and failed before any work;
+    nondeterministic is recorded by the caller when a rerun passes. Anything
+    else non-zero stays failed.
+    """
+    if code is None:
+        return "timeout"
+    if code == 0:
+        return "passed"
+    combined = (stdout + "\n" + stderr).lower()
+    if code in (126, 127) or "command not found" in combined or "no such file or directory" in combined:
+        counts = parse_framework_counts(stdout + "\n" + stderr)
+        if counts.get("parser") == "unknown":
+            return "infrastructure"
+    if "modulenotfounderror" in combined or "importerror" in combined:
+        counts = parse_framework_counts(stdout + "\n" + stderr)
+        if counts.get("parser") == "unknown" or not counts.get("failed"):
+            return "infrastructure"
+    counts = parse_framework_counts(stdout + "\n" + stderr)
+    if counts.get("failed"):
+        return "existing-failure"
+    for marker in ("failed", "failure", "assertionerror", "fail:", "not ok"):
+        if marker in combined:
+            return "existing-failure"
+    return "failed"
+
+
 def cmd_preflight(a: argparse.Namespace) -> None:
     """Record the task gate's state before implementation without treating failure as success."""
     d = need_run(a.run)
@@ -1008,12 +1209,25 @@ def cmd_preflight(a: argparse.Namespace) -> None:
             verify, timeout, run_env, holder=holder,
         )
         stdout, stderr = out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
+        status = classify_preflight(code, stdout, stderr)
+        # A failing baseline that passes on an immediate rerun is flaky, not
+        # broken: record it as nondeterministic rather than as a clean failure.
+        if status in ("failed", "existing-failure"):
+            second, second_out, second_err = execute_verify(
+                verify, timeout, run_env, holder=holder,
+            )
+            second_stdout = second_out.decode("utf-8", "replace")
+            second_stderr = second_err.decode("utf-8", "replace")
+            if second is not None and second == 0:
+                status = "nondeterministic"
+                stdout, stderr = second_stdout, second_stderr
+                code = second
         data = {
             "command": verify,
             "returncode": "timeout" if code is None else code,
             "fingerprint": output_fingerprint(stdout, stderr),
             "output_tail": (stdout + stderr).strip().splitlines()[-30:],
-            "status": "timeout" if code is None else ("passed" if code == 0 else "failed"),
+            "status": status,
             "declared_env": declared,
             "effective_env": effective,
             "source": current_source,
@@ -1021,8 +1235,10 @@ def cmd_preflight(a: argparse.Namespace) -> None:
         }
         if code is None:
             outcome = f"timed out after {timeout}s"
+        elif status == "passed":
+            outcome = "passing"
         else:
-            outcome = "passing" if code == 0 else f"failing (exit {code})"
+            outcome = f"{status} (exit {code})"
         target = baseline_path(d, a.owner)
         publish_json(target, data)
         print(f"baseline recorded: {outcome} -> {target.relative_to(root())}")

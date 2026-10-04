@@ -17,7 +17,8 @@ docket arm R01 --role coordinator
 ```
 
 `dispatch` runs the task-intent gate, registers the worker session, and prints the prompt file holding the exact bytes it bound; send that file to the worker.
-Start the checker session too (SKILL.md shows the launch and its prompt); it acts on every submission.
+Start the checker session when `launch:checker` arrives (SKILL.md shows the
+launch and its prompt); it acts on every submission.
 Then wait with `docket watch R01 --role coordinator` as the signalling playbook describes for your harness.
 Verified work wakes the checker directly, so you are woken only for these:
 

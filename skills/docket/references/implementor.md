@@ -1,10 +1,29 @@
 # Implementor
 
-Implement exactly one assigned task.
+Implement assigned tasks one round at a time.
 
-The implementor role is identical in the standard preset and the quick preset.
-In quick runs the coordinator assigns and the checker verifies and reviews, but the implementor still submits through the same gate with the same scope, baseline, and verification binding.
-An implementor never approves its own work in either preset.
+In the standard preset, the orchestrator assigns tasks and the verifier checks
+each submitted round before the reviewer decides a milestone.
+In new quick runs you also coordinate the run. The planner has already assigned
+every task, created and closed each milestone, and declared its full-suite command.
+Dispatch, implement, and submit each task. Complete each milestone's review before
+starting the next milestone. Run
+`docket batch <run> --verify M1 --as implementor`
+once the milestone's tasks pass their focused
+checks. That full-suite pass wakes the reviewer for one milestone decision.
+In new quick runs, you alone handle `launch:reviewer`: start the reviewer when
+review work is pending and no surviving reviewer session is noted. Claim that
+launch event through the registered inbox before starting the session; retrying
+the claim in your session keeps the same lease, and another session cannot claim
+it while that lease holds.
+Arm the implementor role once, then wait with `docket watch <run> --role implementor`
+for the reviewer approval or a correction. Follow `docket help signalling` for
+the harness-specific wait method. Do not send another prompt into a waiting pane
+to advance a milestone; the approval wake is the handoff.
+After the final milestone decision, the planner receives the completion event;
+new quick runs have no additional aggregate decision.
+There is no verifier in new quick runs. Existing `combined-checker` quick runs
+keep their coordinator and checker duties. An implementor never approves its own work.
 A run that outgrows quick records an escalation request; the implementor keeps working under the recorded preset until an authorized follow-up decides otherwise.
 
 1. Read the complete `Txx-task.mdx`. Own repository discovery: begin with project
@@ -27,14 +46,26 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    declared root exists as far as Docket is concerned: if the task needs a checkout
    that `docket roots` does not list, that is a blocker for the orchestrator, not a
    path to claim, because the declaration cannot change once a baseline exists.
-3. Run `docket preflight <run> <owner>`, implement within the accepted scope, and
-   run the registered `verify:` command. If environment or ambiguity prevents
+3. Run `docket preflight <run> <owner>` when the baseline matters, then implement
+   within the accepted scope. `docket submit` runs the registered `verify:` command
+   once against the final source and freezes its output. Run additional focused
+   checks when debugging or a concrete risk calls for them; an identical manual
+   run immediately before submission is not required. That focused command covers
+   only the area the task touches, and the
+   full suite belongs once per milestone (and at the aggregate in standard), never in a task
+   round. If environment or ambiguity prevents
    completion, report a blocker rather than claiming success. `docket submit`
    reports its diff coverage. Unavailable coverage under `evidence_mode: git` is a
    rejection, not an empty diff: fix the workspace so the task diff is readable, or
    report the blocker. Do not describe unverifiable work as verified.
    Run every `docket preflight`, `docket submit`, and `docket verify` with the
    longest shell timeout available.
+   The rendered prompt computes the minimum synchronous submit allowance from
+   the task's `verify_timeout` plus freeze time. When your shell cap is shorter,
+   run `docket submit <run> <owner> --background` (with the required `--as` role
+   in five-role runs). It starts the same full gate in a detached process and
+   prints a private log path. Read that log or `docket status` for the outcome;
+   do not launch another submit while the background job holds the owner.
    Never re-run one that may still be running; read its result before retrying.
    If the task consumes another task's work, record it with `docket depend <run>
    <owner> --on <other>` before you rely on it. That pins the exact evidence you
@@ -89,6 +120,14 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    Normal submission needs every required criterion `met`; anything less goes
    through `--blocked` or an approved amendment, which stay lightweight and
    skip evidence enforcement.
+   If the assigned requirement itself conflicts with a constraint or cannot be
+   met as written, propose a contract decision before treating it as an
+   implementation failure: `docket propose-amendment <run> <owner> --need TEXT
+   --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT`. Give the
+   planner the smallest decision it can make, with evidence pointers and the
+   effect on acceptance and dependencies. Keep working on unaffected work; do
+   not edit the task contract yourself. Use `--blocked` when execution truly
+   cannot proceed while that decision is pending.
 6. Submit normally with `docket submit <run> <owner> --as implementor`, or submit
    a blocker with `docket submit <run> <owner> --blocked --as implementor`. Submitting freezes the whole round -
    the task revision, the task baseline, the full patch from that baseline, the

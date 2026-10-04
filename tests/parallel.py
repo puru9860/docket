@@ -1,7 +1,7 @@
 """Run the docket unittest suite in reusable worker processes and print one summary.
 
 Every test already works in its own temporary directory, so tests are independent.
-A few long-lived workers (`DOCKET_TEST_JOBS`, default half the CPUs) each start one
+A few long-lived workers (`DOCKET_TEST_JOBS`, default available CPUs) each start one
 interpreter, import the suite once, and run test after test from a shared queue. A
 worker restores the environment and working directory after every test, so one test's
 leftovers never reach the next. `DOCKET_TEST_JOBS=1` is a single worker, so the serial
@@ -69,6 +69,12 @@ def timeout_seconds(env: dict[str, str]) -> float:
     if not (value > 0 and math.isfinite(value)):
         raise SystemExit(f"DOCKET_TEST_TIMEOUT must be a positive number of seconds, got {raw!r}")
     return value
+
+
+def worker_count(env: dict[str, str]) -> int:
+    """Use available CPUs by default; an explicit job count still takes precedence."""
+    selected = int(env.get("DOCKET_TEST_JOBS", "0") or 0)
+    return selected or max(2, os.cpu_count() or 2)
 
 
 def snapshot(start: Path, into: Path) -> Path:
@@ -251,7 +257,7 @@ def main() -> int:
 
 
 def run(start: Path, runner: Path, work: Path) -> int:
-    jobs = int(os.environ.get("DOCKET_TEST_JOBS", "0") or 0) or max(2, (os.cpu_count() or 2) // 2)
+    jobs = worker_count(os.environ)
     timeout = timeout_seconds(os.environ)
     ids = test_ids(start)
     queue = iter(ids)

@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import re
 from pathlib import Path
 
 from .common import STATE_DIR, die, stamp
 from .frontmatter import parse, render
 from .paths import decisions, next_numbered, root
 from .publication import publish, publish_exclusive
-from .policy import need_run
+from .policy import need_run, plan_flag
 from .state import list_incidents
 from .feedback import feedback_dir
 from .five_role import correction_attempts
+from .sessions import collect_run_usage
 
 
 IMPROVEMENT_STATUSES = ("observed", "proposed", "trial", "adopted", "rejected")
@@ -65,38 +68,74 @@ def finding_incidents(finding: dict) -> tuple[int, int]:
     return len(incidents), len(runs)
 
 
+def record_finding(title: str, category: str, role: str, model: str, severity: str,
+                   impact: str, evidence: str, body: str) -> str:
+    """Publish one project-local finding without reusing a damaged file's number."""
+    improvements_dir().mkdir(parents=True, exist_ok=True)
+    for _ in range(100):
+        existing = sorted(improvements_dir().glob("I*.mdx"))
+        num = next_numbered(existing)
+        fid = f"I{num:02d}"
+        meta = {"id": fid, "title": title, "category": category or "other",
+                "roles": role or "-", "models": model or "-",
+                "harnesses": "-", "severity": severity or "unknown",
+                "status": "observed", "impact": impact or "-",
+                "intervention": "-", "evidence": evidence or "-",
+                "expected": "-", "change": "-", "eval": "-",
+                "change_revision": "-", "trial_result": "-", "rationale": "-",
+                "scope": "project-local", "updated_at": stamp()}
+        try:
+            publish_exclusive(improvements_dir() / f"{fid}.mdx",
+                              render(meta, (body or "Candidate improvement under triage.").rstrip() + "\n"))
+        except FileExistsError:
+            continue
+        return fid
+    die("could not record a finding; retry the command")
+
+
+def promote_feedback(ref: str, title: str) -> None:
+    """Promote one local observation once; the source remains unchanged."""
+    match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)/(F\d+)", ref)
+    if not match:
+        die("--from-feedback requires RUN/FID, such as demo/F01")
+    if not title.strip():
+        die("--from-feedback requires --title TEXT")
+    run, fid = match.groups()
+    d = need_run(run)
+    source = feedback_dir(d) / f"{fid}.mdx"
+    if not source.is_file():
+        die(f"no feedback observation {ref!r} in this project")
+    try:
+        source_meta, source_body = parse(source.read_text())
+    except (OSError, ValueError):
+        die(f"feedback observation {ref!r} is unreadable")
+    if source_meta.get("id") != fid or source_meta.get("run") != run:
+        die(f"feedback observation {ref!r} does not match its source")
+    improvements_dir().mkdir(parents=True, exist_ok=True)
+    with (improvements_dir() / ".promotion.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        for path, finding in list_findings():
+            if ref in {part.strip() for part in str(finding.get("evidence", "")).split(",")}:
+                print(f"feedback {ref} already recorded as finding {path.stem}")
+                return
+        recorded = record_finding(title.strip(), str(source_meta.get("category", "other")),
+                                  str(source_meta.get("author_role", "-")),
+                                  str(source_meta.get("model", "-")), "unknown", "-", ref,
+                                  source_body)
+    print(f"recorded finding {recorded} from feedback {ref}: {title.strip()}")
+
+
 def cmd_improvements(a: argparse.Namespace) -> None:
     """List and advance the cross-run improvement backlog."""
+    if a.from_feedback:
+        promote_feedback(a.from_feedback, a.title)
+        return
     if a.add:
         title = (a.title or "").strip()
         if not title:
             die("--add requires --title TEXT")
-        improvements_dir().mkdir(parents=True, exist_ok=True)
-        # The number comes from file names, readable or not: an unparsable
-        # finding still reserves its number, so a gap never reuses it.
-        # This directory is shared across projects, so no run lock covers it;
-        # exclusive creation plus retry is the no-overwrite guarantee.
-        for _ in range(100):
-            existing = sorted(improvements_dir().glob("I*.mdx")) \
-                if improvements_dir().is_dir() else []
-            num = next_numbered(existing)
-            fid = f"I{num:02d}"
-            meta = {"id": fid, "title": title, "category": a.category or "other",
-                    "roles": a.role or "-", "models": a.model or "-",
-                    "harnesses": "-", "severity": a.severity or "unknown",
-                    "status": "observed", "impact": a.impact or "-",
-                    "intervention": "-", "evidence": a.evidence or "-",
-                    "expected": "-", "change": "-", "eval": "-",
-                    "change_revision": "-", "trial_result": "-", "rationale": "-",
-                    "scope": "project-local", "updated_at": stamp()}
-            try:
-                publish_exclusive(improvements_dir() / f"{fid}.mdx",
-                        render(meta, (a.body or "Candidate improvement under triage.") + "\n"))
-            except FileExistsError:
-                continue
-            break
-        else:
-            die("could not record a finding; retry the command")
+        fid = record_finding(title, a.category, a.role, a.model, a.severity,
+                             a.impact, a.evidence, a.body)
         print(f"recorded finding {fid}: {title}")
         return
     if a.propose or a.trial or a.adopt or a.reject:
@@ -172,8 +211,8 @@ def advance_finding(a: argparse.Namespace) -> None:
 def cmd_retrospective(a: argparse.Namespace) -> None:
     """Summarize a run mechanically: corrections, delivery, stalls, and use.
 
-    No model is called. Premium-token use is reported unknown unless measured
-    elsewhere; invocation counts appear only as an explicitly labelled proxy.
+    No model is called. Measured run tokens come from noted harness sessions;
+    a mixed-model session cannot attribute its total to premium models.
     Raw observations are never quoted into prompts here.
     """
     d = need_run(a.run)
@@ -203,6 +242,10 @@ def cmd_retrospective(a: argparse.Namespace) -> None:
             except ValueError:
                 continue
     feedback = len(list(feedback_dir(d).glob("*.mdx"))) if feedback_dir(d).is_dir() else 0
+    usage = collect_run_usage(d, False)
+    measured = bool(usage) and all(row.get("found") for row in usage)
+    premium_models = {item.strip() for item in plan_flag(d, "premium_models", "").split(",")
+                      if item.strip()}
     print(f"retrospective for run {a.run} (mechanical summary, no model calls)")
     print(f"  correction attempts: {corrections}")
     print(f"  decisions recorded: {decisions}")
@@ -213,4 +256,19 @@ def cmd_retrospective(a: argparse.Namespace) -> None:
     print(f"  delivery transport records: "
           + (", ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"))
     print(f"  feedback observations: {feedback}")
-    print("  premium tokens: unknown (invocation counts above are a proxy, not spend)")
+    if measured:
+        print(f"  run tokens: {sum(int(row.get('total', 0) or 0) for row in usage)} "
+              "(since each role joined this run)")
+    else:
+        print("  run tokens: unknown (no complete harness usage)")
+    attributable = measured and bool(premium_models) and all(
+        row.get("models") and (set(row["models"]).issubset(premium_models)
+                               or set(row["models"]).isdisjoint(premium_models))
+        for row in usage)
+    if attributable:
+        premium = sum(int(row.get("total", 0) or 0) for row in usage
+                      if set(row["models"]).issubset(premium_models))
+        print(f"  premium tokens: {premium} (configured premium_models; session totals)")
+    else:
+        print("  premium tokens: unknown (invocation counts are a proxy, not spend; "
+              "mixed or unclassified sessions cannot be split)")

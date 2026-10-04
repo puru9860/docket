@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .common import (
 from .frontmatter import parse
 from .paths import read_dispatch, reports
 from .publication import publish_bytes, publish_json
+from .policy import is_tiered
 from .evidence import (
     dirty_paths, empty_tree, file_fingerprint, git_raw, git_text, index_entries,
     is_state_path, path_state, porcelain_records, state_prefix,
@@ -24,12 +26,29 @@ from .evidence import (
 from .roots import read_roots, resolve_scope, root_identity
 
 
+def snapshot_owner(d: Path, owner: str) -> str:
+    """Keep each tiered correction baseline at a new, immutable address.
+
+    The first round retains the historical path. A correction round receives a
+    distinct capture before its dispatch, so no previously frozen baseline or
+    reconstruction artifact is removed or republished.
+    """
+    if owner in ("run", "orch") or not is_tiered(d):
+        return owner
+    found = reports(d, owner)
+    if not found:
+        return owner
+    match = re.search(r"-report-(\d+)\.mdx$", found[-1].name)
+    rnd = int(match.group(1)) if match else 1
+    return owner if rnd == 1 else f"{owner}-{rnd:02d}"
+
+
 def snapshot_path(d: Path, owner: str) -> Path:
-    return d / ".snapshots" / f"{owner}.json"
+    return d / ".snapshots" / f"{snapshot_owner(d, owner)}.json"
 
 
 def snapshot_dir(d: Path, owner: str) -> Path:
-    return d / ".snapshots" / owner
+    return d / ".snapshots" / snapshot_owner(d, owner)
 
 
 def capture_untracked(repo: Path, relative: str) -> dict[str, object]:

@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .liveness import (
     session_path, sessions_dir,
 )
 from .events import derive_events
+from .sessions import harness_process_ref, harness_session
 
 
 def delivery_dir(d: Path, role: str) -> Path:
@@ -60,7 +62,7 @@ def read_announce(d: Path, role: str, key: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def announce_active(d: Path, role: str, key: str) -> bool:
+def announce_active(d: Path, role: str, key: str, recipient: dict | None = None) -> bool:
     """Whether a native-hook announcement lease still covers this key.
 
     The ledger alone is not delivery truth: a watcher that crashes after
@@ -70,6 +72,8 @@ def announce_active(d: Path, role: str, key: str) -> bool:
     while concurrent watchers still converge on one wake.
     """
     record = read_announce(d, role, key)
+    if recipient is not None and not announcement_matches_recipient(record, recipient):
+        return False
     if not record:
         return False
     try:
@@ -79,14 +83,19 @@ def announce_active(d: Path, role: str, key: str) -> bool:
     return until > now_s()
 
 
-def announce_delivered(d: Path, role: str, key: str) -> bool:
-    """Whether the watcher handed this announcement to the harness.
+def announcement_matches_recipient(record: dict, recipient: dict) -> bool:
+    return (record.get("transport") == "native-hook"
+            and record.get("session") == recipient.get("session")
+            and record.get("session_generation") == recipient.get("generation"))
 
-    The watcher marks an announcement delivered only after its banner is
-    written and immediately before it exits 2, so a crash anywhere before that
-    leaves the mark absent and the lease-bounded re-announcement still applies.
-    """
-    return bool(read_announce(d, role, key).get("delivered_at"))
+
+def announce_delivered(d: Path, role: str, key: str, recipient: dict | None = None) -> bool:
+    """Native receipt requires pickup; a manual watcher keeps its output contract."""
+    record = read_announce(d, role, key)
+    if recipient is not None:
+        return (announcement_matches_recipient(record, recipient)
+                and bool(record.get("received_at")))
+    return bool(record.get("delivered_at") or record.get("received_at"))
 
 
 def mark_announce_delivered(d: Path, role: str, key: str) -> None:
@@ -95,6 +104,17 @@ def mark_announce_delivered(d: Path, role: str, key: str) -> None:
         return
     record["delivered_at"] = now_s()
     publish_json(announce_path(d, role, key), record)
+
+
+def record_native_receipt(d: Path, role: str, key: str, pending: dict, reg: dict) -> None:
+    """A duplicate acknowledgement repairs a crash between the two receipt writes."""
+    announcement = read_announce(d, role, key)
+    if announcement_matches_recipient(announcement, reg) and all(
+            announcement.get(field) == pending.get(field)
+            for field in ("revision", "round", "generation", "workflow")):
+        if not announcement.get("received_at"):
+            announcement["received_at"] = now_s()
+            publish_json(announce_path(d, role, key), announcement)
 
 
 @contextlib.contextmanager
@@ -378,6 +398,84 @@ def ensure_session_registration(run: str, sid: str, role: str, name: str) -> dic
     return record
 
 
+def native_session_registration(run: str, role: str, *, create: bool = False,
+                                session: str = "") -> dict:
+    """Bind a hook to a run, role, and harness process generation.
+
+    Explicit transport IDs use the ordinary session registry. Automatically
+    detected harness IDs are qualified by run and role, allowing a session to
+    supervise explicitly armed runs without changing another run's registration.
+    A terminal hook has no provable harness identity; its single-run fallback
+    uses a console registration and refuses ambiguous selection in the watcher.
+    """
+    explicit = session or os.environ.get("DOCKET_SESSION", "").strip()
+    if explicit:
+        if create:
+            ensure_session_registration(run, explicit, role, explicit)
+        return check_registration(Path(), explicit, run, role)
+    ref = harness_session([])
+    identity = f"{ref['harness']}:{ref['session_id']}" if ref else "console"
+    sid = "native-" + hashlib.sha256(f"{identity}:{run}:{role}".encode()).hexdigest()[:32]
+    reg = read_registration(sid)
+    changed = not reg
+    process = harness_process_ref() if ref else {}
+    process_identity = {k: process.get(k, "") for k in ("harness", "pid", "start")} if process else {}
+    if reg and reg.get("native_process", {}) != process_identity:
+        if not create:
+            return {}
+        reg = {**reg, "generation": int(reg["generation"]) + 1}
+        changed = True
+    if not reg and not create:
+        return {}
+    if not reg:
+        reg = {"session": sid, "run": run, "role": role,
+               "workspace": str(root().resolve()), "generation": 1,
+               "name": identity, "registered_at": stamp()}
+    if create and changed:
+        reg.update(native_harness=ref or {}, native_process=process_identity)
+        publish_json(session_path(sid), reg)
+    return check_registration(Path(), sid, run, role)
+
+
+def event_is_owned(d: Path, role: str, key: str) -> bool:
+    """An active handling lease suppresses a hook only for its valid generation."""
+    lease = read_lease(d, role, key)
+    reg = read_registration(str(lease.get("session", ""))) if lease else {}
+    try:
+        active = float(lease.get("lease_until", 0) or 0) > now_s()
+    except (TypeError, ValueError):
+        active = False
+    return bool(active and reg and reg.get("workspace") == str(root().resolve())
+                and reg.get("run") == d.name and reg.get("role") == role
+                and lease.get("session_generation") == reg.get("generation")
+                and event_actionable(d, lease)[0])
+
+
+def native_bound_runs(role: str) -> list[str]:
+    """Only explicit or proven harness bindings select among concurrent runs."""
+    explicit = os.environ.get("DOCKET_SESSION", "").strip()
+    if explicit:
+        reg = read_registration(explicit)
+        if not reg:
+            die(f"unknown DOCKET_SESSION={explicit}; register and arm its run first")
+        check_registration(Path(), explicit, str(reg.get("run", "")), role)
+        return [str(reg["run"])]
+    ref = harness_session([])
+    if not ref:
+        return []
+    found = []
+    for path in sorted(sessions_dir().glob("*.json")):
+        reg = read_registration(path.stem)
+        native = reg.get("native_harness", {})
+        if not isinstance(native, dict) or reg.get("role") != role:
+            continue
+        if all(native.get(k) == ref.get(k) for k in ("harness", "session_id")):
+            run = str(reg.get("run", ""))
+            if native_session_registration(run, role):
+                found.append(run)
+    return found
+
+
 def inbox_ack(a: argparse.Namespace, d: Path) -> None:
     """Record receipt of a claimed event. Receipt is not completion."""
     with delivery_lock(d, a.role):
@@ -407,6 +505,7 @@ def inbox_ack(a: argparse.Namespace, d: Path) -> None:
             retire_event(d, a.role, a.ack, f"acknowledged after becoming stale: {why}")
             die(f"{a.ack} is stale and was retired: {why}")
         if lease.get("acked") and str(lease.get("session", "")) == a.session:
+            record_native_receipt(d, a.role, a.ack, pending, reg)
             delivery_log(d, a.role, {"kind": "duplicate-receipt", "key": a.ack,
                                      "session": a.session})
             print(f"{a.ack}: already received; duplicate acknowledgement is harmless")
@@ -418,6 +517,7 @@ def inbox_ack(a: argparse.Namespace, d: Path) -> None:
         lease["acked"] = True
         lease["lease_until"] = now_s() + lease_seconds
         publish_json(lease_path(d, a.role, a.ack), lease)
+        record_native_receipt(d, a.role, a.ack, pending, reg)
         delivery_log(d, a.role, {"kind": "receipt", "key": a.ack, "session": a.session})
         fault("delivery:receipt")
         print(f"received {a.ack} (handling lease until {lease['lease_until']})")
@@ -426,7 +526,15 @@ def inbox_ack(a: argparse.Namespace, d: Path) -> None:
 
 
 def inbox_retry(a: argparse.Namespace, d: Path) -> None:
-    """Record why another delivery attempt is due and release the lease."""
+    """Record why another delivery attempt is due and make it wake again.
+
+    A wake delivered to the wrong watcher left `announce_delivered` behind,
+    so clearing only the lease never woke the right role. Retry clears the
+    announcement as well, after the same actionability check, so the next
+    watcher for this role re-announces once. Claiming still enforces the
+    session registration, so no other role or stale generation can take it,
+    and the per-role ledger keeps the re-announcement from duplicating.
+    """
     reason = (a.reason or "").strip()
     if not reason:
         die("--retry requires --reason TEXT")
@@ -439,6 +547,7 @@ def inbox_retry(a: argparse.Namespace, d: Path) -> None:
             retire_event(d, a.role, a.retry, f"retried after becoming stale: {why}")
             die(f"{a.retry} is stale and was retired: {why}")
         lease_path(d, a.role, a.retry).unlink(missing_ok=True)
+        announce_path(d, a.role, a.retry).unlink(missing_ok=True)
         delivery_log(d, a.role, {"kind": "retry", "key": a.retry, "reason": reason})
         fault("delivery:retry")
         print(f"{a.retry} will be attempted again: {reason}")
@@ -457,7 +566,7 @@ def outbox_path(d: Path, role: str, key: str) -> Path:
 
 
 def claim_event(d: Path, run: str, role: str, session: str, key: str = "",
-                lease_seconds: int = 0) -> tuple[dict, dict, str]:
+                lease_seconds: int = 0, expected: dict | None = None) -> tuple[dict, dict, str]:
     """Claim one pending event (or one specific key) for a registered session.
 
     Shared by inbox pickup and qualified delivery so both paths enforce the
@@ -465,6 +574,8 @@ def claim_event(d: Path, run: str, role: str, session: str, key: str = "",
     pending record, and whether the lease was newly `claimed` or `already-held`.
     """
     reg = check_registration(d, session, run, role)
+    if expected is not None and not announcement_matches_recipient(expected, reg):
+        die("native announcement belongs to another recipient generation")
     generation = reg.get("generation", 1)
     seconds = lease_seconds if lease_seconds and lease_seconds > 0 else DELIVERY_LEASE_SECONDS
     with delivery_lock(d, role):
@@ -489,13 +600,16 @@ def claim_event(d: Path, run: str, role: str, session: str, key: str = "",
             pending = read_pending(d, role, candidate)
             if not pending:
                 continue
+            if expected is not None and any(pending.get(field) != expected.get(field) for field in
+                                            ("key", "revision", "round", "generation", "workflow")):
+                die(f"{candidate}: announcement moved; wait for its fresh wake before pickup")
             lease = read_lease(d, role, candidate)
             if lease:
                 try:
                     until = float(lease.get("lease_until", 0) or 0)
                 except (TypeError, ValueError):
                     until = 0
-                if until > now_s():
+                if until > now_s() and (expected is None or event_is_owned(d, role, candidate)):
                     if (str(lease.get("session", "")) == session
                             and str(lease.get("session_generation", "")) == str(generation)):
                         return lease, pending, "already-held"

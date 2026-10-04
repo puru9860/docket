@@ -19,13 +19,20 @@ Implementors can run cheaply in another harness. Docket supports Claude Code, Co
 (temporary compatibility), and OpenCode.
 
 Two presets select tested combinations of mode, workflow, topology, and review policy.
-The quick preset is the default for new runs: three roles, a coordinator combining planning
-and orchestration, an implementor, and a checker combining verification and review.
+The quick preset is the default for new runs: a planner defines the outcome, tasks,
+milestones, and their full-suite commands, an implementor implements them, and a reviewer
+decides once per milestone after a frozen full-suite pass. There is no verifier
+session in new quick runs. The implementor waits for the reviewer's approval
+before dispatching the next milestone.
 The standard preset is five sessions (planner, orchestrator, implementor, verifier,
 reviewer) with an independent verifier behind every decision; select it with `--mode standard`.
-Quick records `combined-checker` on every artifact, so no reader mistakes a quick decision
-for independently verified work.
-Quick merges duties through explicit recorded policy only.
+New standard runs record `tiered-verifier-reviewer`: the verifier settles each passing task
+for sequencing, and the reviewer approves a closed milestone after `docket batch --verify`
+freezes its full-suite result. Existing standard runs with the recorded
+`independent-verifier-reviewer` policy keep their per-task review behavior.
+New quick runs record `quick-milestone-reviewer`; existing quick runs with
+`combined-checker` keep their coordinator, implementor, and checker policy.
+Quick assigns coordination to the implementor through explicit recorded policy.
 It never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut,
 and it keeps scope claims, complete baselines, immutable evidence, source-drift rejection,
 honest blocking, and decisions bound to exact bundle digests.
@@ -156,21 +163,34 @@ use uv; nothing else changes.
 ```bash
 cd <your project> && mkdir -p .docket
 docket init R01 --title "Short name" --objective "What done means for the whole run."
-docket assign R01 T01 --harness opencode --file src/x.py --verify 'tests/test.sh' \
+docket arm R01 --role planner
+docket arm R01 --role reviewer
+docket assign R01 T01 --harness opencode --file src/x.py --verify 'python3 -m unittest tests.test_x' \
   --title "Task name" --goal "What must be true when done." \
-  --criterion "A mechanically checkable criterion" --criterion "Another one"
+  --criterion "A mechanically checkable criterion" --criterion "Another one" --as planner
+docket batch R01 --create M1 --members T01 --milestone --command 'tests/test.sh' --as planner
+docket batch R01 --close M1 --as planner
+# Implementor takes over after the planner has defined every task and milestone.
 docket dispatch R01 T01 --session impl-1 --agent impl-1 --register
 # dispatch prints `prompt: .docket/runs/R01/.prompts/<file>.txt`; start the worker in
 # its harness and send it exactly that file, e.g. herdr agent prompt impl-1 "$(cat <file>)"
 docket set-model R01 T01 --actual <model label the harness shows>
-docket arm R01 --role coordinator      # then wait: docket help signalling, per harness
+docket arm R01 --role implementor      # then wait: docket help signalling, per harness
 ```
 
-That is the whole start: a bare `docket init` is the quick preset, `assign` takes the
-goal and criteria so nothing has to be opened and edited first, and `dispatch` runs the
-task-intent gate, registers the worker session, and writes the exact prompt to send.
-A checker session waits with `docket watch R01 --role checker` and verifies then reviews
-each submission. Use `--mode standard` for five sessions with an independent verifier.
+That is the start: the planner sets the objective, assigns all tasks, and closes their
+milestone batches before dispatch. `assign` takes the goal and
+criteria, and `dispatch` runs the task-intent gate and writes the worker prompt.
+After task submissions, the implementor runs
+`docket batch R01 --verify M1 --as implementor`.
+The reviewer receives one milestone wake and can
+approve it with `docket batch R01 --approve M1 --as reviewer`. Use `--mode standard`
+for five sessions with an independent verifier.
+In quick, the implementor owns the reviewer launch event. In tiered standard,
+settled batch members wake the orchestrator to run the full suite; a passing
+result wakes the reviewer directly. Uncertain verifier findings wake the reviewer
+for a correction while dependent work stays held. Both presets wake
+the reviewer to recover interrupted decisions and apply granted corrections.
 
 The role playbooks ship beside the skill and are surfaced by the CLI:
 
@@ -244,7 +264,7 @@ submitted or blocked work it tells you to open a fresh round with `docket decide
 ```
 docket init <run> [--mode quick|standard] [--title T] [--objective TEXT] [--harness H]
                                   [--evidence-mode M] [--root alias=path ...]
-docket assign <run> <owner> [--goal TEXT] [--criterion TEXT ...] [--file PATH ...] [--verify CMD]
+docket assign <run> <owner> [--goal TEXT] [--criterion TEXT ...] [--file PATH ...] [--verify CMD] [--as planner]  # new quick
                                   [--complexity low|high] [--executor implementor|orchestrator]
 docket dispatch <run> <owner> --session S [--agent NAME] [--register]
                                                      bind one round; writes the prompt to send
@@ -259,19 +279,41 @@ docket submit <run> <owner> [--as implementor]      validate, freeze, and hand o
 docket verify <run> <owner> --result pass --as verifier
 docket bundle <run> <owner> [--round N] [--list]     the frozen evidence for a round
 docket depend <run> <owner> [--on TASK]              consume another task's frozen evidence
+docket batch <run> --create M1 --members T01,T02 --milestone --command CMD --as planner
+docket batch <run> --close M1 --as planner
+docket batch <run> --verify M1 --as implementor
+docket batch <run> --approve M1 --as reviewer         decide one verified milestone
 docket decide <run> <owner> --approve|--changes|--waive [--reason TEXT] [--re-review] --as reviewer
                                                      repeat the bare verdict to finish an interrupted one
-docket status <run> [--role planner|orchestrator|verifier|reviewer]
+docket status <run> [--role planner|implementor|orchestrator|verifier|reviewer]
 docket events <run> --role R --peek                  inspect events, consuming none
 docket arm <run> --role R                            arm the watcher for a waiting role
+docket pickup <run> --role R                         acknowledge native wakes in this recipient session
 docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
-docket watch <run> --role coordinator|checker|orchestrator|planner|verifier|reviewer
+docket watch <run> --role planner|implementor|reviewer|orchestrator|verifier|coordinator|checker
                                                      block until something needs you
 docket help <role>                                   the playbooks
+docket help <role> --run R01 --owner T01              compact guidance for that run's recorded policy and task
 ```
 
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
+The active help form uses the same canonical contract and command renderer as
+`docket prompt`, without writing a prompt record. The full playbook remains
+available through `docket help <role>`.
+
+Submission runs and freezes the registered final verification. Use preflight
+when a before-change result matters, and extra checks for debugging or specific
+risks. A routine identical manual verification immediately before submission
+is not required.
+
+`docket metrics R01` includes correction and resume counts, reported defects
+after acceptance, and measured token categories. Run tokens per accepted task
+stay unknown when role telemetry is missing. Record a later defect with
+`docket feedback R01 --add --role reviewer --category escaped-defect --task T01
+--round 1 --evidence PATH --body TEXT`; this requires an applied approval or
+waiver for that round. Compare similar task risk and complexity before changing
+model policy; these measurements do not estimate monetary cost.
 
 Report and task schemas are built in. Override them per project by dropping a
 `.docket/templates/<plan|task|scope|report|handoff|orchestrator_report|decision>.mdx`.
@@ -300,12 +342,11 @@ On Claude Code, merge `hooks/settings.json.example` into the project's
 Arm **every role that will wait**, then disarm when the run ends:
 
 ```bash
-docket arm R01 --role coordinator    # quick: waiting on the checker and escalations
-docket arm R01 --role checker        # quick: waiting on submitted rounds
-docket arm R01 --role orchestrator   # waiting on implementors
-docket arm R01 --role planner        # waiting on the orchestrator (split only)
-docket arm R01 --role verifier       # waiting on submissions (five-role runs)
-docket arm R01 --role reviewer       # waiting on milestone batches (five-role runs)
+docket arm R01 --role planner        # new quick and standard
+docket arm R01 --role implementor    # new quick: coordinates execution and suite runs
+docket arm R01 --role reviewer       # new quick: milestone decisions
+docket arm R01 --role orchestrator   # standard: waiting on implementors
+docket arm R01 --role verifier       # standard: waiting on submissions
 docket disarm R01                    # done
 ```
 
@@ -322,7 +363,8 @@ tear it down with the session. See `docket help signalling`.
 
 On Codex, merge `hooks/codex-hooks.json.example` into `~/.codex/hooks.json` and trust it once in `/hooks`.
 It is a synchronous Stop hook: when a supervisor's turn ends, `docket watch` waits inside the hook at no model cost, and a wake is handed back as the next prompt.
-Like the Claude hook it is inert unless `watch.conf` and `DOCKET_ROLE` exist, so a Codex implementor is unaffected.
+Like the Claude hook it is inert unless `watch.conf` and `DOCKET_ROLE` exist. A
+Codex implementor in a new quick run watches for milestone approval and corrections.
 
 Harnesses without an equivalent wake hook wait with one blocking `docket watch` instead.
 Every return re-enters the model with its whole context, so the wait window is the cost lever.
@@ -331,7 +373,17 @@ Wait on Docket events, not on `herdr agent wait` or a `sleep` loop, which return
 `docket help signalling` has the table for each harness.
 The file protocol is identical either way.
 
-A delivered wake is not repeated while the event behind it is unchanged, so a supervisor that routed work to another role is left alone until that role's answer lands.
+After a native wake, run `docket pickup R01 --role "$DOCKET_ROLE"` before acting.
+Pickup records receipt for the event revision and this session generation. An
+unreceived announcement retries after its lease; a received wake stays quiet while
+the event holds. Arm each waiting role inside its own session to bind its run.
+`DOCKET_RUN=R01` narrows that binding, and `DOCKET_RUN=R01,R02` explicitly selects
+several bound runs. For an explicit transport ID, use `arm --session SESSION` and
+start the hook session with `DOCKET_SESSION=SESSION`. An unbound terminal hook
+refuses multiple same-role armed runs. `doctor` reports runtime differences between
+the running and installed skill and checks synchronous Codex hooks in `CODEX_HOME`
+JSON or TOML config; configured and locally enabled still require trust and a real
+wake check. See the signalling playbook for the finite native wait window.
 
 ## Feedback loop
 
@@ -344,15 +396,37 @@ docket feedback --digest              # friction by role, category, and recurrin
 docket feedback --digest --since 2026-10-01
 ```
 
+The digest suggests a promotion command for repeated observations. Run it in
+the source project's checkout to make an observed finding in that project's
+`.docket/improvements/` backlog. Promotion keeps the source and is idempotent:
+
+```bash
+docket improvements --from-feedback R01/F02 --title 'Clarify the oracle'
+docket improvements                    # review project findings
+docket retrospective R01               # mechanical run summary
+```
+
 Docket also notes each role's harness session (Claude Code, Codex, or OpenCode) whenever the role runs its own docket commands, so token usage per role and the full conversation behind any report can be reviewed later:
 
 ```bash
-docket usage R01              # tokens per role and session, read from each harness transcript
+docket usage R01              # tokens since each role joined the run, read from harness transcripts
 docket usage R01 --archive    # also keep a copy of every transcript and log its usage
 ```
 
-The final aggregate verdict archives automatically, into `~/.local/state/docket/sessions/` beside the log, with private permissions because transcripts can hold secrets.
+The standard run's final aggregate verdict archives automatically. In new quick
+runs the planner runs `docket usage R01 --archive` after the final milestone.
+Archives live under `~/.local/state/docket/sessions/` with private permissions
+because transcripts can hold secrets.
 The digest then reports token usage by role across runs.
+
+For a run with premium models, set flat `plan.mdx` fields such as
+`premium_models: claude-opus-5-5, gpt-6-sol`, `token_budget: 5000000`, and
+`review_reserve: 1000000`. Docket counts tokens since each role joined the run
+and refuses a new premium dispatch, resume, or switch once the remaining
+allowance reaches the review reserve. An unavailable session transcript makes
+the guard refuse a premium launch until usage is known. A non-premium approved
+fallback remains available. Codex account usage crossing its warning threshold
+also wakes the planner once per limit window.
 
 ### Per-model learning
 
@@ -420,6 +494,23 @@ worked out in more depth elsewhere.
 
 The `plan.mdx` / `report-NN.mdx` / `decision-NN.mdx` convention predates all of this; it
 started as a manual review workflow and this project just mechanised it.
+
+## Codex usage limit recovery
+
+When an active Codex worker reaches an account usage limit, the orchestrator
+receives an event naming the next approved fallback outside Codex. It can move
+the draft round with `docket resume --on-limit`, without a plan amendment. The
+replacement still runs in a new, registered harness session.
+
+## Long verification commands
+
+`docket submit --background` runs the ordinary submit gate in a detached process
+when a harness shell call cannot last for the task's declared verify timeout.
+Use `docket submit RUN OWNER --background` with the usual `--as` role when
+required. The call returns a private log path while the child holds the owner
+lock through verification, evidence freeze, and report publication. Read the log
+or `docket status` for the outcome. Repeating the background command while it
+is running reports the existing job instead of starting another verify.
 
 ## License
 

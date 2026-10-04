@@ -243,15 +243,22 @@ def cmd_models(a: argparse.Namespace) -> None:
         return
     log = Path(a.log).expanduser() if a.log else feedback_log_path()
     records = outcome_records(log, a.since)
+    run_filter = (getattr(a, "run", "") or "").strip()
+    if run_filter:
+        records = [r for r in records if str(r.get("run", "")) == run_filter]
     if a.review:
         print(model_review_packet(records, normalized_model(a.review), a.since))
         return
     models = sorted({str(r.get("model")) for r in records
                      if r.get("origin") == "outcome" and r.get("model")})
     if not models:
-        print("no outcome cases recorded yet: they accumulate as tasks are verified and decided")
+        if run_filter:
+            print(f"no outcome cases recorded yet for run {run_filter}")
+        else:
+            print("no outcome cases recorded yet: they accumulate as tasks are verified and decided")
         return
-    print(f"per-model outcomes from {log}" + (f" since {a.since}" if a.since else ""))
+    scope = f" for run {run_filter}" if run_filter else f" from {log}"
+    print(f"per-model outcomes{scope}" + (f" since {a.since}" if a.since else ""))
     for model in models:
         card = model_scorecard(records, model)
         name, meta = adopted_profile(model)
@@ -499,6 +506,11 @@ def cmd_feedback_digest(a: argparse.Namespace) -> None:
                   f"{body[:220]}")
             print(f"      latest: {last.get('project', '')} {last.get('run', '')} "
                   f"{last.get('task', '-')} round {last.get('round', '-')} at {last.get('at', '')}")
+            if len(items) >= 2 and last.get("id") and last.get("run"):
+                ref = f"{last['run']}/{last['id']}"
+                title = body.split(".", 1)[0].strip()[:80] or "Review recurring feedback"
+                print(f"      candidate in {last.get('project', '')}: docket improvements "
+                      f"--from-feedback {shlex.quote(ref)} --title {shlex.quote(title)}")
 
 
 def cmd_feedback(a: argparse.Namespace) -> None:
@@ -546,6 +558,18 @@ def cmd_feedback(a: argparse.Namespace) -> None:
     body = (a.body or "").strip()
     if not body:
         die("--add requires --body TEXT")
+    if a.category == "escaped-defect":
+        if not a.task or not str(a.round).isdigit() or not a.evidence:
+            die("escaped-defect feedback needs --task TASK --round N and --evidence PATH "
+                "to link the post-approval finding")
+        decided = d / f"{a.task}-decision-{int(a.round):02d}.mdx"
+        if not decided.is_file():
+            die(f"escaped-defect feedback needs an accepted decision for {a.task} "
+                f"round {a.round}")
+        decision_meta, _ = parse(decided.read_text())
+        if decision_meta.get("verdict") not in ("approved", "waived") \
+                or decision_meta.get("applied") != "yes":
+            die(f"{decided.name} is not an applied approval or waiver")
     fid = next_feedback_id(d)
     # The dispatch record already knows which prompt and model a task round was
     # given, so an agent's report is tied to them without restating either.

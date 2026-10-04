@@ -11,13 +11,15 @@ import re
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
-from .common import MODE_QUICK, stamp
+from .common import MODE_QUICK, now_s, stamp
 from .paths import root, run_dir
 from .publication import publish_json
-from .policy import mode_of, need_run
+from .policy import is_quick_milestone, mode_of, need_run
 from .feedback import ensure_private_dir, feedback_log_path, log_feedback
+from .hook_config import codex_hook_configuration
 
 
 #
@@ -95,6 +97,30 @@ def calling_harness() -> str:
         if "codex" in candidates and name.startswith("codex"):
             return "codex"
     return ""
+
+
+def harness_process_ref() -> dict[str, object]:
+    """The calling harness process identity, when an ancestor proves the claim."""
+    harness = calling_harness()
+    if not harness:
+        return {}
+    chain = process_ancestors() or []
+    for pid, comm in chain:
+        if harness == "claude":
+            marker = os.environ.get("CLAUDE_PID", "").strip()
+            if (marker and str(pid) != marker) or (not marker and comm.lower() != "claude"):
+                continue
+        if harness == "opencode" and str(pid) != os.environ.get("OPENCODE_PID", "").strip():
+            continue
+        if harness == "codex" and not comm.lower().startswith("codex"):
+            continue
+        start = ""
+        try:
+            start = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, ValueError, IndexError):
+            pass
+        return {"harness": harness, "pid": pid, "start": start, "noted_at": stamp()}
+    return {}
 
 
 def opencode_running_session(needles: list[str]) -> tuple[str, str]:
@@ -175,7 +201,9 @@ def note_harness_session(d: Path, role: str, owner: str,
     ref = harness_session(needles)
     if not ref:
         return None
-    entry = {"role": role, "owner": owner or "-", **ref}
+    process = harness_process_ref()
+    entry = {"role": role, "owner": owner or "-", **ref,
+             **({"worker_process": process} if process else {})}
     identity = ("harness", "session_id", "role", "owner")
     try:
         with (d / HARNESS_SESSION_LEDGER).open("a+") as fh:
@@ -187,7 +215,17 @@ def note_harness_session(d: Path, role: str, owner: str,
                         seen = json.loads(line)
                     except ValueError:
                         continue
-                    if isinstance(seen, dict) and all(seen.get(k) == entry[k] for k in identity):
+                    if not isinstance(seen, dict) or any(
+                            seen.get(k) != entry[k] for k in ("harness", "session_id")):
+                        continue
+                    # A session plays one role per run. A supervisor arming another
+                    # role or handing off a task speaks for that role without
+                    # playing it, and noting it would attribute its tokens there.
+                    if seen.get("role") != role:
+                        return None
+                    same_process = all((seen.get("worker_process") or {}).get(k)
+                                       == process.get(k) for k in ("pid", "start"))
+                    if all(seen.get(k) == entry[k] for k in identity) and same_process:
                         return ref
                 fh.write(json.dumps({"at": stamp(), **entry}, sort_keys=True) + "\n")
                 fh.flush()
@@ -206,19 +244,21 @@ def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
         return str(getattr(a, "role", "") or ""), ""
     if a.cmd == "feedback":
         return (str(a.role or ""), owner) if a.add else ("", "")
-    quick = mode_of(d) == MODE_QUICK
+    quick = mode_of(d) == MODE_QUICK and not is_quick_milestone(d)
     explicit = str(getattr(a, "as_role", "") or "")
     if a.cmd in ("submit", "handoff"):
         if explicit:
             return explicit, owner
         if owner == "orch":
-            return ("coordinator" if quick else "orchestrator"), owner
+            return ("coordinator" if quick else "implementor" if is_quick_milestone(d)
+                    else "orchestrator"), owner
         return "implementor", owner
     if a.cmd == "verify":
         return explicit or ("checker" if quick else "verifier"), owner
     if a.cmd == "decide":
         return explicit or ("checker" if quick else "reviewer"), owner
-    return ("coordinator" if quick else "orchestrator"), ""
+    return ("coordinator" if quick else "implementor" if is_quick_milestone(d)
+            else "orchestrator"), ""
 
 
 def note_command_session(a: argparse.Namespace) -> None:
@@ -233,7 +273,10 @@ def note_command_session(a: argparse.Namespace) -> None:
         role, owner = command_session_role(a, d)
     except SystemExit:
         return
-    if role:
+    # A session started for one role says so in DOCKET_ROLE; a command it runs on
+    # another role's behalf is not that role's session.
+    declared = os.environ.get("DOCKET_ROLE", "").strip()
+    if role and (not declared or declared == role):
         a.harness_session_ref = note_harness_session(d, role, owner, [a.run, a.cmd])
 
 
@@ -256,10 +299,33 @@ def run_harness_sessions(d: Path) -> list[dict[str, object]]:
                                       "owners": [], "cwd": str(entry.get("cwd", "")),
                                       "version": str(entry.get("version", "")),
                                       "first_seen": str(entry.get("at", ""))})
+        seen_at = str(entry.get("at", ""))
+        if seen_at and (not ref["first_seen"] or seen_at < ref["first_seen"]):
+            ref["first_seen"] = seen_at
         for field, value in (("roles", entry.get("role")), ("owners", entry.get("owner"))):
             if value and value != "-" and value not in ref[field]:
                 ref[field].append(str(value))
+        if isinstance(entry.get("worker_process"), dict):
+            ref["worker_process"] = entry["worker_process"]
     return list(merged.values())
+
+
+def session_noted_roles(d: Path, ref: dict[str, str]) -> list[str]:
+    """Roles this run noted for one harness session, or [] for a stranger.
+
+    A harness session plays one role per run, and the ledger is the
+    registration a watcher checks when DOCKET_ROLE is unset. A terminal
+    watcher with no harness session has no entry and is never refused here.
+    """
+    roles: list[str] = []
+    for noted in run_harness_sessions(d):
+        if str(noted.get("harness", "")) != str(ref.get("harness", "")) \
+                or str(noted.get("session_id", "")) != str(ref.get("session_id", "")):
+            continue
+        for role in noted.get("roles", []):
+            if role and role not in roles:
+                roles.append(str(role))
+    return roles
 
 
 def session_transcripts(ref: dict[str, object]) -> list[Path]:
@@ -318,6 +384,18 @@ def _span(usage: dict[str, object], when: str) -> None:
         usage["ended"] = max(str(usage["ended"]), when)
 
 
+def _in_run_window(when: str, since: str) -> bool:
+    if not since:
+        return True
+    if not when:
+        return False
+    try:
+        return datetime.fromisoformat(when.replace("Z", "+00:00")) >= datetime.fromisoformat(
+            since.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+
+
 def _jsonl(path: Path) -> list[dict]:
     try:
         lines = path.read_text(errors="replace").splitlines()
@@ -334,25 +412,34 @@ def _jsonl(path: Path) -> list[dict]:
     return out
 
 
-def claude_session_usage(files: list[Path]) -> dict[str, object]:
+def claude_session_usage(files: list[Path], since: str = "") -> dict[str, object]:
     """Tokens from a Claude Code transcript and its subagents, one count per API message."""
     usage = empty_usage()
     counted: dict[str, dict] = {}
+    seen_messages: set[str] = set()
     for path in (p for p in files if p.suffix == ".jsonl"):
         for record in _jsonl(path):
-            _span(usage, str(record.get("timestamp", "") or ""))
+            when = str(record.get("timestamp", "") or "")
             if not usage["harness_cwd"] and record.get("cwd"):
                 usage["harness_cwd"] = str(record["cwd"])
             message = record.get("message")
             if record.get("type") != "assistant" or not isinstance(message, dict):
+                if _in_run_window(when, since):
+                    _span(usage, when)
                 continue
+            key = f"{path.name}:{message.get('id') or record.get('uuid')}"
+            if key in seen_messages:
+                continue
+            seen_messages.add(key)
+            if not _in_run_window(when, since):
+                continue
+            _span(usage, when)
             model = str(message.get("model", "") or "")
             if not model or model.startswith("<"):
                 continue
             if model not in usage["models"]:
                 usage["models"].append(model)
             if isinstance(message.get("usage"), dict):
-                key = f"{path.name}:{message.get('id') or record.get('uuid')}"
                 counted[key] = message["usage"]
     for counts in counted.values():
         usage["calls"] += 1
@@ -365,30 +452,154 @@ def claude_session_usage(files: list[Path]) -> dict[str, object]:
     return usage
 
 
-def codex_session_usage(files: list[Path]) -> dict[str, object]:
-    """Tokens from a Codex rollout: its last cumulative token count."""
+def codex_session_usage(files: list[Path], since: str = "") -> dict[str, object]:
+    """Tokens from the Codex cumulative count after the role joined the run."""
     usage = empty_usage()
     last: dict = {}
+    baseline: dict = {}
+    record_when = ""
     for record in (r for path in files for r in _jsonl(path)):
-        _span(usage, str(record.get("timestamp", "") or ""))
+        record_when = str(record.get("timestamp", "") or "") or record_when
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         if record.get("type") == "session_meta" and payload.get("cwd"):
             usage["harness_cwd"] = str(payload["cwd"])
-        elif record.get("type") == "turn_context" and payload.get("model"):
+        if (record.get("type") == "event_msg" and payload.get("type") == "token_count"
+                and isinstance(payload.get("info"), dict)):
+            counts = payload["info"].get("total_token_usage")
+            if not _in_run_window(record_when, since):
+                if isinstance(counts, dict):
+                    baseline = counts
+                continue
+            usage["calls"] += 1
+            if isinstance(counts, dict):
+                last = counts
+        if not _in_run_window(record_when, since):
+            continue
+        _span(usage, record_when)
+        if record.get("type") == "turn_context" and payload.get("model"):
             if payload["model"] not in usage["models"]:
                 usage["models"].append(str(payload["model"]))
-        elif (record.get("type") == "event_msg" and payload.get("type") == "token_count"
-              and isinstance(payload.get("info"), dict)):
-            usage["calls"] += 1
-            last = payload["info"].get("total_token_usage") or last
-    cached = int(last.get("cached_input_tokens") or 0)
-    written = int(last.get("cache_write_input_tokens") or 0)
-    usage["input"] = max(0, int(last.get("input_tokens") or 0) - cached - written)
+    def delta(key: str) -> int:
+        return max(0, int(last.get(key) or 0) - int(baseline.get(key) or 0))
+    cached = delta("cached_input_tokens")
+    written = delta("cache_write_input_tokens")
+    usage["input"] = max(0, delta("input_tokens") - cached - written)
     usage["cache_read"], usage["cache_write"] = cached, written
-    usage["output"] = int(last.get("output_tokens") or 0)
-    usage["reasoning"] = int(last.get("reasoning_output_tokens") or 0)
-    usage["total"] = int(last.get("total_tokens") or 0)
+    usage["output"] = delta("output_tokens")
+    usage["reasoning"] = delta("reasoning_output_tokens")
+    usage["total"] = delta("total_tokens")
     return usage
+
+
+CODEX_LIMIT_WARN_PERCENT = {"primary": 70, "secondary": 90}
+
+
+def _codex_limit_reading(path: Path) -> dict | None:
+    """The last usage-limit reading in one Codex rollout, read from its tail."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            for window in (256 * 1024, 4 * 1024 * 1024):
+                fh.seek(max(0, size - window))
+                lines = fh.read().splitlines()
+                if size > window:
+                    lines = lines[1:]
+                for raw in reversed(lines):
+                    if b'"rate_limits"' not in raw:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except ValueError:
+                        continue
+                    payload = record.get("payload") if isinstance(record, dict) else None
+                    limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+                    if isinstance(limits, dict) and (isinstance(limits.get("primary"), dict)
+                                                     or isinstance(limits.get("secondary"), dict)):
+                        return {"at": str(record.get("timestamp", "")),
+                                "primary": limits.get("primary"),
+                                "secondary": limits.get("secondary")}
+                if size <= window:
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def codex_rate_limits(now: float | None = None) -> dict | None:
+    """The current Codex usage-limit reading on this machine, or None.
+
+    The limits are account-wide, so every recent session's rollout is a reading,
+    not only the run's. A session can log a stale snapshot after newer ones, so
+    each window takes the highest use among readings for its current period
+    (usage only grows within one), and a window that has reset since is dropped.
+    """
+    days = sorted(p for p in (codex_home() / "sessions").glob("*/*/*") if p.is_dir())[-2:]
+    try:
+        rollouts = sorted((p for day in days for p in day.glob("rollout-*.jsonl")),
+                          key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    except OSError:
+        return None
+    readings = [r for r in map(_codex_limit_reading, rollouts) if r]
+    now = now_s() if now is None else now
+    out: dict = {}
+    for window in ("primary", "secondary"):
+        live = []
+        for reading in readings:
+            w = reading.get(window)
+            if not isinstance(w, dict) or not isinstance(w.get("used_percent"), (int, float)) \
+                    or not isinstance(w.get("resets_at"), (int, float)) or w["resets_at"] <= now:
+                continue
+            live.append((float(w["resets_at"]), float(w["used_percent"]),
+                         int(w.get("window_minutes") or 0), reading["at"]))
+        if not live:
+            continue
+        # One period's reset time jitters by a few seconds between responses.
+        current = max(r[0] for r in live)
+        period = [r for r in live if r[0] >= current - 600]
+        top = max(period, key=lambda r: r[1])
+        out[window] = {"used_percent": top[1], "window_minutes": top[2], "resets_at": top[0]}
+        out["at"] = max([out.get("at", ""), *(r[3] for r in period)])
+    return out or None
+
+
+def codex_limit_lines(limits: dict) -> list[str]:
+    """Human lines for a Codex limit reading, a warning last when one is due."""
+    def when(epoch: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(epoch))
+    names = {"primary": "5h window", "secondary": "weekly window"}
+    parts, hot = [], []
+    for window in ("primary", "secondary"):
+        w = limits.get(window)
+        if not w:
+            continue
+        minutes = w["window_minutes"]
+        name = names[window] if minutes in (0, 300, 10080) else f"{minutes}-minute window"
+        parts.append(f"{name} {w['used_percent']:.0f}% used, resets {when(w['resets_at'])}")
+        if w["used_percent"] >= CODEX_LIMIT_WARN_PERCENT[window]:
+            hot.append(f"{name} at {w['used_percent']:.0f}%")
+    lines = [f"codex limits (account-wide, read {limits['at'][:16].replace('T', ' ')}Z): "
+             + "; ".join(parts)]
+    if hot:
+        lines.append("warning: Codex " + " and ".join(hot) + ". Tell the user once now: every"
+                     " Codex role stalls mid-task when a window reaches 100%. An approved worker"
+                     " fallback, when available, is routed to the orchestrator; moving supervisor"
+                     " roles to another harness is the user's call.")
+    return lines
+
+
+def codex_limit_exhausted(limits: dict | None) -> bool:
+    """Whether a live Codex account window has reached its reported cap."""
+    if not isinstance(limits, dict):
+        return False
+    return any(isinstance(limits.get(window), dict)
+               and float(limits[window].get("used_percent", 0) or 0) >= 100
+               for window in ("primary", "secondary"))
+
+
+def codex_stop_hook_installed() -> bool:
+    """Whether local Codex config enables a synchronous Docket Stop adapter."""
+    config = codex_hook_configuration(codex_home())
+    return bool(config["locations"] and config["enabled"])
 
 
 def opencode_session_rows(sid: str) -> dict[str, object] | None:
@@ -432,7 +643,7 @@ def opencode_session_rows(sid: str) -> dict[str, object] | None:
     return {"sessions": sessions, "messages": messages}
 
 
-def opencode_session_usage(rows: dict[str, object] | None) -> dict[str, object]:
+def opencode_session_usage(rows: dict[str, object] | None, since: str = "") -> dict[str, object]:
     """Tokens summed over an OpenCode session's assistant messages, subagents included."""
     usage = empty_usage()
     if not rows:
@@ -441,8 +652,11 @@ def opencode_session_usage(rows: dict[str, object] | None) -> dict[str, object]:
     for message in rows["messages"]:
         info = message["info"] if isinstance(message.get("info"), dict) else {}
         created = (info.get("time") or {}).get("created")
+        when = stamp(created / 1000) if isinstance(created, (int, float)) else ""
+        if not _in_run_window(when, since):
+            continue
         if isinstance(created, (int, float)):
-            _span(usage, stamp(created / 1000))
+            _span(usage, when)
         if info.get("role") != "assistant":
             continue
         tokens = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
@@ -465,15 +679,16 @@ def opencode_session_usage(rows: dict[str, object] | None) -> dict[str, object]:
 
 def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path], object]:
     """Usage, transcript files, and OpenCode rows for one noted session."""
+    since = str(ref.get("first_seen", "") or "")
     if ref.get("harness") == "opencode":
         rows = opencode_session_rows(str(ref.get("session_id", "")))
-        usage = opencode_session_usage(rows)
+        usage = opencode_session_usage(rows, since)
         usage["found"] = rows is not None
         usage["transcript"] = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
         return usage, [], rows
     files = session_transcripts(ref)
     usage = (claude_session_usage if ref.get("harness") == "claude"
-             else codex_session_usage)(files)
+             else codex_session_usage)(files, since)
     usage["found"] = bool(files)
     usage["transcript"] = str(files[0]) if files else ""
     return usage, files, None

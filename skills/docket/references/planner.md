@@ -7,7 +7,9 @@ The planner owns the plan and its intent and constraint amendments. It does not 
 - `split`: the planner and orchestrator are separate agents. Use this when the
   planner runs on an expensive Claude Code or Codex model and implementation and
   supervision can run more cheaply in OpenCode.
-- `combined`: one agent performs both planner/reviewer and orchestrator duties.
+- `combined`: one agent performs planner and orchestrator duties. Only under
+  the legacy workflow does that agent also review task rounds; `five-role-v1`
+  keeps review with the independent reviewer.
   Implementors may still be separate agents. Use the orchestrator workflow after
   the plan is approved; no redundant planner handoff occurs.
 
@@ -17,9 +19,16 @@ Record the choice with `docket init <run> --topology split|combined`.
 
 New runs start on the quick preset unless `--mode standard` selects the five-session one.
 The standard preset keeps planner and orchestrator as separate sessions with an independent verifier behind every decision.
-The quick preset merges planning and orchestration into one coordinator session for work with one clear outcome, established local verification, one writer, and no unresolved requirement or architecture decision.
-A coordinator owns exactly the planner duties described here plus deterministic dispatch.
-Nothing about intent ownership or amendment authority is weakened by the merge.
+The new quick preset keeps a separate planner. Define the objective, constraints,
+acceptance, tasks, and milestone membership before starting the implementor.
+Assign every task with `--as planner`, then create each milestone with its full-suite
+command, for example `docket batch R01 --create M1 --members T01,T02 --milestone
+--command 'tests/test.sh' --as planner`, and close it with `--close M1 --as planner`.
+The implementor coordinates dispatch and runs that declared full suite after each
+milestone's implementation. It waits for the reviewer's approval before starting
+the next milestone. Each role arms and watches its own Docket events after startup.
+Only the reviewer approves those milestones. Existing `combined-checker` quick runs
+retain their coordinator and checker roles.
 A run that outgrows quick records an escalation request instead of migrating silently.
 
 ## Choose the review evidence
@@ -67,10 +76,47 @@ and ownership are independent:
 - `executor=implementor` delegates the task regardless of complexity.
 - `executor=orchestrator` keeps the task with the orchestrator.
 
-Define functional intent and constraints, not detailed repository maps. The cheap
+Define functional intent and constraints, not detailed repository maps. The
 implementor owns discovery and proposes its change surface after dispatch.
+Choose a strong, lower-cost implementor model as the default for delegated
+coding work, and keep free models as fallbacks only when their measured pass
+rate justifies the extra correction time. Name the actual approved models in
+the plan so dispatch and recovery follow the same policy.
+For a budgeted run, set flat `premium_models`, `token_budget`, and
+`review_reserve` fields in `plan.mdx`. New launches of those premium models
+stop when measured run tokens reach the review reserve boundary; approved
+non-premium fallbacks remain available. A missing transcript makes the guard
+refuse the premium launch because it cannot measure the remaining allowance.
+An account-wide Codex usage warning wakes the planner once per limit window;
+review the reserve and model policy before authorizing another premium launch.
+Prefer fewer, larger tasks that each deliver a checkable outcome. Avoid a chain
+of tiny tasks that touch the same file: every task adds a dispatch, verifier
+finding, and review boundary. Split work when the outcomes have independent
+acceptance criteria, can proceed separately, or need a different owner.
+Write at least one task-specific, checkable `--criterion` when assigning a
+task. A standard tiered run then adds criteria for sibling sites, existing behavior, and side
+effects. Use `--no-default-criteria` only when those three questions genuinely
+do not apply.
+
+Assign focused per-task verification: each task's `verify:` covers only the area
+it touches, and that declared command is the implementor's whole test obligation.
+The full suite never belongs in a task `verify:`; in new quick runs declare it
+when creating the milestone and the implementor runs `docket batch <run> --verify <bid>`
+when the batch is ready. In standard runs pass it with `--command CMD` at verification;
+the suite also runs at the aggregate. A task that names `tests/test.sh` as its verify is
+overscoped and must be narrowed.
 
 Approve the plan only after the human agrees to it.
+
+When an implementor proposes a contract change with `docket propose-amendment`,
+read its need, conflicting constraints, evidence, alternative, and impact. Edit
+the affected task contract if the new requirement is accepted, then record
+`docket amendment <run> --accept <ID>`. To keep the existing contract, record
+`docket amendment <run> --reject <ID> --reason TEXT`. This is the planner's
+intent decision; leave implementation findings and task verdicts to their
+assigned roles. The reviewer can cite the accepted ID with `decide --changes
+--amendment <ID>` to open a fresh verification round without charging an
+implementation correction.
 
 ## Split-mode information boundary
 
@@ -80,6 +126,11 @@ The planner must not monitor implementor lifecycle, read `Txx-report` files,
 receive task submission wakes, or relay per-task implementation progress to the
 human. Those are orchestrator responsibilities. This boundary is intentional: it
 protects the expensive planner's context and token budget.
+
+For a new plan instruction that the orchestrator needs while it waits, record
+`docket instruct <run> --role orchestrator --message TEXT`; the role's watcher
+wakes immediately and the orchestrator resolves the instruction after handling
+it. Use this for decisions about intent, not routine task progress.
 
 Arm only the planner role and set `DOCKET_ROLE=planner` in its session:
 
@@ -92,17 +143,24 @@ docket status <run> --role planner
 
 The standard preset builds two herdr windows once, at session setup.
 Build the planner window first, from the planner pane, as a 1:1 vertical split with planner and reviewer.
-Split the planner pane 1:1 to the right for the reviewer, read the new pane id from `result.pane.pane_id`, and start the reviewer there.
+Split the planner pane 1:1 to the right for the reviewer and keep the new pane id from `result.pane.pane_id`.
+When `launch:reviewer` arrives, start the reviewer in that prepared pane.
 Then create the tab that will hold the orchestrator window.
 
 ```bash
 herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id
+herdr tab create --cwd "$PWD" --env DOCKET_ROLE=orchestrator --no-focus   # JSON: result.root_pane.pane_id
+# On launch:reviewer, use the reviewer pane id saved above.
 herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto
-herdr tab create --cwd "$PWD" --no-focus
+herdr agent start orchestrator --kind codex --pane <root_pane_id> -- --yolo   # or the harness the plan names
 ```
 
+Start the orchestrator in that tab's root pane.
+The tab's `--env DOCKET_ROLE=orchestrator` is what lets the orchestrator's Stop hook fire; a pane without it cannot wait at zero cost.
+
 The orchestrator builds its own window inside that tab: it splits the orchestrator pane 1:1 to the right for the implementor pane and down in half for the verifier, and starts the verifier there.
-Only the planner starts the reviewer.
+Only the planner starts the reviewer in standard. The launch event appears when review work
+is pending and no reviewer harness session has joined this run.
 Only the orchestrator starts the verifier and each implementor.
 
 ```bash
@@ -111,7 +169,10 @@ herdr pane split --current --direction down --ratio 0.5 --cwd "$PWD" --env DOCKE
 herdr agent start verifier --kind opencode --pane <pane_id> -- --auto
 ```
 
-The quick preset merges planning and orchestration into one coordinator session and uses none of these commands.
+In the new quick preset, start one implementor session. The implementor handles
+the task and milestone commands and owns `launch:reviewer` when review work is
+pending; the planner does not receive that launch event. The standard layout above
+uses separate orchestrator and verifier sessions.
 
 The only implementation artifact the planner consumes is the standardized
 `orch-report-NN.mdx` in legacy split runs. In `five-role-v1` runs the aggregate
@@ -132,7 +193,7 @@ began, re-read it and either ask for the reviewed body back or re-decide with
 re-verifies it; a blocked aggregate report clears the blocked checks and skips
 completion verification there, exactly as it does at submission.
 
-## Combined mode
+## Combined topology (legacy and custom runs)
 
 Continue with the orchestrator playbook in the same agent. Do not arm the planner
 role. The final orchestrator report is still required as the durable summary, but

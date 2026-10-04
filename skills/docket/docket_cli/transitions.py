@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -14,7 +16,8 @@ from .frontmatter import is_empty, parse, render, sections, set_section
 from .paths import decisions, latest, reports
 from .publication import fault, publish, publish_json
 from .policy import (
-    artifact_policy_fields, is_five_role, mode_of, need_run, plan_flag, require_five_role,
+    artifact_policy_fields, is_five_role, is_quick_milestone, is_tiered, mode_of, need_run,
+    plan_flag, require_five_role,
     task_executor,
 )
 from .baselines import evidence_digest, evidence_mode, task_verify
@@ -23,9 +26,11 @@ from .locks import owner_lock
 from .state import (
     applied_decision, batch_path, group_numbered_items, latest_verification, list_batches,
     normalized_scope, read_batch, read_transition, record_reopen, scope_collisions,
-    seed_report_acceptance, transition_path,
+    seed_report_acceptance, transition_path, quick_submitted_pass,
 )
-from .dependencies import dependency_problems, provisional_dependencies, refreshed_inputs
+from .dependencies import (
+    dependency_problems, provisional_dependencies, refreshed_inputs, read_deps,
+)
 from .freeze import current_bundle, freeze_task_bundle
 from .aggregates import (
     current_aggregate, freeze_aggregate_bundle, require_aggregate, stale_aggregate,
@@ -39,7 +44,7 @@ from .sessions import collect_run_usage
 from .models import record_outcome
 from .five_role import clear_corrections, guard_correction_budget, note_correction
 from .gate import gate_problems
-from .amendments import amendment_blocks
+from .amendments import accepted_requirement_round, amendment_blocks
 
 
 REOPEN_STEPS = ("next-round",)
@@ -486,7 +491,8 @@ def correction_handoff_line(d: Path, owner: str, dec: Path, nxt: Path) -> str:
         count = len(group_numbered_items(raw_lines)) or len(raw_lines)
     except (OSError, ValueError):
         count = 0
-    dispatcher = "coordinator" if mode_of(d) == MODE_QUICK else "orchestrator"
+    dispatcher = ("implementor" if is_quick_milestone(d) else
+                  "coordinator" if mode_of(d) == MODE_QUICK else "orchestrator")
     noun = "change" if count == 1 else "changes"
     if owner == "orch" or task_executor(d, owner) == "orchestrator":
         return (f"recorded {count} required {noun} in {dec.name}; the {dispatcher} "
@@ -599,6 +605,204 @@ def cmd_decide(a: argparse.Namespace) -> None:
         return
     with owner_lock(d, a.owner):
         decide_locked(a, d)
+
+
+def cmd_batch_decide(a: argparse.Namespace, d: Path) -> None:
+    """Record one milestone reviewer decision bound to the frozen full-suite result.
+
+    One reviewer invocation approves every submitted member, each against its own
+    bundle digest through the standard decision transition, and freezes the batch
+    decision against the batch verification digest. A correction still opens per
+    member with `docket decide --changes`, whose follow-up round takes a fresh
+    baseline. Lives here (after batches in MODULES) so it can run decide_locked.
+    """
+    bid = str(getattr(a, "approve", "") or "").strip()
+    if not bid:
+        die("batch approval needs a batch id: `docket batch RUN --approve BID --as reviewer`")
+    batch_path(d, bid)
+    with owner_lock(d, f"batch-{bid}"):
+        # Hold every member lock through preflight, journal publication, and all
+        # member decisions. A submit or correction cannot move evidence between
+        # the approval check and the durable batch intent.
+        from .state import read_batch as _read_batch
+        batch = _read_batch(d, bid)
+        members = sorted(str(m) for m in (batch or {}).get("members", []))
+        with contextlib.ExitStack() as held:
+            for member in members:
+                held.enter_context(owner_lock(d, member))
+            _cmd_batch_decide_locked(a, d, bid)
+
+
+def _archive_batch_transition(d: Path, bid: str, journal: dict,
+                              decision: dict | None = None) -> None:
+    """Keep a prior batch intent and decision before a new evidence revision."""
+    content = json.dumps(journal, sort_keys=True, separators=(",", ":")).encode()
+    address = hashlib.sha256(content).hexdigest()
+    directory = d / ".transitions" / "batch-history" / bid
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{address}.json"
+    if not target.exists():
+        publish_json(target, journal)
+    if decision:
+        record = d / ".batches" / "history" / bid / f"{address}.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        if not record.exists():
+            publish_json(record, decision)
+
+
+def _batch_member_approval_preflight(a: argparse.Namespace, d: Path,
+                                     bid: str, members: list[str]) -> None:
+    """Check every new member approval before publishing batch approval intent."""
+    from .state import state_of as _state_of
+    for member in members:
+        rnd, status = _state_of(d, member)
+        if status in ("approved", "waived", "completed"):
+            continue
+        if status != "submitted":
+            die(f"batch {bid} member {member} is {status}; the recorded decision cannot "
+                "approve different work")
+        pending = read_transition(d, member)
+        if pending.get("state") == "in-progress" and pending.get("verdict") != "approved":
+            die(f"batch {bid} member {member} has an unfinished "
+                f"{pending.get('verdict')} decision")
+        rep = d / f"{member}-report-{rnd:02d}.mdx"
+        _, body = parse(rep.read_text())
+        frozen, stale = require_bundle(d, member, rnd, rep, evidence_digest(body))
+        if stale:
+            die(f"batch {bid} member {member} changed after its bundle was frozen; "
+                "re-review and re-verify the current report before approval")
+        check = argparse.Namespace(run=d.name, owner=member)
+        guard_accepting_verdict(check, d, rnd, "approved", frozen)
+
+
+def _batch_published_approval(d: Path, journal: dict) -> bool:
+    """Whether an interrupted batch already wrote a member approval artifact."""
+    for member, digest in (journal.get("member_bundles") or {}).items():
+        for path in decisions(d, str(member)):
+            meta, _ = parse(path.read_text())
+            if (meta.get("verdict") == "approved" and meta.get("applied") == "yes"
+                    and meta.get("bundle_digest") == digest):
+                return True
+    return False
+
+
+def _cmd_batch_decide_locked(a: argparse.Namespace, d: Path, bid: str) -> None:
+    from .batches import (
+        batch_ready as _batch_ready,
+        batch_verification_historical_valid as _batch_historical,
+        batch_verification_valid as _batch_valid,
+        current_member_bundles as _member_bundles,
+    )
+    from .state import read_batch as _read_batch
+    from .state import state_of as _state_of
+    batch = _read_batch(d, bid)
+    if not batch:
+        die(f"no batch {bid!r} in {d.name}")
+    if batch.get("state") != "closed":
+        die(f"batch {bid} is {batch.get('state')}, not closed")
+    require_five_role(a, d, "decide:approve")
+    if not is_tiered(d):
+        die("batch approval applies only to a tiered review run")
+    journal_path = d / ".transitions" / f"batch-{bid}.json"
+    try:
+        journal = json.loads(journal_path.read_text())
+    except FileNotFoundError:
+        journal = {}
+    except (OSError, ValueError) as exc:
+        die(f"batch {bid} has an unreadable decision transition: {exc}")
+    if not isinstance(journal, dict):
+        die(f"batch {bid} has a malformed decision transition")
+    members = sorted(str(m) for m in (batch.get("members") or []))
+    current_bundles = _member_bundles(d, batch)
+    verification = batch.get("verification") or {}
+    decision = batch.get("milestone_decision") or {}
+    if journal.get("state") == "complete":
+        if decision.get("batch_verification") != journal.get("batch_verification") \
+                or decision.get("member_bundles") != journal.get("member_bundles"):
+            die(f"batch {bid} decision journal and milestone record disagree")
+        if (journal.get("batch_verification") == verification.get("digest")
+                and journal.get("member_bundles") == current_bundles):
+            if not _batch_historical(d, batch):
+                die(f"batch {bid} has damaged historical full-suite evidence; "
+                    "the completed decision cannot be confirmed")
+            print(f"milestone {bid} already approved {len(journal.get('members', []))} "
+                  f"member(s) in one reviewer decision: {', '.join(journal.get('members', []))}")
+            return
+        # Reopening a waived member or refreezing corrected work creates a
+        # new decision generation. Keep the old completed decision addressable.
+        _archive_batch_transition(d, bid, journal, decision)
+        journal = {}
+    if not journal:
+        ready, _ = _batch_ready(d, batch)
+        if not ready:
+            die(f"batch {bid} is not ready: every submitted member needs resolved verification")
+    if not _batch_valid(d, batch):
+        die(f"batch {bid} has no valid full-suite pass for its current member bundles and "
+            f"source; run `docket batch {d.name} --verify {bid} --command CMD` first. A changed "
+            "member or source invalidates the previous pass rather than reusing it")
+    verification = batch.get("verification")
+    assert isinstance(verification, dict)
+    if journal and (journal.get("batch_verification") != verification.get("digest")
+                    or journal.get("member_bundles") != current_bundles):
+        if _batch_published_approval(d, journal):
+            die(f"batch {bid} changed during its decision transition; restore the reviewed "
+                "member bundles and batch verification before retrying")
+        abandoned = {**journal, "state": "abandoned", "abandoned_at": stamp(),
+                     "abandoned_because": "reviewed evidence moved before any member approval"}
+        _archive_batch_transition(d, bid, abandoned)
+        journal = {}
+        ready, _ = _batch_ready(d, batch)
+        if not ready:
+            die(f"batch {bid} is not ready after the prior approval intent was abandoned")
+    _batch_member_approval_preflight(a, d, bid, members)
+    if not journal:
+        journal = {
+            "state": "in-progress", "verdict": "approved", "batch": bid,
+            "batch_verification": str(verification.get("digest", "")),
+            "members": members,
+            "member_bundles": current_bundles,
+            "reviewer": getattr(a, "reviewer", None) or "reviewer",
+            "reason": str(getattr(a, "reason", "") or ""),
+        }
+        publish_json(journal_path, journal)
+    reviewer = getattr(a, "reviewer", None) or "reviewer"
+    supplied_reason = str(getattr(a, "reason", "") or "")
+    if reviewer != journal.get("reviewer") or (supplied_reason and supplied_reason != journal.get("reason")):
+        die(f"batch {bid} has a recorded reviewer decision; retry it with the same "
+            "reviewer and reason, or omit the reason")
+    members = [str(m) for m in journal["members"]]
+    reason = (f"milestone {bid} approval binds batch verification "
+              f"{verification.get('digest')} and its frozen full-suite command "
+              f"{verification.get('command')}")
+    if journal.get("reason"):
+        reason += f"; {journal['reason']}"
+    for member in members:
+        _, st = _state_of(d, member)
+        if st not in ("submitted", "approved", "waived", "completed"):
+            die(f"batch {bid} member {member} is {st}; the recorded decision cannot "
+                "approve different work")
+        if st in ("approved", "waived", "completed"):
+            continue
+        fake = argparse.Namespace(run=d.name, owner=member, approve=True, changes=False,
+                                  waive=False, reopen=False, reason=reason,
+                                  reviewer=reviewer, re_review=False, verify_timeout=None,
+                                  as_role=getattr(a, "as_role", ""),
+                                  batch_approval=bid, change=[])
+        decide_locked(fake, d)
+    batch["milestone_decision"] = {
+        "verdict": "approved",
+        "reviewer": reviewer,
+        "members": members,
+        "member_bundles": journal["member_bundles"],
+        "batch_verification": journal["batch_verification"],
+        "command": str(verification.get("command", "")),
+        "decided_at": stamp(),
+    }
+    publish_json(batch_path(d, bid), batch)
+    journal["state"] = "complete"
+    publish_json(journal_path, journal)
+    print(f"milestone {bid} approved {len(members)} member(s) in one reviewer decision: "
+          f"{', '.join(members)}; bound to full-suite {verification.get('command')}")
 
 
 def reopen_decide(a: argparse.Namespace, d: Path) -> None:
@@ -740,21 +944,25 @@ def guard_accepting_verdict(
                 "the captured verification described different acceptance"
             )
         if is_five_role(d) and verdict == "approved":
-            exempt = [item.strip() for item in
-                      plan_flag(d, "verifier_exempt", "").split(",") if item.strip()]
-            if a.owner not in exempt:
-                vpath, vmeta, _ = latest_verification(d, a.owner, rnd)
-                frozen_digest = str((frozen or {}).get("digest", ""))
-                if vpath is None or vmeta.get("result") != "pass":
-                    die(f"{a.owner} round {rnd} has no passing verification: a verifier pass "
-                        "means ready for review, never approved. Record one with "
-                        f"`docket verify {a.run} {a.owner} --result pass --as verifier` first")
-                if str(vmeta.get("bundle_digest", "")) != frozen_digest:
-                    die(f"{vpath.name} binds bundle {vmeta.get('bundle_digest')} but round {rnd} "
-                        f"froze {frozen_digest}: re-verify the current evidence")
-                if str(vmeta.get("contract_revision", "")) != live_contract:
-                    die(f"{vpath.name} verified contract {vmeta.get('contract_revision')} but the "
-                        "task now reads differently: re-verify after the amendment")
+            if is_quick_milestone(d):
+                if not quick_submitted_pass(d, a.owner, rnd):
+                    die(f"{a.owner} round {rnd} has no intact passing task-gate bundle")
+            else:
+                exempt = [item.strip() for item in
+                          plan_flag(d, "verifier_exempt", "").split(",") if item.strip()]
+                if a.owner not in exempt:
+                    vpath, vmeta, _ = latest_verification(d, a.owner, rnd)
+                    frozen_digest = str((frozen or {}).get("digest", ""))
+                    if vpath is None or vmeta.get("result") != "pass":
+                        die(f"{a.owner} round {rnd} has no passing verification: a verifier pass "
+                            "means ready for review, never approved. Record one with "
+                            f"`docket verify {a.run} {a.owner} --result pass --as verifier` first")
+                    if str(vmeta.get("bundle_digest", "")) != frozen_digest:
+                        die(f"{vpath.name} binds bundle {vmeta.get('bundle_digest')} but round {rnd} "
+                            f"froze {frozen_digest}: re-verify the current evidence")
+                    if str(vmeta.get("contract_revision", "")) != live_contract:
+                        die(f"{vpath.name} verified contract {vmeta.get('contract_revision')} but the "
+                            "task now reads differently: re-verify after the amendment")
         if stale_inputs:
             die(
                 f"{a.owner} cannot be {verdict} against consumed evidence that moved:\n      "
@@ -768,6 +976,13 @@ def guard_accepting_verdict(
                 f"note: {a.owner} consumed {entry.get('on')} provisionally at "
                 f"{entry.get('bundle')}; that is readiness, not an approval of {entry.get('on')}"
             )
+        for entry in read_deps(d, a.owner):
+            if entry.get("kind") == "settled":
+                print(
+                    f"note: {a.owner} consumed {entry.get('on')} as tiered-settled at "
+                    f"{entry.get('bundle')}; that is readiness for sequencing, never "
+                    f"reviewer approval of {entry.get('on')}"
+                )
 
 
 def decide_locked(a: argparse.Namespace, d: Path) -> None:
@@ -775,11 +990,18 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
     verdict = "waived" if a.waive else ("approved" if a.approve else "changes-requested")
     require_five_role(a, d, f"decide:{'waive' if a.waive else ('approve' if a.approve else 'changes')}")
     supplied_changes = list(getattr(a, "change", None) or [])
+    amendment = str(getattr(a, "amendment", "") or "")
     if supplied_changes and verdict != "changes-requested":
         die("--change needs --changes; only a changes request records required changes")
+    if amendment and verdict != "changes-requested":
+        die("--amendment needs --changes; only a fresh requirement round can cite it")
     pending = read_transition(d, a.owner)
     if pending.get("state") != "in-progress":
         pending = {}
+    if (is_tiered(d) and a.owner != "orch" and a.approve
+            and not getattr(a, "batch_approval", "") and not pending):
+        die(f"{a.owner} belongs to a tiered run: approve its closed milestone with "
+            "`docket batch RUN --approve BID --as reviewer` after the batch full-suite pass")
     if pending and pending.get("verdict") != verdict:
         if pending.get("verdict") == "reopen-waived":
             die(
@@ -898,6 +1120,12 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
         decision_meta["bundle_round"] = str(frozen.get("round", rnd))
         if a.owner == "orch":
             decision_meta["bundle_kind"] = "aggregate"
+    if amendment and not resuming and not recovered:
+        if frozen is None or not accepted_requirement_round(
+                d, a.owner, amendment, str(frozen.get("digest", ""))):
+            die(f"{amendment} is not an accepted amendment invalidating "
+                f"{a.owner} round {rnd}'s frozen bundle")
+        decision_meta["requirement_amendment"] = amendment
     if recovered:
         moved = []
         journalled = decision_meta.get("evidence_digest", "").strip()
@@ -993,9 +1221,21 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
             required = sections(decision_body).get("Required changes", "")
             if is_empty(required) or PLACEHOLDER.search(required):
                 die(f"{dec.name} needs specific required changes before the transition can be applied")
-            if is_five_role(d) and a.owner != "orch":
+            if is_five_role(d) and a.owner != "orch" and not decision_meta.get("requirement_amendment"):
                 note_correction(d, a.owner, "reviewer_returns", token=dec.name)
-                guard_correction_budget(d, a.owner, f"reviewer changes on round {rnd}")
+                def preserve_refused_changes() -> None:
+                    # A grant must wake the reviewer with the exact correction
+                    # it refused, including changes supplied on the command line.
+                    refused_meta = {**decision_meta, "applied": "no", "evidence_digest": digest,
+                                    "reviewer": a.reviewer or decision_meta.get("reviewer")
+                                    or DEFAULT_REVIEWER}
+                    refused_body = set_section(decision_body, "Verdict", verdict)
+                    refused_body = set_section(
+                        refused_body, "Reason", a.reason.strip() or
+                        sections(decision_body).get("Reason", "").strip() or "none")
+                    publish(dec, render(refused_meta, refused_body))
+                guard_correction_budget(d, a.owner, f"reviewer changes on round {rnd}",
+                                        on_exhausted=preserve_refused_changes)
         else:
             for name in ("Required changes", "Answers to decisions needed"):
                 if is_empty(sections(decision_body).get(name, "")):

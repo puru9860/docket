@@ -9,10 +9,11 @@ import sys
 from pathlib import Path
 
 from .common import COVERAGE_AVAILABLE, WORKFLOW_LEGACY_DECODE, die
-from .frontmatter import parse, render, sections
+from .frontmatter import checkbox_items, parse, render, sections
 from .paths import _ordered, owners, planned_tasks
 from .publication import publish
-from .policy import need_run, workflow_of
+from .policy import is_quick_milestone, need_run, workflow_of
+from .batches import batch_verification_dir, batch_verification_valid
 from .bundles import bundle_dir, bundle_problems, bundles_for, latest_bundle, load_bundle
 from .state import (
     latest_verification, list_amendments, list_incidents, read_batch, state_of,
@@ -20,7 +21,7 @@ from .state import (
 )
 from .freeze import current_bundle
 from .aggregates import aggregate_bundle_problems
-from .gate import parse_evidence_table, task_criterion_ids
+from .gate import parse_evidence_table
 from .release import (
     RELEASE_MILESTONES, UNAVAILABLE_MILESTONE, find_bundle_by_digest, frozen_bundle_view,
     installation_state, packet_staleness, resolve_release, validate_frozen_release,
@@ -104,7 +105,7 @@ def render_bounded_packet(lines: list[str], diff_blocks: list[tuple[str, list[st
         if mandatory_blocks else 0
     if mandatory_tokens > PACKET_TOKEN_TARGET:
         statement = ("Mandatory material exceeds the packet target: "
-                     f"{mandatory_tokens} estimated tokens of findings, complete waiver "
+                     f"{mandatory_tokens} estimated tokens of acceptance criteria, findings, complete waiver "
                      "reasons, required changes, and report decisions are retained.")
     else:
         statement = ("The packet remains above the target after routine evidence excerpts "
@@ -138,6 +139,34 @@ def task_coverage_row(d: Path, owner: str) -> dict[str, str]:
         if vmeta:
             row["verification"] = f"{vmeta.get('result', '?')} ({vmeta.get('attempt', '?')})"
     return row
+
+
+def packet_acceptance_lines(owner: str, contract: str, report: str,
+                            contract_ref: str, report_ref: str) -> list[str]:
+    """Keep criterion wording and its frozen evidence together in the packet."""
+    criteria = checkbox_items(sections(parse(contract)[1]).get("Acceptance criteria", ""))
+    if not criteria:
+        return []
+    rows, _ = parse_evidence_table(report)
+    evidence = {str(row.get("id", "")).upper(): row for row in rows or []}
+    checklist = re.findall(r"^\s*-\s+\[([ xX])\]\s+(.+)$",
+                           sections(parse(report)[1]).get("Acceptance", ""), re.M)
+    checked = {wording.strip(): mark.lower() == "x" for mark, wording in checklist}
+    out = [f"  frozen contract: {contract_ref}; frozen report: {report_ref}"]
+    for number, wording in enumerate(criteria, 1):
+        aid = f"A{number}"
+        row = evidence.get(aid)
+        if row:
+            out.append(f"  - {owner} {aid}: {wording} | {row['state']} | "
+                       f"evidence: {row['artifacts'] or 'none'} | "
+                       f"gap: {row['gaps'] or 'none'}")
+        else:
+            state = ("checked" if checked[wording] else "unchecked") \
+                if wording in checked else "unmapped"
+            out.append(f"  - {owner} {aid}: {wording} | {state} | "
+                       f"evidence: {report_ref} (checklist only) | "
+                       "gap: no per-criterion evidence mapping recorded")
+    return out
 
 
 def render_final_packet(a: argparse.Namespace, d: Path) -> None:
@@ -198,25 +227,17 @@ def render_final_packet(a: argparse.Namespace, d: Path) -> None:
                 errors="replace")
         except OSError:
             frozen_task = ""
-        aids = task_criterion_ids(d, owner, text=frozen_task)
-        if aids:
-            _, entry = find_bundle_by_digest(d, str(item.get("bundle", "")))
-            ev_states: dict[str, str] = {}
-            if entry is not None:
-                try:
-                    frozen_body = (bundle_dir(d, owner, entry) / "report.mdx"
-                                   ).read_text(errors="replace")
-                    table_rows, _ = parse_evidence_table(frozen_body)
-                    if table_rows is not None:
-                        for row in table_rows:
-                            ev_states[str(row.get("id", "")).upper()] = str(row.get("state", ""))
-                except OSError:
-                    pass
-            if ev_states:
-                for aid in aids:
-                    lines.append(f"  - {owner} {aid}: {ev_states.get(aid, 'not-verified')}")
-            else:
-                lines.append(f"  - {owner} acceptance IDs: {', '.join(aids)}")
+        _, entry = find_bundle_by_digest(d, str(item.get("bundle", "")))
+        if entry is not None:
+            where = bundle_dir(d, owner, entry)
+            frozen_report = (where / "report.mdx").read_text(errors="replace")
+            block = packet_acceptance_lines(
+                owner, frozen_task, frozen_report,
+                f"documents/tasks/{owner}-task.mdx", f"{where.relative_to(d)}/report.mdx")
+            lines.extend(block)
+            mandatory_blocks.append("\n".join(block))
+            required_reading.extend((f"documents/tasks/{owner}-task.mdx",
+                                     f"{where.relative_to(d)}/report.mdx"))
     owner, entry = find_bundle_by_digest(d, str(manifest["aggregate"]["digest"]))
     orch_manifest = load_bundle(d, "orch", entry) if entry is not None else None
     lines += ["", "## Aggregate bundle (frozen)", ""]
@@ -273,8 +294,9 @@ def render_final_packet(a: argparse.Namespace, d: Path) -> None:
                 diff_text = ""
             qualified = f"{alias}:{name}" if alias else name
             diff_blocks.append((f"  patch {qualified} ({len(diff_text.splitlines())} lines; "
-                                "first {keep} shown; full text in the bundle)",
+                                f"first {{keep}} shown; full: {where.relative_to(d)}/{name})",
                                 diff_text.splitlines()))
+            required_reading.append(f"{where.relative_to(d)}/{name}")
             lines.append(f"@@diff:{len(diff_blocks) - 1}@@")
     lines += ["", "## Verifier findings, waivers, and unresolved risks (frozen)", ""]
     for item in manifest.get("constituents", []):
@@ -546,31 +568,23 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
                      f"(bundle {row['bundle'] or 'none'}, "
                      f"verification {row['verification'] or 'none'}, "
                      f"decision {row['decision'] or 'none'})")
-        aids = task_criterion_ids(d, owner)
-        if aids:
-            try:
-                rnd = int(row.get("round") or 0)
-            except ValueError:
-                rnd = 0
-            frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
-            manifest = load_bundle(d, owner, frozen) if frozen else None
-            where = bundle_dir(d, owner, frozen) if frozen else None
-            ev_states: dict[str, str] = {}
-            if manifest and where:
-                try:
-                    frozen_body = (where / "report.mdx").read_text(errors="replace")
-                    rows, _ = parse_evidence_table(frozen_body)
-                    if rows is not None:
-                        for r in rows:
-                            ev_states[str(r.get("id", "")).upper()] = str(r.get("state", ""))
-                except OSError:
-                    pass
-            if ev_states:
-                for aid in aids:
-                    lines.append(f"  - {owner} {aid}: {ev_states.get(aid, 'not-verified')}")
-            else:
-                lines.append(f"  - {owner} acceptance IDs: {', '.join(aids)} "
-                             "(legacy checklist; no evidence table)")
+        try:
+            rnd = int(row.get("round") or 0)
+        except ValueError:
+            rnd = 0
+        frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
+        _, frozen_entry = find_bundle_by_digest(d, str((frozen or {}).get("digest", "")))
+        where = bundle_dir(d, owner, frozen_entry) if frozen_entry else None
+        if where:
+            contract_ref = f"{where.relative_to(d)}/contract.mdx"
+            report_ref = f"{where.relative_to(d)}/report.mdx"
+            block = packet_acceptance_lines(
+                owner, (where / "contract.mdx").read_text(errors="replace"),
+                (where / "report.mdx").read_text(errors="replace"),
+                contract_ref, report_ref)
+            lines.extend(block)
+            mandatory_blocks.append("\n".join(block))
+            required_reading.extend((contract_ref, report_ref))
         if a.correction:
             entries = bundles_for(d, owner)
             if len(entries) >= 2:
@@ -604,6 +618,30 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
                                  f"source {str(root_entry.get('source_tree', ''))[:12]} "
                                  f"({root_entry.get('file')})")
     lines += ["", "## Integration verification", ""]
+    if batch_scope and is_quick_milestone(d):
+        batch = read_batch(d, batch_scope)
+        verification = batch.get("verification") or {}
+        if verification:
+            if not batch_verification_valid(d, batch):
+                die(f"milestone {batch_scope} has no intact full-suite pass bound to its "
+                    "frozen members and source; refuse a review packet until it is verified")
+            digest = str(verification.get("digest", ""))
+            frozen_dir = batch_verification_dir(d, batch_scope, digest)
+            lines.append(f"- milestone {batch_scope} full-suite verification: passed "
+                         f"({digest})")
+            lines.append(f"  command: {verification.get('command')}")
+            lines.append(f"  frozen output: {frozen_dir.relative_to(d)}/stdout and stderr")
+            lines.append(f"  exit: {verification.get('returncode')}; "
+                         f"frozen at: {verification.get('frozen_at')}")
+            source = verification.get("source") or {}
+            for root in source.get("roots", []) if isinstance(source, dict) else []:
+                if isinstance(root, dict):
+                    lines.append(f"  source {root.get('alias')}: tree {root.get('tree')}")
+            for tail_line in (verification.get("output_tail") or [])[-12:]:
+                lines.append(f"  output: {tail_line}")
+        else:
+            lines.append(f"- milestone {batch_scope} has no full-suite result yet; "
+                         "a routed blocker must be resolved first")
     if orch_entry is not None and orch_manifest is not None:
         ver = orch_manifest.get("verification", {})
         ver = ver if isinstance(ver, dict) else {}
@@ -648,8 +686,11 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
                 continue
             lines.append(f"- {owner}: no frozen bundle")
             continue
-        manifest = load_bundle(d, owner, frozen)
-        where = bundle_dir(d, owner, frozen)
+        _, frozen_entry = find_bundle_by_digest(d, str(frozen.get("digest", "")))
+        if frozen_entry is None:
+            continue
+        manifest = load_bundle(d, owner, frozen_entry)
+        where = bundle_dir(d, owner, frozen_entry)
         delta = (manifest or {}).get("delta", {}) if manifest else {}
         lines.append(f"- {owner} round {rnd} bundle {frozen.get('digest')}")
         if isinstance(delta, dict) and delta.get("coverage") == COVERAGE_AVAILABLE:
@@ -672,8 +713,9 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
                 diff_text = ""
             qualified = f"{alias}:{name}" if alias else name
             diff_blocks.append((f"  patch {qualified} ({len(diff_text.splitlines())} lines; "
-                                "first {keep} shown; full text in the bundle)",
+                                f"first {{keep}} shown; full: {where.relative_to(d)}/{name})",
                                 diff_text.splitlines()))
+            required_reading.append(f"{where.relative_to(d)}/{name}")
             lines.append(f"@@diff:{len(diff_blocks) - 1}@@")
     if a.correction:
         owner = a.correction

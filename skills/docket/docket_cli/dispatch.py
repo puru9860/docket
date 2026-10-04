@@ -12,15 +12,17 @@ import sys
 from pathlib import Path
 
 from .common import COVERAGE_AVAILABLE, COVERAGE_UNAVAILABLE, MODE_QUICK, die, stamp
-from .frontmatter import parse
+from .frontmatter import parse, render
 from .paths import _ordered, dispatch_path, next_numbered, read_dispatch, root
-from .publication import fault, perturb, publish_bytes, publish_exclusive, publish_json
-from .policy import max_concurrency_of, mode_of, model_policy, need_run
+from .publication import fault, perturb, publish, publish_bytes, publish_exclusive, publish_json
+from .policy import (is_quick_milestone, max_concurrency_of, mode_of, model_policy, need_run,
+                      next_role_fallback, allowed_models_for_role, plan_flag, provider_concurrency_of,
+                      provider_of, role_effort, role_model)
 from .baselines import assignment_evidence, require_baseline, snapshot_path, task_scope_hint
 from .bundles import digest_of
 from .locks import owner_lock
 from .state import (
-    checkpoints_dir, derive_stage, normalized_scope, resumable_checkpoint, scope_collisions,
+    derive_stage, normalized_scope, resumable_checkpoint, scope_collisions,
     seed_report_acceptance, state_of, task_depends_on,
 )
 from .dependencies import pin_final_dependencies
@@ -30,6 +32,9 @@ from .liveness import TERMINAL_REPORT_STATES, dispatch_dependencies_unmet, live_
 from .delivery import check_registration, ensure_session_registration
 from .gate import task_intent_problems
 from .prompts import compose_prompt, prompts_dir, rendering_problem
+from .sessions import codex_limit_exhausted, codex_rate_limits, collect_run_usage
+from .verification import write_checkpoint
+from .batches import quick_milestone_implementation_problem, quick_milestone_plan_problems
 
 
 @contextlib.contextmanager
@@ -81,6 +86,58 @@ def dispatch_ownership_problems(d: Path, owner: str) -> list[str]:
     return sorted(set(scope_collisions(d, owner, proposed)))
 
 
+def session_ownership_problem(d: Path, session: str, owner: str) -> str:
+    """A live worker session can hold at most one task in this run."""
+    for active in live_dispatches(d):
+        if str(active.get("session", "")) == session and str(active.get("owner", "")) != owner:
+            return (f"session {session} already holds live {active.get('owner')} round "
+                    f"{active.get('round')}; use a different session or wait for it to settle")
+    return ""
+
+
+def guard_provider_concurrency(d: Path, owner: str, model: str,
+                               active: list[dict]) -> None:
+    """Refuse a dispatch that would exceed its model provider's own cap."""
+    provider = provider_of(model)
+    if not provider:
+        return
+    cap = provider_concurrency_of(d, provider)
+    if not cap:
+        return
+    holding = [r for r in active
+               if provider_of(str(r.get("model_requested", "") or "")) == provider]
+    if len(holding) >= cap:
+        die(f"{owner} cannot dispatch: provider {provider} concurrency "
+            f"{len(holding)}/{cap} exhausted; wait for a {provider} task to settle")
+
+
+def guard_review_reserve(d: Path, model: str) -> None:
+    """Keep configured run tokens available for final review before premium launches."""
+    premium = {item.strip() for item in plan_flag(d, "premium_models", "").split(",")
+               if item.strip()}
+    if model not in premium:
+        return
+    raw_budget = plan_flag(d, "token_budget", "").strip()
+    if not raw_budget:
+        return
+    raw_reserve = plan_flag(d, "review_reserve", "0").strip()
+    try:
+        budget, reserve = int(raw_budget), int(raw_reserve)
+    except ValueError:
+        die("token_budget and review_reserve must be whole token counts")
+    if budget <= 0 or reserve < 0 or reserve >= budget:
+        die("token_budget must be positive and review_reserve must be smaller than it")
+    observations = collect_run_usage(d, False)
+    if any(not row.get("found") for row in observations):
+        die("premium token budget cannot be enforced: a noted harness session's "
+            "usage is unavailable; recover its transcript or choose a non-premium model")
+    used = sum(int(row.get("total", 0) or 0) for row in observations)
+    if used >= budget - reserve:
+        die(f"premium model {model} cannot launch: {used} of {budget} run tokens used, "
+            f"leaving the {reserve}-token review reserve. Choose an approved "
+            "non-premium fallback or have the planner amend the flat budget policy")
+
+
 def cmd_dispatch(a: argparse.Namespace) -> None:
     """Dispatch one task round to one session with one writer.
 
@@ -97,7 +154,9 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             die(f"no assignment {a.owner} in {a.run}")
         role = "orchestrator" if parse(task.read_text())[0].get(
             "executor", "implementor") == "orchestrator" else "implementor"
-    if mode_of(d) == MODE_QUICK and role == "orchestrator":
+    if is_quick_milestone(d) and role == "orchestrator":
+        role = "implementor"
+    elif mode_of(d) == MODE_QUICK and role == "orchestrator":
         # Quick merges planning and orchestration into the coordinator
         # session, the same mapping authority_for applies to submit and
         # verify duties, so the dispatch binding names the physical role.
@@ -110,6 +169,10 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         die(f"no report for {a.owner} in {a.run}")
     if not a.session:
         die("dispatch requires --session SESSION of a registered worker")
+    planning = quick_milestone_plan_problems(d, a.owner)
+    if planning:
+        die(f"{a.owner} cannot dispatch before the planner defines every task and "
+            "closed milestone:\n      " + "\n      ".join(f"- {item}" for item in planning))
     if a.owner != "orch":
         intent_problems = task_intent_problems(d, a.owner)
         if intent_problems:
@@ -124,7 +187,13 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
     prior = read_dispatch(d, a.owner) or {}
     adopting = (prior.get("state") == "dispatched" and int(prior.get("round", 0) or 0) == rnd
                 and str(prior.get("session", "")) == a.session)
+    session_problem = session_ownership_problem(d, a.session, a.owner)
+    if session_problem:
+        die(f"{a.owner} cannot dispatch: {session_problem}")
     if not adopting:
+        milestone_problem = quick_milestone_implementation_problem(d, a.owner)
+        if milestone_problem:
+            die(f"{a.owner} cannot dispatch: {milestone_problem}")
         early = dispatch_dependencies_unmet(d, a.owner)
         if early:
             die(f"{a.owner} cannot dispatch with unmet dependencies:\n      "
@@ -139,6 +208,17 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         if cap and len(active) >= cap:
             die(f"{a.owner} cannot dispatch: provider concurrency {len(active)}/{cap} "
                 "exhausted; wait for a dispatched task to finish")
+        primary, _fallbacks, _policy_state, _run_allowed = model_policy(d)
+        allowed = allowed_models_for_role(d, role)
+        configured = role_model(d, role)
+        if configured and allowed is not None and configured not in allowed:
+            die(f"{a.owner} cannot dispatch: per-role model {configured!r} for {role} "
+                f"is outside the approved run policy {allowed}; amend the plan first")
+        candidate = a.model or configured or primary
+        if allowed is not None and candidate not in allowed:
+            refuse_outside_policy(d, a.owner, candidate, allowed)
+        guard_provider_concurrency(d, a.owner, candidate, active)
+        guard_review_reserve(d, candidate)
     if a.register:
         ensure_session_registration(a.run, a.session, role, a.agent or a.session)
     reg = check_registration(d, a.session, a.run, role)
@@ -221,23 +301,40 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             # new record. Dependency, scope, and registration checks stay
             # outside, so unrelated work is never serialized behind a dispatch.
             perturb("dispatch:before-claim")
+            milestone_problem = quick_milestone_implementation_problem(d, a.owner)
+            if milestone_problem:
+                die(f"{a.owner} cannot dispatch: {milestone_problem}")
+            session_problem = session_ownership_problem(d, a.session, a.owner)
+            if session_problem:
+                die(f"{a.owner} cannot dispatch: {session_problem}")
             cap = max_concurrency_of(d)
             active = [r for r in live_dispatches(d)
                       if not (r.get("owner") == a.owner and int(r.get("round", 0) or 0) == rnd)]
             if cap and len(active) >= cap:
                 die(f"{a.owner} cannot dispatch: provider concurrency {len(active)}/{cap} "
                     "exhausted; wait for a dispatched task to finish")
-            primary, fallbacks, policy_state, allowed = model_policy(d)
-            model = a.model or primary
+            primary, fallbacks, policy_state, _run_allowed = model_policy(d)
+            allowed = allowed_models_for_role(d, role)
+            configured = role_model(d, role)
+            if configured and allowed is not None and configured not in allowed:
+                die(f"{a.owner} cannot dispatch: per-role model {configured!r} for {role} "
+                    f"is outside the approved run policy {allowed}; amend the plan first")
+            model = a.model or configured or primary
             if allowed is not None and model not in allowed:
                 refuse_outside_policy(d, a.owner, model, allowed)
+            guard_provider_concurrency(d, a.owner, model, active)
+            guard_review_reserve(d, model)
             if a.owner != "orch" and not snapshot_path(d, a.owner).is_file():
                 # A task takes its baseline at its first dispatch, after every
-                # refusal: one refused for a full cap would otherwise fix its
-                # baseline under work that is still running. An incomplete
-                # capture refuses the dispatch and writes no record.
+                # refusal. A tiered correction has its own versioned baseline;
+                # the previous round's complete capture is never replaced.
+                # An incomplete capture refuses the dispatch and writes no record.
                 require_baseline(d, a.owner, task_scope_hint(d, a.owner))
-                print(f"captured {a.owner}'s baseline at dispatch")
+                if rnd > 1 and snapshot_path(d, a.owner).stem != a.owner:
+                    print(f"captured {a.owner}'s fresh pre-correction baseline for round "
+                          f"{rnd}; prior baselines and bundles stay intact")
+                else:
+                    print(f"captured {a.owner}'s baseline at dispatch")
             seed_report_acceptance(d, a.owner)
             prompt_file = None
             try:
@@ -305,60 +402,6 @@ def write_prompt_file(d: Path, owner: str, role: str, rnd: int, prompt: str,
     return path
 
 
-def write_checkpoint(d: Path, owner: str, semantic_handoff: str = "no") -> Path:
-    """A mechanical snapshot: diff identity, verification, history, pointers.
-
-    An automatic snapshot is never labelled a ready semantic handoff; only a
-    submitted `docket handoff` checkpoint is. A replacement performs targeted
-    discovery from these pointers and supplies the missing reasoning itself.
-    """
-    try:
-        rnd, _ = state_of(d, owner)
-    except (OSError, ValueError):
-        rnd = 0
-    coverage, detail, changed = COVERAGE_UNAVAILABLE, "", []
-    try:
-        coverage, detail, changed, _outside = assignment_evidence(d, owner)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
-    dispatch = read_dispatch(d, owner)
-    task = d / f"{owner}-task.mdx"
-    task_rev = digest_of(task.read_bytes()) if task.is_file() else ""
-    decs = _ordered(d.glob(f"{owner}-decision-*.mdx"))
-    checkpoints_dir(d).mkdir(parents=True, exist_ok=True)
-    session_history: object = ""
-    if dispatch:
-        session_history = dispatch.get("session_history", dispatch.get("session", ""))
-    for _ in range(100):
-        existing = sorted(checkpoints_dir(d).glob(f"{owner}-*.json"))
-        path = checkpoints_dir(d) / f"{owner}-{next_numbered(existing):02d}.json"
-        try:
-            publish_exclusive(path, json.dumps({
-                "checkpoint": path.name,
-                "run": d.name,
-                "owner": owner,
-                "round": rnd,
-                "diff_identity": digest_of(("\n".join(sorted(changed))).encode()),
-                "diff_detail": detail,
-                # Measured work decides whether a replacement resumes or starts fresh;
-                # unmeasured evidence is never read as "nothing was done".
-                "work": ("changed" if changed else "none") if coverage == COVERAGE_AVAILABLE else "unknown",
-                "last_verification": str((frozen or {}).get("digest", "")) or "none",
-                "session_history": session_history,
-                "model_history": dispatch.get("model_history", []) if dispatch else [],
-                "task_pointer": task.name if task.is_file() else "",
-                "task_revision": task_rev,
-                "decision_pointer": decs[-1].name if decs else "",
-                "semantic_handoff": semantic_handoff,
-                "taken_at": stamp(),
-            }, indent=2, sort_keys=True) + "\n")
-        except FileExistsError:
-            continue
-        return path
-    die(f"could not allocate a checkpoint for {owner}; retry the command")
-
-
 def cmd_resume(a: argparse.Namespace) -> None:
     """Resume a dispatched task under a new session after checkpointing."""
     d = need_run(a.run)
@@ -386,6 +429,9 @@ def cmd_resume(a: argparse.Namespace) -> None:
             # dispatch claim. It must not skip the current round's admission
             # checks merely because the predecessor already held a slot.
             if a.owner != "orch":
+                milestone_problem = quick_milestone_implementation_problem(d, a.owner)
+                if milestone_problem:
+                    die(f"{a.owner} cannot resume: {milestone_problem}")
                 intent_problems = task_intent_problems(d, a.owner)
                 if intent_problems:
                     print(f"\nINVALID TASK: {a.owner}-task.mdx\n", file=sys.stderr)
@@ -405,9 +451,46 @@ def cmd_resume(a: argparse.Namespace) -> None:
         # force now, exactly like a dispatch. Carrying the predecessor's model
         # forward unchecked would let a policy change be bypassed by resuming
         # instead of dispatching. --model names an approved replacement.
-        _primary, _fallbacks, _state, allowed = model_policy(d)
+        _primary, _fallbacks, _state, _run_allowed = model_policy(d)
+        role = str(dispatch.get("role", "implementor") or "implementor")
+        allowed = allowed_models_for_role(d, role)
         previous_model = str(dispatch.get("model_requested", "") or "")
-        model = a.model or previous_model
+        if a.on_limit:
+            if round_state != "draft":
+                die(f"{a.owner} round {rnd} is {round_state}; --on-limit requires a draft round")
+            task_file = d / f"{a.owner}-task.mdx"
+            try:
+                task_meta, task_body = parse(task_file.read_text())
+            except (OSError, ValueError):
+                die(f"{a.owner} needs a readable task contract for usage-limit recovery")
+            if task_meta.get("harness") != "codex":
+                die(f"{a.owner} is not running in the Codex harness; --on-limit does not apply")
+            if not codex_limit_exhausted(codex_rate_limits()):
+                die("Codex has no current exhausted usage window; --on-limit would be a "
+                    "fallback without its recorded trigger")
+            if a.model:
+                die("--on-limit selects the next approved model; omit --model")
+            if a.harness not in ("opencode", "claude"):
+                die("--on-limit needs --harness opencode or --harness claude for the replacement")
+            role = str(dispatch.get("role", "implementor") or "implementor")
+            model = next_role_fallback(d, role, previous_model,
+                                       dispatch.get("model_history", []))
+            if not model:
+                entry = emit_exception(d, a.owner, "model-fallback-exhausted",
+                                       "Codex usage limit is exhausted and no untried "
+                                       "approved fallback remains")
+                die(f"{a.owner}: {entry['detail']} (exception {entry['id']} is open)")
+            if model.startswith("opencode/") and a.harness != "opencode":
+                die(f"fallback model {model} requires the opencode harness")
+            if model.startswith("claude-") and a.harness != "claude":
+                die(f"fallback model {model} requires the claude harness")
+            if model.startswith(("gpt-", "codex/")):
+                die(f"fallback model {model} still requires Codex, whose usage limit is "
+                    "exhausted; approve a non-Codex fallback before resuming")
+        else:
+            if a.harness:
+                die("--harness is only for --on-limit recovery")
+            model = a.model or previous_model
         if allowed is not None and model not in allowed:
             if a.model:
                 refuse_outside_policy(d, a.owner, model, allowed)
@@ -415,31 +498,53 @@ def cmd_resume(a: argparse.Namespace) -> None:
                 f"model policy is now [{', '.join(allowed)}]. Resume with "
                 f"`docket resume {a.run} {a.owner} --session {a.session} --model "
                 f"{allowed[0]}` or another approved model")
+        guard_review_reserve(d, model)
+        session_problem = session_ownership_problem(d, a.session, a.owner)
+        if session_problem:
+            die(f"{a.owner} cannot resume: {session_problem}")
         if a.register:
             ensure_session_registration(a.run, a.session,
                                         str(dispatch.get("role", "implementor")),
                                         a.agent or a.session)
         reg = check_registration(d, a.session, a.run, dispatch.get("role", "implementor"))
         with capacity_lock(d):
+            if bound_round != rnd:
+                milestone_problem = quick_milestone_implementation_problem(d, a.owner)
+                if milestone_problem:
+                    die(f"{a.owner} cannot resume: {milestone_problem}")
+            guard_review_reserve(d, model)
             # The same serialized read-check-write as dispatch: re-read live
             # capacity, refuse a full cap, and publish the rebound record.
             # The predecessor slot this resume takes over is excluded, so a
             # legitimate replacement is never refused by its own record.
+            session_problem = session_ownership_problem(d, a.session, a.owner)
+            if session_problem:
+                die(f"{a.owner} cannot resume: {session_problem}")
             cap = max_concurrency_of(d)
             active = [r for r in live_dispatches(d)
                       if not (r.get("owner") == a.owner and int(r.get("round", 0) or 0) == rnd)]
             if cap and len(active) >= cap:
                 die(f"{a.owner} cannot resume: provider concurrency {len(active)}/{cap} "
                     "exhausted; wait for a dispatched task to finish")
+            guard_provider_concurrency(d, a.owner, model, active)
             checkpoint = write_checkpoint(d, a.owner)
+            if a.on_limit:
+                task_meta["harness"] = a.harness
+                task_meta["requested_model"] = model
+                task_meta["actual_model"] = ""
+                publish(task_file, render(task_meta, task_body))
             history = dispatch.get("session_history", [])
             if not isinstance(history, list):
                 history = [history] if history else []
             history.append({"at": stamp(), "from": dispatch.get("session", ""),
                             "to": a.session,
-                            "reason": a.reason or "resume without ready handoff"})
+                            "reason": a.reason or ("Codex usage limit exhausted"
+                                                   if a.on_limit else "resume without ready handoff")})
             dispatch["session_history"] = history
             dispatch["session"] = a.session
+            dispatch.pop("worker_process", None)
+            if a.on_limit:
+                dispatch["harness_requested"] = a.harness
             dispatch["session_generation"] = reg.get("generation", 1)
             if a.agent:
                 dispatch["agent"] = a.agent
@@ -483,6 +588,9 @@ def cmd_resume(a: argparse.Namespace) -> None:
             machine_feedback(d, "recovery", a.owner,
                              f"round moved to a replacement session: {a.reason or 'no reason given'}")
             print(f"resumed {a.owner} round {rnd} -> session {a.session}")
+            if a.on_limit:
+                print(f"Codex usage limit recovery selected approved fallback {model} on "
+                      f"{a.harness}; no plan amendment")
             if resumable_checkpoint(d, a.owner, rnd) is None:
                 print(f"checkpoint {checkpoint.name} measured no work; the replacement "
                       "starts the round fresh")
@@ -527,7 +635,9 @@ def cmd_switch_model(a: argparse.Namespace) -> None:
         dispatch = read_dispatch(d, a.owner)
         if not dispatch or dispatch.get("state") != "dispatched":
             die(f"no active dispatch for {a.owner} in {a.run}; dispatch it first")
-        _primary, _fallbacks, _state, allowed = model_policy(d)
+        _primary, _fallbacks, _state, _run_allowed = model_policy(d)
+        role = str(dispatch.get("role", "implementor") or "implementor")
+        allowed = allowed_models_for_role(d, role)
         tried = [h.get("model", "") for h in dispatch.get("model_history", [])
                  if isinstance(h, dict)]
         ordered = list(allowed) if allowed is not None else []
@@ -536,6 +646,7 @@ def cmd_switch_model(a: argparse.Namespace) -> None:
                 f"history: {', '.join(tried)}")
         if allowed is not None and a.model not in ordered:
             refuse_outside_policy(d, a.owner, a.model, ordered)
+        guard_review_reserve(d, a.model)
         if a.session:
             die(f"a new session is a new launch, not a model switch: run `docket resume "
                 f"{a.run} {a.owner} --session {a.session} --model {a.model}`, which records the "

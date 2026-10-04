@@ -6,7 +6,8 @@ request changes through review, amend the task, or invent implementation fixes.
 In quick runs the checker session performs this verification duty and then the review duty as two separately recorded steps under `combined-checker`.
 The verification artifact records the combined policy, and the checker never claims an independent verifier opinion.
 The merge uses no `--skip-verify`, no blanket `verifier_exempt`, and no legacy completion shortcut. A skipped verification may still be recorded with a reason, but no approval may stand over it in any mode; only a waiver accepts such work without claiming it passed.
-A standard preset run keeps verification and review in separate sessions under `independent-verifier-reviewer`.
+A standard preset run keeps verification and review in separate sessions under `tiered-verifier-reviewer` for new runs (`independent-verifier-reviewer` runs keep their recorded policy with identical five-role authority). A verifier pass settles the round for dispatch, scope reuse, and milestone sequencing; it is readiness, never reviewer approval.
+Verify only the task's focused evidence: the declared per-task command is the whole test obligation, the full suite runs once per milestone with `docket batch <run> --verify <bid> --command CMD` and at the aggregate, and you never rerun that same full suite against the same frozen code.
 Never run a git command that writes the index, refs, or files of the checkout under review (`git add`, `git add -N`, `git reset`, `git stash`); reproduce in a copy, and read the evidence through `docket bundle` and `docket diff`.
 
 1. Read the task contract, the submitted report body, the frozen bundle named
@@ -52,6 +53,9 @@ a rewrite.
    and route the dispute to the reviewer instead of continuing an argument
    loop. Never approve disputed work, waive requirements, or alter
    acceptance.
+
+Wait with `docket watch <run> --role verifier`; see `docket help signalling` for the per-harness table.
+Do not wait on `herdr agent wait`, a sleep loop, or status polling.
 
 ## Prompt rendering
 

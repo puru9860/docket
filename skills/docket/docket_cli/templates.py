@@ -28,7 +28,7 @@ evidence_mode: {evidence_mode}
 provisional_integration: forbidden
 workflow: {workflow}
 correction_limit: 2
-verifier_correction: forbidden
+verifier_correction: {verifier_correction}
 ---
 
 # Plan: <title>
@@ -59,6 +59,7 @@ run: {run}
 task: {owner}
 owner: {owner}
 complexity: {complexity}
+risk: {risk}
 executor: {executor}
 mode: {mode}
 review_policy: {review_policy}
@@ -101,6 +102,21 @@ assigned verification: the gate always runs it, alongside any command the capsul
 ## Out of scope
 
 ## Starting hints
+
+<!-- Advisory default, not a hard constraint. Follow it unless the code shows a
+     better way; only Out of scope above binds. -->
+
+none
+
+## Files to read
+
+<!-- Paths and symbols to read and quote in the report. -->
+
+none
+
+## Reuse
+
+<!-- Existing functions to reuse instead of reimplementing. -->
 
 none
 
@@ -180,7 +196,18 @@ effort_history:
 
 ## Verification
 
-<!-- TODO: the exact command you ran and its real output. Never claim a result you did not see. -->
+<!-- TODO: name the registered command and any checks already run. If submit will run
+     the final command, state that its output will be captured in the frozen bundle.
+     Never claim a result you did not see. -->
+
+## Evidence
+
+<!-- One row per acceptance ID (A1, A2, ...). State is met, partial, not-met, or
+     not-verified. Columns are ID, State, Artifacts, Gaps. The gate enforces
+     this table when present: every required ID exactly once, artifacts for
+     every met row, and no gap on a met row. Example row: A1 met with
+     verify.stdout and no gaps. Fill the table; a checked box with contrary
+     evidence still fails on its row. -->
 
 ## Decisions needed
 
