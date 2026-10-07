@@ -12,6 +12,7 @@ from .common import (
 )
 from .profiles import PROFILE_TOKEN_BUDGET
 from .sessions import cmd_usage, note_command_session
+from .discussions import DISCUSSION_PARTICIPANTS, cmd_discuss
 from .models import cmd_feedback, cmd_models
 from .five_role import ROUTE_TABLE, cmd_escalate_mode, cmd_escalation, cmd_route
 from .delivery import cmd_inbox, cmd_reconcile, cmd_session
@@ -83,6 +84,41 @@ def main() -> None:
             pass
     p = argparse.ArgumentParser(prog="docket", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("discuss", help="exchange attributed peer messages outside the coding lifecycle")
+    q.add_argument("discussion", nargs="?", help="stable discussion ID, e.g. C01")
+    g = q.add_mutually_exclusive_group()
+    g.add_argument("--start", action="store_true", help="create a discussion and peer launch prompt")
+    g.add_argument("--join", action="store_true", help="bind this harness session to a participant")
+    g.add_argument("--send", action="store_true", help="reply to the latest message")
+    g.add_argument("--propose", action="store_true", help="propose a conclusion for the peer to accept")
+    g.add_argument("--accept", type=int, metavar="N", help="accept the other agent's latest proposal")
+    g.add_argument("--pause", action="store_true", help="interrupt the discussion with a reason")
+    g.add_argument("--continue", dest="continue_discussion", action="store_true",
+                   help="continue a paused or concluded discussion with new direction")
+    g.add_argument("--close", action="store_true", help="close permanently with a summary or reason")
+    g.add_argument("--read", action="store_true", help="inspect the transcript without consuming messages")
+    g.add_argument("--pickup", action="store_true", help="read incoming messages and record receipt")
+    g.add_argument("--watch", action="store_true", help="wait for an incoming message; exits 2 on wake")
+    g.add_argument("--prompt", action="store_true", help="render a participant's launch or recovery prompt")
+    g.add_argument("--list", action="store_true", help="list discussions and their states")
+    g.add_argument("--watch-joined", action="store_true", help=argparse.SUPPRESS)
+    q.add_argument("--as", dest="as_participant", choices=DISCUSSION_PARTICIPANTS, default="")
+    q.add_argument("--session", default="", help="explicit session ID; otherwise identify this harness")
+    q.add_argument("--replace", action="store_true", help="replace an old participant session at join")
+    q.add_argument("--reply-to", type=int, metavar="N", help="latest transcript sequence, initially 0")
+    q.add_argument("--topic", default="", help="discussion topic")
+    q.add_argument("--purpose", choices=("feedback", "brainstorm", "second-opinion"), default="feedback")
+    text_input = q.add_mutually_exclusive_group()
+    text_input.add_argument("--message", default="", help="briefing, reply, or control reason")
+    text_input.add_argument("--message-file", default="", help="read exact message text from a file")
+    q.add_argument("--harness", choices=SUPPORTED_HARNESSES, default="", help="requested peer harness")
+    q.add_argument("--model", default="", help="requested peer model; never claimed as observed")
+    q.add_argument("--max-turns", type=int, default=12, help="agent turns per phase before pausing")
+    q.add_argument("--json", action="store_true", help="inspect structured message envelopes")
+    q.add_argument("--timeout", type=int, default=28800)
+    q.add_argument("--interval", type=int, default=5)
+    q.set_defaults(fn=cmd_discuss)
 
     q = sub.add_parser("init", help="scaffold a run and its plan")
     q.add_argument("run")

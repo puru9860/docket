@@ -38,6 +38,73 @@ with something cleverer.
 - **Sessions die.** A file-based run survives a killed session, a compacted context, and
   a machine restart. In-memory coordination does not.
 
+## Peer discussions
+
+`docket discuss` is an independent file protocol for brainstorming, feedback,
+and second opinions. The user's current harness session is the invoker; one
+visible peer session participates across Claude Code, Codex, or OpenCode.
+It does not create a coding run, assign roles, capture Git, or bypass any gate.
+
+```
+.docket/conversations/<id>/
+  discussion.mdx          immutable topic, briefing, requested harness/model, turn cap
+  participants/invoker.mdx current invoker session and generation
+  participants/peer.mdx   current peer session and generation
+  messages/000001.mdx     immutable attributed reply and lifecycle state
+  .prompts/peer.txt       rendered launch guidance; the caller starts the harness
+  .delivery/*-receipt.json generation-bound receipt cursor
+  .delivery/*-announce.json bounded announcement lease
+  .locks/run.lock         serializes message allocation, controls, joins, and delivery
+```
+
+The original briefing is sequence 0. Each message records its sender kind
+(`agent` or `human`), participant, recipient, session generation, harness metadata,
+reply sequence, predecessor digest, and status in flat frontmatter. The newest
+message's status is lifecycle truth, or `open` from the original document before
+the first reply. There is no separate state JSON. Readers validate contiguous
+sequence numbers and predecessor digests, refusing a missing or altered historical
+predecessor. APIs never rewrite earlier messages; content that a local user edits
+outside Docket is not authenticated. Conversation directories are private because
+briefings and replies can carry private session context.
+
+Agents alternate turns and every reply names the current sequence under the lock.
+A stale reply refuses rather than overwriting or silently answering old context.
+One agent's proposal is accepted only by the other agent against that exact latest
+proposal. Acceptance records `concluded`, not coding approval. A turn cap records
+`paused`, never agreement; an accepting reply can still settle the last proposal
+at that cap. A user interruption appends a pause even when already paused at
+the cap, invalidating the latest proposal for acceptance; later replies refuse.
+It does not kill a running harness call. The invoker or human can append new direction
+with `--continue`, preserving the earlier conclusion and opening another phase
+with a fresh allowance. The peer cannot auto-continue past the cap. A permanent
+`closed` discussion requires a new ID for later work.
+
+Participants join from their own harness session, pinning a proven process ID,
+start identity, and native session when available. A replacement requires
+`--replace`, advances the generation, invalidates old receipt and announcement
+state, and refuses the old writer. Explicit session IDs support terminal use;
+the protocol is a trusted local-file convention, not authentication. Sender
+markers are rendered from metadata and `--read --json` separates envelopes from
+prose. A peer contribution never acquires human or coding reviewer authority.
+OpenCode auto-binding requires a unique running tool whose parsed literal Docket
+arguments exactly match the current invocation. Shell variables, compound or
+unparseable commands, unavailable records, and ambiguity use explicit registration
+rather than guessing the newest session in its shared database. Explicit startup
+session IDs are validated before creating a discussion or publishing its files.
+
+The native Stop hook selects only discussions bound to its proven current
+process/session, or an explicitly selected participant. It works without
+`DOCKET_ROLE` or `watch.conf`; coding supervisors multiplex their role events
+with their joined conversations. Hooks emit fixed metadata and pickup pointers,
+never peer prose. Announcement leases prevent concurrent duplicate wakes and
+allow recovery when a hook never delivers. Pickup prints the captured messages
+before publishing its generation-bound cursor. An authored reply from that
+generation also proves consumption of its predecessors. `--read` and `--list`
+remain inspection and touch no receipt or announcement. Blocking watchers cover
+harnesses without native hooks and retain the minimum useful wait window.
+Canonical launch and exchange guidance lives in `references/discussion.md`,
+available through `docket help discussion`.
+
 ## Data model
 
 ```
@@ -1516,6 +1583,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `feedback` | `feedback_log_path`, `log_feedback`, `machine_feedback` |
 | `hook_config` | shared defensive Stop-hook recognition, local Codex JSON/TOML configuration, runtime skill-copy comparison |
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
+| `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |
 | `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
 | `liveness` | session registrations, `dispatch_liveness`, `round_dispatched`, `live_dispatches`, `reconcile_dispatches`, `dispatch_dependencies_unmet` |
 | `five_role` | `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `blocked_route`, `route_blocked`, `cmd_route`, `cmd_escalate_mode` |

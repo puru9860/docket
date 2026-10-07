@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .common import STATE_DIR
 from .paths import root
 
 
@@ -50,7 +51,9 @@ PRIVATE_STATE_DIRS = (".snapshots", ".bundles", ".baselines", ".submit-jobs",
 def keep_private(path: Path) -> None:
     """Make every private state directory above `path` owner-only."""
     for parent in (path, *path.parents):
-        if parent.name in PRIVATE_STATE_DIRS and parent.is_dir():
+        private = parent.name in PRIVATE_STATE_DIRS or (
+            parent.name == "conversations" and parent.parent.name == STATE_DIR)
+        if private and parent.is_dir():
             try:
                 if parent.stat().st_mode & 0o077:
                     os.chmod(parent, 0o700)

@@ -1,25 +1,22 @@
 ---
 name: docket
-description: Coordinate planned coding work through standardized task and aggregate reports, using Claude Code, Codex, or OpenCode in split or combined planner/orchestrator topologies. Use for multi-agent implementation pipelines or when the user invokes /docket.
+description: Coordinate planned coding work or visible peer discussions across Claude Code, Codex, and OpenCode. Use for multi-agent implementation pipelines, brainstorming, feedback or another agent's view on the current topic, or when the user invokes /docket.
 metadata:
-  argument-hint: <run-id> or the task to plan
+  argument-hint: <run-id>, coding task, or discussion topic
 ---
 
 # Docket
 
-Docket coordinates planned coding work through files, across Claude Code (`claude`),
-Codex (`codex`, temporary compatibility), and OpenCode (`opencode`).
-Five logical roles (planner, orchestrator, implementor, verifier, reviewer) run as
-fewer sessions under a preset.
-The quick preset is the default: a planner that defines tasks and milestones, an
-implementor that coordinates its own work, and a reviewer that acts once per milestone.
-New quick runs record `quick-milestone-reviewer`; old `combined-checker` runs keep their policy.
-The standard preset (`--mode standard`) runs all five as separate sessions with an
-independent verifier and a reviewer decision once per verified milestone in new runs.
-Neither weakens the gate, the evidence, or the decision binding; legacy is only a
-historical decode for old runs, and `docket init --workflow legacy` refuses.
+Docket coordinates coding work and peer discussions through files across Claude Code (`claude`), Codex (`codex`, temporary compatibility), and OpenCode (`opencode`).
+For coding, quick is the default: a planner defines tasks and milestones, an implementor coordinates its work, and a reviewer acts once per milestone.
+The standard preset (`--mode standard`) runs planner, orchestrator, implementor, verifier, and reviewer as separate sessions.
+Both presets retain the gate, evidence, and decision binding. Old runs keep their recorded policy; new runs cannot select legacy.
 
 ## Start from a plain request
+
+For brainstorming, feedback, or another view, read `docket help discussion` (`references/discussion.md`).
+You remain the invoker in the current session and start one visible peer on the requested harness/model.
+Use `docket discuss` to exchange replies, agree on a conclusion, pause on user interruption, and continue with their new direction. Do not create a coding run for discussion.
 
 Users usually just say something like "act as planner and spawn an implementor for X".
 Pick the preset from the whole request, not the word "planner" alone; this section is enough to start without `--help`.
@@ -131,5 +128,5 @@ canonical contracts, and `model-profiles/` for guidance cards.
 
 $ARGUMENTS
 
-If the request is non-empty, the user invoked `/docket`. Otherwise infer the run,
-topology, and current role from the conversation and `docket status`.
+If the request is non-empty, the user invoked `/docket`. Otherwise infer coding work or a peer discussion from the conversation.
+Use `docket status` for coding state, or `docket discuss --list` for an existing discussion.

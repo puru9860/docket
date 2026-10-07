@@ -10,7 +10,7 @@ from .common import ACTING_ROLES, SKILL_DIR, die
 from .frontmatter import unwrap_markdown
 
 
-HELP_TOPICS = (*ACTING_ROLES, "signalling")
+HELP_TOPICS = (*ACTING_ROLES, "signalling", "discussion")
 
 
 def contracts_dir() -> Path:
@@ -51,7 +51,7 @@ def read_contract(role: str) -> str:
 
 def cmd_help(a: argparse.Namespace) -> None:
     """Read the canonical role reference rather than duplicating playbooks in code."""
-    if a.role != "signalling":
+    if a.role not in ("signalling", "discussion"):
         contract = read_contract(a.role)
     else:
         contract = ""

@@ -24,8 +24,8 @@
 # ledger write but before the harness accepts the wake re-announces the same
 # actionable event after lease expiry, and duplicates are harmless.
 #
-# Inert unless .docket/watch.conf and DOCKET_ROLE exist, so an idle or unscoped
-# session costs nothing and cannot consume another supervisor's event.
+# Coding wakes require watch.conf and DOCKET_ROLE. Discussions select only a
+# participant joined by this harness process, or an explicit discussion binding.
 # Arm:    docket arm R01 --role orchestrator     (repeat per waiting role,
 # including the quick implementor while a milestone is under review)
 # Disarm: docket disarm R01
@@ -41,23 +41,29 @@ while [ ! -d "$ROOT/.docket" ] && [ "$ROOT" != / ]; do
 done
 CONF="$ROOT/.docket/watch.conf"
 
-[ -f "$CONF" ] || exit 0
-[ -n "${DOCKET_ROLE:-}" ] || exit 0
-case "$DOCKET_ROLE" in
-  planner|orchestrator|implementor|verifier|reviewer|coordinator|checker) ;;
-  *) exit 0 ;;
-esac
+watch_args=(discuss --watch-joined)
+HOOK_RECIPIENT=discussion
+if [ -f "$CONF" ] && [ -n "${DOCKET_ROLE:-}" ]; then
+  case "$DOCKET_ROLE" in
+    planner|orchestrator|implementor|verifier|reviewer|coordinator|checker)
+      watch_args=(watch --armed --role "$DOCKET_ROLE")
+      HOOK_RECIPIENT="$DOCKET_ROLE" ;;
+    *) exit 0 ;;
+  esac
+elif [ ! -d "$ROOT/.docket/conversations" ]; then
+  exit 0
+fi
 cd "$ROOT" || exit 0
 
 DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
-FAILURE="$ROOT/.docket/hook-failure-$DOCKET_ROLE"
+FAILURE="$ROOT/.docket/hook-failure-$HOOK_RECIPIENT"
 
 # The CLI is stdlib-only; avoid uv cache and network state in the wake path.
 launch=(python3 "$DOCKET")
 
 # A sandbox may refuse the temp directory; .docket is known to be writable here.
 ERR="$(mktemp "${TMPDIR:-/tmp}/docket-wake.XXXXXX" 2>/dev/null)" \
-  || ERR="$ROOT/.docket/.wake-$DOCKET_ROLE.$$"
+  || ERR="$ROOT/.docket/.wake-$HOOK_RECIPIENT.$$"
 trap 'rm -f "$ERR"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -72,7 +78,7 @@ trap 'exit 143' TERM
 # 2 here, and any other failure is recorded for `docket doctor` and never wakes.
 # The watch timeout stays below the harness's 28800s hook timeout, so the watcher
 # ends on its own instead of racing the harness's kill.
-DOCKET_WATCH_HOOK=1 "${launch[@]}" watch --armed --role "$DOCKET_ROLE" \
+DOCKET_WATCH_HOOK=1 "${launch[@]}" "${watch_args[@]}" \
   --timeout "${DOCKET_WATCH_TIMEOUT:-28740}" 2>"$ERR"
 code=$?
 case "$code" in

@@ -8,6 +8,7 @@ import gzip
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -123,8 +124,29 @@ def harness_process_ref() -> dict[str, object]:
     return {}
 
 
-def opencode_running_session(needles: list[str]) -> tuple[str, str]:
-    """The OpenCode session whose running shell call is this command, and its version."""
+def opencode_command_argv(command: str) -> list[str] | None:
+    """Decode one literal Docket invocation; never expand or execute shell text."""
+    if any(char in command for char in ("$", "`", "\n", "\r")):
+        return None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens or any(token and all(char in ";&|()<>" for char in token) for token in tokens):
+        return None
+    if Path(tokens[0]).name == "docket":
+        return tokens[1:]
+    if (len(tokens) >= 2 and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(tokens[0]).name)
+            and Path(tokens[1]).name == "docket"):
+        return tokens[2:]
+    return None
+
+
+def opencode_running_session(needles: list[str], *, require_unique: bool = False,
+                             command_argv: list[str] | None = None) -> tuple[str, str]:
+    """The matching running shell session and version; optionally refuse ambiguity."""
     try:
         import sqlite3
     except ImportError:
@@ -133,6 +155,7 @@ def opencode_running_session(needles: list[str]) -> tuple[str, str]:
     if not db.is_file():
         return "", ""
     since = int((time.time() - 3600) * 1000)
+    matched: tuple[str, str] = ("", "")
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
         try:
@@ -157,16 +180,24 @@ def opencode_running_session(needles: list[str]) -> tuple[str, str]:
                             or state.get("status") != "running":
                         continue
                     command = str((state.get("input") or {}).get("command", ""))
-                    if all(needle in command for needle in needles):
-                        return str(sid), str(version or "")
+                    matches = (opencode_command_argv(command) == command_argv
+                               if command_argv is not None else all(needle in command for needle in needles))
+                    if matches:
+                        candidate = (str(sid), str(version or ""))
+                        if not require_unique:
+                            return candidate
+                        if matched[0] and matched[0] != candidate[0]:
+                            return "", ""
+                        matched = candidate
         finally:
             con.close()
     except sqlite3.Error:
         return "", ""
-    return "", ""
+    return matched
 
 
-def harness_session(needles: list[str]) -> dict[str, str] | None:
+def harness_session(needles: list[str], *, require_unique: bool = False,
+                    command_argv: list[str] | None = None) -> dict[str, str] | None:
     """The harness session running this command, or None outside a known harness.
 
     `DOCKET_SESSION_CAPTURE=off` disables detection entirely.
@@ -187,7 +218,9 @@ def harness_session(needles: list[str]) -> dict[str, str] | None:
         ref["session_id"] = os.environ["CODEX_THREAD_ID"].strip()
         version = os.environ.get("CODEX_VERSION", "").strip()
     else:
-        ref["session_id"], version = opencode_running_session(needles)
+        ref["session_id"], version = (
+            opencode_running_session(needles, require_unique=require_unique, command_argv=command_argv)
+            if require_unique or command_argv is not None else opencode_running_session(needles))
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", ref["session_id"]):
         return None
     if version:

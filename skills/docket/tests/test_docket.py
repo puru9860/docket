@@ -147,7 +147,8 @@ class DocketCLI(unittest.TestCase):
         # in their subprocess env instead.
         self._docket_role_env = {k: os.environ.pop(k) for k in (
             "DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT",
-            "DOCKET_RUN", "DOCKET_SESSION") if k in os.environ}
+            "DOCKET_RUN", "DOCKET_SESSION", "DOCKET_DISCUSSION",
+            "DOCKET_PARTICIPANT", "DOCKET_DISCUSSION_SESSION") if k in os.environ}
         # A suite run inside a herdr pane must never split, drive, or close the user's
         # real panes; a test that needs panes installs `fake_herdr_panes` instead.
         self._herdr_env = {k: os.environ.pop(k) for k in list(os.environ)
@@ -164,7 +165,8 @@ class DocketCLI(unittest.TestCase):
         os.environ.update(self._herdr_env)
         os.environ.update(self._harness_env)
         for _key in ("DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT",
-                     "DOCKET_RUN", "DOCKET_SESSION"):
+                     "DOCKET_RUN", "DOCKET_SESSION", "DOCKET_DISCUSSION",
+                     "DOCKET_PARTICIPANT", "DOCKET_DISCUSSION_SESSION"):
             os.environ.pop(_key, None)
         os.environ.update(self._docket_role_env)
         if self._profiles is None:
@@ -1278,11 +1280,13 @@ class DocketCLI(unittest.TestCase):
         unscoped hook run wakes and the child fails.
         """
         for key in ("DOCKET_ROLE", "DOCKET_WATCH_HOOK", "DOCKET_WATCH_TIMEOUT",
-                    "DOCKET_RUN", "DOCKET_SESSION"):
+                    "DOCKET_RUN", "DOCKET_SESSION", "DOCKET_DISCUSSION",
+                    "DOCKET_PARTICIPANT", "DOCKET_DISCUSSION_SESSION"):
             self.assertNotIn(key, os.environ)
         env = dict(os.environ, DOCKET_ROLE="orchestrator", DOCKET_WATCH_HOOK="1",
                    DOCKET_WATCH_TIMEOUT="8h", DOCKET_BIN=str(DOCKET),
-                   DOCKET_RUN="foreign", DOCKET_SESSION="foreign")
+                   DOCKET_RUN="foreign", DOCKET_SESSION="foreign", DOCKET_DISCUSSION="foreign",
+                   DOCKET_PARTICIPANT="peer", DOCKET_DISCUSSION_SESSION="foreign")
         env["PYTHONPYCACHEPREFIX"] = str(Path(self._feedback_tmp.name) / "child-pycache")
         proc = subprocess.run(
             [sys.executable, "-m", "unittest",

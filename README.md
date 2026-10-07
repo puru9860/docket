@@ -18,6 +18,12 @@ The planner and orchestrator may be separate (`split`) or one agent (`combined`)
 Implementors can run cheaply in another harness. Docket supports Claude Code, Codex
 (temporary compatibility), and OpenCode.
 
+Docket also supports visible peer discussions for brainstorming, feedback, or
+another provider's view on the current topic. Your current agent participates
+directly with one invited peer, preserving the context of your existing session.
+They exchange attributed messages, agree on a written conclusion, and can pause
+or continue with your new direction. Discussions do not need a coding run.
+
 Two presets select tested combinations of mode, workflow, topology, and review policy.
 The quick preset is the default for new runs: a planner defines the outcome, tasks,
 milestones, and their full-suite commands, an implementor implements them, and a reviewer
@@ -202,6 +208,58 @@ docket help verifier
 docket help reviewer
 docket help signalling
 ```
+
+## Peer discussions
+
+Ask your agent to "get another view from Claude on this topic" or "brainstorm
+this with another agent". The Docket skill keeps your current session as invoker,
+briefs one peer in a visible harness session, and has them exchange actual replies.
+Use the harness and model you requested, including a different provider through
+OpenCode. The protocol also works with separate terminals.
+
+```bash
+docket discuss C01 --start --topic "Should this work offline?" --purpose second-opinion \
+  --harness claude --model MODEL --message-file briefing.md
+# Start the peer in a visible session and send the printed prompt file.
+# Join manually if the invoker's harness was not detected:
+docket discuss C01 --join --as invoker --session c01-invoker
+docket discuss C01 --read
+docket discuss C01 --pickup --as invoker --session c01-invoker
+docket discuss C01 --send --as invoker --session c01-invoker --reply-to 1 --message-file reply.md
+```
+
+Messages carry `[agent:invoker]`, `[agent:peer]`, or `[human:human]` markers and
+explicit sequence and harness metadata. Agent suggestions retain agent authority;
+human instructions take priority. These are protocol labels, not authentication.
+`--read --json` exposes separate envelopes and bodies. Replies reference the
+latest sequence so an agent cannot silently respond against outdated context.
+
+One agent proposes a conclusion with `--propose`, and the other accepts that
+exact proposal with `--accept N`. This records `concluded`, including any
+remaining disagreements in the summary. The default 12-turn limit pauses
+without claiming agreement. You can interrupt or discuss again at any point:
+
+```bash
+docket discuss C01 --pause --as human --message "Stop for now."
+docket discuss C01 --continue --as human --message "You overlooked deployment costs."
+```
+
+Continue preserves the earlier conclusion and messages and starts another phase
+with the same two sessions. Pause stops subsequent message submissions; it does
+not kill a harness's running inference or shell command. Use `--close --as human
+--message TEXT` to close permanently. `docket discuss --list` lists discussions.
+
+The existing Claude Code and Codex Stop hook watches participants joined inside
+their own proven harness process, even without a coding role. A peer wake carries
+a pickup command rather than message prose, and pickup records receipt. OpenCode
+and sessions without that hook use a blocking `docket discuss C01 --watch --as
+peer --session C01-peer`. Native hooks also continue handling coding role events.
+Transcripts stay under private `.docket/conversations/<id>/` directories; a
+replacement session uses `--join --replace` and reads the saved history. Requested
+model metadata is not proof of the model that ran. Docket renders the launch
+prompt; the invoking agent or operator starts the visible peer harness.
+
+See `docket help discussion` for the full launch, exchange, wake, and recovery flow.
 
 ## Layout of a run
 

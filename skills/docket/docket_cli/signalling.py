@@ -22,6 +22,7 @@ from .sessions import (
     calling_harness, codex_home, codex_stop_hook_installed, harness_session,
     session_noted_roles,
 )
+from .discussions import discussion_announce, discussion_joined, discussion_watch
 from .hook_config import codex_hook_configuration
 from .events import ensure_worker_exit_checkpoint, events
 from .delivery import (
@@ -344,9 +345,12 @@ def cmd_watch(a: argparse.Namespace) -> None:
         die("--role is required so one supervisor cannot consume another role's events")
     declared = os.environ.get("DOCKET_ROLE", "").strip()
     native = os.environ.get("DOCKET_WATCH_HOOK") == "1"
+    joined_discussions = discussion_joined() if native else []
     selected_runs = None
     if native:
         if a.armed and not a.run and not any(role == a.role for _, role in armed()):
+            if joined_discussions:
+                discussion_watch(argparse.Namespace(watch_joined=True, timeout=a.timeout, interval=a.interval))
             raise SystemExit(0)
         selector = os.environ.get("DOCKET_RUN", "").strip()
         if a.run and selector and a.run not in selector.split(","):
@@ -355,6 +359,9 @@ def cmd_watch(a: argparse.Namespace) -> None:
             native_session_registration(a.run, a.role, create=True)
         bound = native_bound_runs(a.role)
         if harness_session([]) and not bound:
+            if joined_discussions:
+                discussion_watch(argparse.Namespace(watch_joined=True, timeout=a.timeout, interval=a.interval))
+                return
             die(f"native hook has no current recipient binding; run `docket arm RUN "
                 f"--role {a.role}` inside this session before waiting")
         selected_runs = list(dict.fromkeys(selector.split(","))) if selector else bound or None
@@ -406,8 +413,12 @@ def cmd_watch(a: argparse.Namespace) -> None:
     deadline = time.monotonic() + a.timeout
     while True:
         fresh: list[tuple[str, str, Path, str, str]] = []
+        discussion_notices, discussion_active = discussion_announce(discussion_joined()) if native else ([], False)
+        if discussion_notices:
+            print("Docket peer conversation:\n" + "\n".join(discussion_notices), file=sys.stderr, flush=True)
+            raise SystemExit(HOOK_WAKE_EXIT)
         pairs = watched_pairs()
-        if not pairs:
+        if not pairs and not discussion_active:
             raise SystemExit(0)
         live_pairs = [(run, role) for run, role in pairs
                       if not paused_flag(run_dir(run), role).is_file()]

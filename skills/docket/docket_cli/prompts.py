@@ -46,8 +46,8 @@ def cmd_role_help(a: argparse.Namespace) -> None:
         return
     if not a.run or not a.owner:
         die("active guidance needs both --run RUN and --owner TASK (or orch)")
-    if a.role == "signalling":
-        die("signalling help is shared across presets; use `docket help signalling`")
+    if a.role in ("signalling", "discussion"):
+        die(f"{a.role} help is shared across presets; use `docket help {a.role}`")
     prompt, _ = compose_prompt(need_run(a.run), a.run, a.owner, a.role)
     print(prompt, end="" if prompt.endswith("\n") else "\n")
 
