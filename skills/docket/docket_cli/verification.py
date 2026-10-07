@@ -12,14 +12,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from .common import COVERAGE_AVAILABLE, die, stamp
+from .common import COVERAGE_AVAILABLE, COVERAGE_UNAVAILABLE, die, stamp
 from .frontmatter import parse
-from .paths import owners, root
-from .publication import publish_json
-from .policy import plan_flag
-from .baselines import evidence_digest, output_fingerprint
+from .paths import _ordered, next_numbered, owners, read_dispatch, root
+from .publication import publish_exclusive, publish_json
+from .policy import plan_flag, task_risk
+from .baselines import assignment_evidence, evidence_digest, output_fingerprint
 from .bundles import bundle_problems, bundles_for, digest_of, load_bundle
-from .state import verification_paths
+from .state import checkpoints_dir, state_of, verification_paths
 from .freeze import current_bundle
 from .aggregates import aggregate_bundle_problems
 
@@ -372,9 +372,69 @@ def execute_verify(command: str, timeout: int, env: dict[str, str],
 
 
 def verifier_exempt_set(d: Path) -> set[str]:
-    """Members covered by verifier_exempt, which counts as resolved verification."""
+    """Members covered by verifier_exempt, which counts as resolved verification.
+
+    High-risk tasks are never exempt: concurrency, security, oracle-change, and
+    harness-plumbing work needs a recorded verification even when the plan
+    lists it.
+    """
     raw = plan_flag(d, "verifier_exempt", "")
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    return {item.strip() for item in raw.split(",")
+            if item.strip() and task_risk(d, item.strip()) != "high"}
+
+
+def write_checkpoint(d: Path, owner: str, semantic_handoff: str = "no") -> Path:
+    """A mechanical snapshot: diff identity, verification, history, pointers.
+
+    An automatic snapshot is never labelled a ready semantic handoff; only a
+    submitted `docket handoff` checkpoint is. A replacement performs targeted
+    discovery from these pointers and supplies the missing reasoning itself.
+    """
+    try:
+        rnd, _ = state_of(d, owner)
+    except (OSError, ValueError):
+        rnd = 0
+    coverage, detail, changed = COVERAGE_UNAVAILABLE, "", []
+    try:
+        coverage, detail, changed, _outside = assignment_evidence(d, owner)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
+    dispatch = read_dispatch(d, owner)
+    task = d / f"{owner}-task.mdx"
+    task_rev = digest_of(task.read_bytes()) if task.is_file() else ""
+    decs = _ordered(d.glob(f"{owner}-decision-*.mdx"))
+    checkpoints_dir(d).mkdir(parents=True, exist_ok=True)
+    session_history: object = ""
+    if dispatch:
+        session_history = dispatch.get("session_history", dispatch.get("session", ""))
+    for _ in range(100):
+        existing = sorted(checkpoints_dir(d).glob(f"{owner}-*.json"))
+        path = checkpoints_dir(d) / f"{owner}-{next_numbered(existing):02d}.json"
+        try:
+            publish_exclusive(path, json.dumps({
+                "checkpoint": path.name,
+                "run": d.name,
+                "owner": owner,
+                "round": rnd,
+                "diff_identity": digest_of(("\n".join(sorted(changed))).encode()),
+                "diff_detail": detail,
+                # Measured work decides whether a replacement resumes or starts fresh;
+                # unmeasured evidence is never read as "nothing was done".
+                "work": ("changed" if changed else "none") if coverage == COVERAGE_AVAILABLE else "unknown",
+                "last_verification": str((frozen or {}).get("digest", "")) or "none",
+                "session_history": session_history,
+                "model_history": dispatch.get("model_history", []) if dispatch else [],
+                "task_pointer": task.name if task.is_file() else "",
+                "task_revision": task_rev,
+                "decision_pointer": decs[-1].name if decs else "",
+                "semantic_handoff": semantic_handoff,
+                "taken_at": stamp(),
+            }, indent=2, sort_keys=True) + "\n")
+        except FileExistsError:
+            continue
+        return path
+    die(f"could not allocate a checkpoint for {owner}; retry the command")
 
 
 def current_task_revision(d: Path, owner: str) -> str:

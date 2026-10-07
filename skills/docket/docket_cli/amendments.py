@@ -12,7 +12,8 @@ from .publication import fault, publish_exclusive, publish_json
 from .policy import need_run
 from .bundles import digest_of
 from .locks import owner_lock
-from .state import amendments_dir, list_amendments, list_batches, state_of, task_depends_on
+from .state import (amendments_dir, list_amendments, list_batches,
+                    seed_report_acceptance, state_of, task_depends_on)
 from .dependencies import read_deps
 from .freeze import current_bundle
 from .aggregates import current_aggregate
@@ -98,6 +99,8 @@ def cmd_amendment(a: argparse.Namespace) -> None:
     except (OSError, ValueError):
         die(f"amendment {iid!r} is unreadable")
     if record.get("status") != "pending":
+        if record.get("status") == "accepted":
+            seed_report_acceptance(d, str(record.get("owner", "")))
         print(f"amendment {iid} is already {record.get('status')}; nothing rewritten")
         return
     decider = (a.by or "").strip() or "planner"
@@ -116,6 +119,7 @@ def cmd_amendment(a: argparse.Namespace) -> None:
     record.update({"status": "accepted", "decided_by": decider,
                    "decided_at": stamp(), "new_contract_rev": new_rev})
     publish_json(path, record)
+    seed_report_acceptance(d, str(record["owner"]))
     affected = [o for o in amendment_consumers(d, record["owner"])
                 if o != record["owner"]]
     retired = []
@@ -138,9 +142,17 @@ def cmd_amendment(a: argparse.Namespace) -> None:
             accepted = data if isinstance(data, list) else []
         except (OSError, ValueError):
             accepted = []
+    frozen_bundles: dict[str, str] = {}
+    for affected_owner in [str(record["owner"]), *affected]:
+        affected_round, _ = state_of(d, affected_owner)
+        frozen, _ = current_bundle(d, affected_owner, affected_round) \
+            if affected_round else (None, [])
+        if frozen and frozen.get("digest"):
+            frozen_bundles[affected_owner] = str(frozen["digest"])
     accepted.append({"amendment": iid, "task": record["owner"],
                      "old_contract_rev": record.get("old_contract_rev", ""),
                      "new_contract_rev": new_rev, "affected": affected,
+                     "frozen_bundles": frozen_bundles,
                      "accepted_at": stamp()})
     publish_json(accepted_path, accepted)
     fault("amendment:accept")
@@ -179,9 +191,34 @@ def amendment_blocks(d: Path, owner: str) -> list[str]:
         if owner != "orch" and owner != entry.get("task") \
                 and owner not in (entry.get("affected") or []):
             continue
-        if frozen_at and str(entry.get("accepted_at", "")) <= frozen_at:
+        pinned = entry.get("frozen_bundles")
+        if isinstance(pinned, dict) and owner != "orch":
+            old_digest = str(pinned.get(owner, "") or "")
+            if not old_digest:
+                continue
+            if frozen and str(frozen.get("digest", "")) != old_digest:
+                continue
+        elif frozen_at and str(entry.get("accepted_at", "")) <= frozen_at:
             continue
         problems.append(
             f"amendment {entry.get('amendment')} was accepted after round {rnd} froze: "
             "reverify the new contract in a fresh round first")
     return problems
+
+
+def accepted_requirement_round(d: Path, owner: str, iid: str, bundle_digest: str) -> bool:
+    """Whether this accepted amendment invalidated exactly the frozen round being returned."""
+    path = amendments_dir(d) / "accepted.json"
+    try:
+        accepted = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(accepted, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("amendment") == iid
+        and (entry.get("task") == owner or owner in (entry.get("affected") or []))
+        and isinstance(entry.get("frozen_bundles"), dict)
+        and entry["frozen_bundles"].get(owner) == bundle_digest
+        for entry in accepted
+    )

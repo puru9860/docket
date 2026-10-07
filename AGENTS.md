@@ -170,6 +170,20 @@ diff -r --exclude='__pycache__' --exclude='*.pyc' ~/.agents/skills/docket ~/Docu
   so an assign-time baseline predated the earlier tasks' work and counted it as the
   later task's own. It is still captured once, before the task's work, and never
   recaptured. A dispatch refused for a full cap captures nothing.
-- Running docket writes bytecode under `~/.cache/docket/pycache` (or `PYTHONPYCACHEPREFIX`)
-  and never a `__pycache__` in the skill. That cache is what keeps a call from recompiling
+- Running docket through `bin/docket` or `tests/test.sh` writes bytecode under
+  `~/.cache/docket/pycache` (or `PYTHONPYCACHEPREFIX`) and never a `__pycache__`
+  in the skill. That cache is what keeps a call from recompiling
   the whole CLI; deleting it only costs one slow call.
+  A bare `import docket_cli` (or bare `pytest`) without `PYTHONPYCACHEPREFIX`
+  is not covered: Python compiles `docket_cli/__init__.py` before executing
+  any of its code, so exactly `docket_cli/__pycache__/__init__.*.pyc` can still
+  land beside the package, and the test collection itself can write
+  `tests/__pycache__/`. Never run `py_compile` or `compileall` on skill files;
+  use the supported entry points or set `PYTHONPYCACHEPREFIX` first.
+- Inside Claude Code, Codex, or OpenCode, `docket watch` refuses a `--timeout` under 590
+  seconds. A shorter window only returns to the model to start the same wait again; the
+  wake hook is exempt.
+- A harness session is noted for one role per run. An orchestrator arming the verifier or
+  handing off an implementor's task is not noted as that role, so its tokens stay its own.
+- `docket status` writes under `.status-seen/` when a harness session calls it. That is the
+  unchanged-status nudge, not delivery state.

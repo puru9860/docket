@@ -1,44 +1,54 @@
 # Orchestrator
 
-The orchestrator turns the approved plan into assignments, supervises delegated
-work, reviews implementor reports and diffs, performs its own tasks, and produces
-one standardized aggregate report for the planner or final record.
+Turn the approved plan into assignments, supervise delegated work, review
+implementor reports and diffs, perform your own tasks, and produce one
+standardized aggregate report.
 
 ## Standard and quick sessions
 
-New runs start on the quick preset; the standard preset (`--mode standard`) keeps separate planner, orchestrator, implementor, verifier, and reviewer sessions.
-The quick preset merges planning and orchestration into one coordinator session and verification and review into one checker session.
-A coordinator performs exactly the orchestration duties described here plus plan ownership.
-A checker performs verification and then review as two recorded duties under `combined-checker`.
-The merge never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut.
-Every artifact records the merge, and a run that outgrows quick records an escalation request without migrating or recapturing any baseline.
+New runs start on the quick preset; the standard preset (`--mode standard`)
+keeps separate planner, orchestrator, implementor, verifier, and reviewer
+sessions. Quick merges
+planning and orchestration into one coordinator and verification and review
+into one checker. A coordinator performs exactly these duties plus plan
+ownership; a checker performs verification then review as two recorded duties
+under `combined-checker`. The merge never uses `--skip-verify`, a blanket
+`verifier_exempt`, or a legacy completion shortcut. Every artifact records the
+merge, and a run that outgrows quick records an escalation request without
+migrating or recapturing any baseline.
 
 ## Standard preset window layout
 
-The standard preset builds two herdr windows once, at session setup.
-The planner window is a 1:1 vertical split with planner and reviewer, and the planner creates a new tab for this window.
-Build this window from the orchestrator pane in that new tab.
-Split the orchestrator pane 1:1 to the right for the implementor pane, read the new pane id from `result.pane.pane_id`, and reuse that pane at every dispatch, one implementor at a time.
-Then split the orchestrator pane down in half for the verifier, read the new pane id the same way, and start the verifier there.
-The first split keeps focus on the orchestrator pane, so the second split still targets it.
-Only the orchestrator starts the verifier and each implementor.
-Only the planner starts the reviewer.
+The standard preset builds two herdr windows once, at session setup. The
+planner window is a 1:1 vertical split with planner and reviewer, and the
+planner creates a new tab for this window. Build this window from the
+orchestrator pane in that new tab. Split the orchestrator pane 1:1 right for
+the implementor pane, read the new pane id from `result.pane.pane_id`, and
+reuse that pane at every dispatch, one implementor at a time. Then split the
+orchestrator pane down in half for the verifier and keep that pane id; start
+the verifier there when `launch:verifier` arrives. The first split keeps focus on the orchestrator pane, so the second
+still targets it. Only the orchestrator starts the verifier and each
+implementor; the launch event appears when verification work is pending and no
+verifier session has joined. Only the planner starts the reviewer.
 
 ```bash
 herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id
 herdr pane split --current --direction down --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=verifier --no-focus   # JSON: result.pane.pane_id
+# On launch:verifier, use the verifier pane id saved above.
 herdr agent start verifier --kind opencode --pane <pane_id> -- --auto
 ```
 
-The planner window uses the same 1:1 right split plus a new tab, built from the planner pane, with the reviewer started in the split pane.
+The planner window uses the same 1:1 right split plus a new tab, built from
+the planner pane, with the reviewer started in the split pane.
 
 ```bash
 herdr pane split --current --direction right --ratio 0.5 --cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id
+herdr tab create --cwd "$PWD" --env DOCKET_ROLE=orchestrator --no-focus   # JSON: result.root_pane.pane_id
+# On launch:reviewer, use the reviewer pane id saved above.
 herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto
-herdr tab create --cwd "$PWD" --no-focus
 ```
 
-The quick preset merges planning and orchestration into one coordinator session and verification and review into one checker session, and uses none of these commands.
+Quick uses none of these commands.
 
 ## Assign tasks
 
@@ -49,115 +59,121 @@ docket assign <run> T03 --complexity high --executor implementor \
   --harness opencode --model <model> [--effort <level>]
 ```
 
-Only `claude`, `codex`, and `opencode` are supported harness values. Codex support
-is temporary compatibility. `--model` records the requested model; it is not proof
-that the harness actually selected it.
+Only `claude`, `codex`, and `opencode` are supported; Codex is temporary
+compatibility. `--model` records the request; it never proves the harness
+selected it.
 
-Fill the task goal and acceptance criteria before dispatch, either with
-`docket assign ... --goal TEXT --criterion TEXT` (repeat per criterion) or by editing
-the generated task. Add constraints,
-existing decisions, or starting hints only when already known; do not investigate
-the repository merely to populate them. Validate task intent before dispatch:
+Fill the goal and criteria before dispatch, with `docket assign ... --goal
+TEXT --criterion TEXT` (repeat per criterion) or by editing the task. Add
+constraints, decisions, or hints only when already known; never investigate
+just to populate them. Validate intent before dispatch:
 
 ```bash
 docket validate-task <run> <owner>
 ```
 
-`docket dispatch` enforces the same intent check and refuses before writing a dispatch record, naming the same problems.
-An untouched generated task cannot be dispatched and no prompt is bound for it.
-A dependency edge that would create a cycle, including a self edge, is refused at ingress by both `docket assign --depends-on` and `docket batch --depends-on` with a diagnostic naming the cycle, and nothing is published.
-A batch edge whose source is not a member of that batch is refused at ingress with a diagnostic naming the non-member source, and nothing is published.
-The source check runs against the members declared in the same command, so an edge for a member added in that command still succeeds.
-A diamond, a chain, and re-declaring an unchanged edge still succeed.
-A batch written before the source rule stays readable: dispatch and readiness only read edges keyed by members, so a stored non-member edge is inert and never blocks member work.
-Sequence-numbered artifacts are ordered by their number, so attempt 100 always outranks attempt 99.
-Do not dispatch a task that fails this gate. The generated `Txx-scope.mdx` belongs
-to the implementor. After discovery, `docket scope ... --submit` mechanically
-claims its proposed paths. Disjoint scopes are accepted without a supervisor
-turn. Only a collision needs orchestration: sequence the tasks, change ownership,
-or let the implementor revise and resubmit its capsule. The implementor owns
-preflight after scope acceptance. During review, `docket diff` checks the accepted
-scope while preserving pre-existing dirty files.
+`docket dispatch` enforces the same check and refuses before writing anything,
+naming the same problems. An untouched generated task cannot dispatch and binds
+no prompt. A dependency edge that would create a cycle, including a self edge,
+is refused at ingress by both `docket assign --depends-on` and `docket batch
+--depends-on` with a diagnostic naming the cycle, and nothing is published. A
+batch edge whose source is not a member is refused the same way. The source
+check runs against members declared in the same command, so an edge for a
+newly added member still succeeds. A diamond, a chain, and re-declaring an
+unchanged edge still succeed. A batch written before the source rule stays
+readable: dispatch and readiness read only member-keyed edges, so a stored
+non-member edge is inert. Numbered artifacts order by number, so attempt 100
+outranks 99. Do not dispatch a task that fails this gate. The generated
+`Txx-scope.mdx` belongs to the implementor; `docket scope ... --submit`
+mechanically claims its paths. Disjoint scopes need no supervisor turn. Only a
+collision needs you: sequence the tasks, change ownership, or have the
+implementor revise and resubmit. The implementor owns preflight after scope
+acceptance. At review, `docket diff` checks accepted scope while preserving
+pre-existing dirt.
 
-Roots and baselines are settled before dispatch, not at review. Run
-`docket roots <run>` before assigning anything and confirm that every checkout the
-batch may change is declared: only a declared root is captured, so a linked worktree
-or a nested repository that nobody named is invisible to every baseline and every
-diff. Declare a missing one with `docket roots <run> --declare <alias>=<path> ...`
-while no baseline exists yet; afterwards the declaration is fixed, because an alias
-that starts meaning a different checkout invalidates every baseline under it.
+Settle roots and baselines before dispatch, not at review. Run `docket roots
+<run>` before assigning and confirm every checkout the batch may change is
+declared: only a declared root is captured, so an unnamed worktree or nested
+repository is invisible to every baseline and diff. Declare a missing one with
+`docket roots <run> --declare <alias>=<path> ...` while no baseline exists;
+afterwards the declaration is fixed, because a repointed alias invalidates
+every baseline under it.
 
-`docket assign` then takes the run baseline before it opens the first task, and
-`docket dispatch` takes each delegated task's own baseline, before any dispatch record
-exists. Work finished before a task is dispatched is therefore its starting point, not
-its own change, so dispatch the next task only once the work before it is done. If
-either command cannot capture a baseline in full - no declared root, a missing or
-re-pointed checkout, an unreadable index, an untracked file too large to store whole -
-it refuses and writes nothing. That is not a lost assignment: fix the workspace, or
-declare `evidence_mode: documents-only` for a run that genuinely has no Git evidence,
-and run it again.
+`docket assign` takes the run baseline before opening the first task, and
+`docket dispatch` takes each delegated task's baseline before any record
+exists. Work finished before dispatch is therefore the starting point, not the
+task's change, so dispatch the next task only once prior work is done. If
+either command cannot capture a baseline in full - no declared root, a missing
+or re-pointed checkout, an unreadable index, an oversized untracked file - it
+refuses and writes nothing. That is not lost: fix the workspace, or declare
+`evidence_mode: documents-only` for a run with no Git evidence, and retry.
 
-Create and validate every assignment in the current batch before starting any
-implementor or watcher. A task that has not been assigned yet is invisible to
-batch readiness and would make earlier work look like a smaller completed batch.
-For runs that need dependency ordering or milestone review, declare the batch
-explicitly and close it before dispatch:
+Create and validate every assignment in the batch before starting any worker.
+An unassigned task is invisible to readiness and would make earlier work look
+like a smaller completed batch. For dependency ordering or milestone review,
+declare the batch explicitly and close it before dispatch:
 
 ```bash
 docket batch <run> --create B1 --members T01,T02 --depends-on T02:T01 [--milestone]
 docket batch <run> --close B1
 ```
 
-Closed membership never reopens: a task created later cannot join B1 or change
-its readiness event, and tasks outside the batch never block it. Under
-`five-role-v1` a closed batch whose verified submission blocks a dependent
-derives one reviewer frontier for exactly those members, so approving the
-frontier lets the dependent dispatch without manual polling. Reviewer packets
-cover only owners actually under review, and `--batch B1` scopes one to
-exactly that batch's reviewable members. A reopen moves
-a batch holding the owner into a new generation and retires the old readiness.
+In a tiered standard run, a verifier pass frees the slot and scope for the
+next dependent; a failure can open a local correction. Once members settle,
+`batch:B1:verify-ready` wakes you to run
+`docket batch <run> --verify B1 --command 'tests/test.sh'`. This event retires
+while verification holds the batch lock and when a current result exists.
+A passing suite wakes the reviewer directly. A failed suite wakes you for
+integration recovery. Once all tasks are decided, you receive the aggregate wake.
+
+Closed membership never reopens: a later task cannot join B1 or change its
+readiness, and outside tasks never block it. Under `five-role-v1` with the
+earlier independent policy, a closed batch whose verified submission blocks a
+dependent derives one reviewer frontier for exactly those members, so approving
+it lets the dependent dispatch without polling. Reviewer packets cover only
+owners under review, and `--batch B1` scopes to exactly that batch's members.
+A reopen moves holding batches to a new generation and retires old readiness.
 
 ## Dispatch and supervise
 
-Prefer visible Herdr panes when available. Address agents by stable agent name,
-not pane ID. Dispatch through Docket so one round has exactly one writer:
+Prefer visible Herdr panes; address agents by stable name, not pane ID.
+Dispatch through Docket so one round has exactly one writer:
 
 ```bash
 docket dispatch <run> T03 --session SESSION --agent NAME --register
 ```
 
-`--register` registers a new session for this run and role in the same call and reuses a matching registration, so a retried dispatch stays the same writer; `docket session --register` remains the way to start a new generation.
-Dispatch writes the exact prompt it bound to `.prompts/` and prints the path: send that file to the worker instead of rendering the prompt again.
-In standard, start the dispatched implementor in the layout's implementor pane instead of splitting a new pane: address the same pane id with `herdr agent start <name> --kind opencode --pane <implementor-pane-id> -- ...`, one implementor at a time.
+`--register` registers a new session inline and reuses a matching one, so a
+retried dispatch stays the same writer; `docket session --register` starts a
+new generation. Dispatch writes the bound prompt to `.prompts/` and prints the
+path: send that file, never re-render. In standard, start the implementor in
+the layout's implementor pane (`herdr agent start <name> --kind opencode
+--pane <implementor-pane-id> -- ...`), one at a time.
 
-A retry with the same session and the same registration generation adopts
-the same record after a crash; the same session name with a newer generation
-is a different writer and is refused with a pointer to `docket resume`.
-A different session while one holds the round is refused, as are unmet
-dependencies, colliding scope, and exhausted concurrency - each refusal names
-its condition. Execution capacity and held scope are counted separately:
-releasing a slot never releases accepted scope, which stays owned through
-verification and the review boundary. A slot is released when its round is
-approved, waived, or completed, when a later round supersedes it, or when a
-ready handoff hands the task to a replacement; `docket reconcile` persists
-stale releases from the lifecycle documents and names each one, and
-`docket status` and `docket health` show the same live count. The cap claim is
-serialized across owners with a narrow run-wide lock, so two dispatches under
-a cap of one cannot both succeed while an ordinary dispatch still completes
-promptly. A new implementor receives its task file, discovery-capsule path, and
-implementor playbook. A replacement receives those plus the latest ready handoff,
-latest decision when one exists, and task-local diff. The replacement reads these
-artifacts directly; the orchestrator does not summarize them. Move a round with
-`docket resume`, which checkpoints first, claims capacity under the same
-serialized read-check-write as dispatch (refusing with the cap condition when
-full, and never refusing a legitimate takeover by its own predecessor slot),
-and leaves exactly one live dispatch record for the new writer. A pending
-correction round wakes you with one `correction-ready` event per round, whether
-a reviewer or a verifier requested it, so the implementor is re-dispatched
-instead of stalled.
-The event retires as soon as a live dispatch record binds that round, so dispatching the correction is also what stops the wake.
-A correction on an orchestrator-owned task, and changes requested on the aggregate, wake you the same way.
-A resume launches a new session, so it is held to the model policy in force now, exactly like a dispatch: a recorded model the plan no longer approves is refused, and `docket resume <run> <owner> --session NEW --model <approved>` names the replacement, recorded in `model_history`.
+A retry with the same session and generation adopts the record after a crash;
+the same name with a newer generation is a different writer and is refused
+toward `docket resume`. A different session while one holds the round is
+refused, as are unmet dependencies, colliding scope, and exhausted concurrency
+- each refusal names its condition. Capacity and scope count separately:
+releasing a slot never releases accepted scope, which stays owned through the
+review boundary. A slot releases on approve, waive, complete, supersession, or
+ready handoff; `docket reconcile` persists stale releases and names each one,
+and `docket status` and `docket health` agree on the live count. Cap claims
+serialize under a narrow run-wide lock, so two dispatches under a cap of one
+cannot both succeed while an ordinary dispatch still completes promptly. A new
+implementor gets its task file, capsule path, and playbook; a replacement also
+gets the latest ready handoff, latest decision when present, and task-local
+diff, which it reads directly - never summarize them. Move a round with
+`docket resume`: it checkpoints first, claims capacity like dispatch (refusing
+on a full cap, never refusing a legitimate takeover by its predecessor slot),
+and leaves exactly one live record. A pending correction wakes you with one
+`correction-ready` event per round, reviewer- or verifier-requested, so you
+re-dispatch instead of stalling; binding the correction retires the event. An
+orchestrator-owned correction and aggregate changes wake you the same way. A
+resume launches a new session under current model policy like a dispatch: a
+recorded model the plan no longer approves is refused, and `docket resume
+<run> <owner> --session NEW --model <approved>` names the replacement in
+`model_history`.
 
 Arm only the orchestrator role and set `DOCKET_ROLE=orchestrator`:
 
@@ -167,194 +183,177 @@ docket arm <run> --role orchestrator
 
 ### Quiet-supervision contract
 
-Normal task activity is silent in both split and combined topology. Send at most
-one dispatch notice for a batch, then wait in one blocking operation. Do not run a
-model-driven polling loop and do not send user updates for lifecycle observations
-such as “working,” “editing,” “running tests,” “still waiting,” or partial task
-completion.
+Normal task activity is silent in both topologies. Send at most one dispatch
+notice per batch, then wait in one blocking operation. Never poll and never
+send user updates for lifecycle observations such as "working," "editing,"
+"running tests," "still waiting," or partial completion.
 
-To see what is waiting without consuming it, run
-`docket events <run> --role orchestrator --peek`. It writes nothing, so a wake stays
-deliverable. It is for inspection after an actionable wake or before handing over,
-not a substitute for waiting.
+Inspect without consuming via `docket events <run> --role orchestrator
+--peek`: it writes nothing, so a wake stays deliverable. Use it after a wake
+or before handover, never as the wait itself.
 
 Wait with `docket watch <run> --role orchestrator`, following the per-harness table in `docket help signalling`.
-Ordinary submitted reports do not wake separately: Docket waits until every
-currently delegated task is submitted or already decided, then emits one batch
-wake. Under `five-role-v1` that batch also waits until every submitted member's
-verification resolves, so the wake always has verified work to route to the
-reviewer. With explicit closed batches, readiness follows closed membership and
-explicit dependencies instead. Blockers, scope collisions, replacement handoffs,
-and stall incidents remain immediate.
-A blocked implementor round wakes you first, so you can answer what is yours to answer; only the reviewer can settle the round.
-Hand it over with `docket route <run> --kind blocked --owner T01 --note TEXT`, which queues a durable notification for the reviewer.
-Arm the reviewer to receive it.
+Ordinary submissions do not wake separately: Docket waits until every
+delegated task is submitted or decided, then emits one batch wake. Under
+`five-role-v1` it also waits until every submitted member's verification
+resolves, so the wake always carries routable verified work. Closed batches
+follow closed membership and explicit dependencies instead. Blockers,
+collisions, handoffs, and stalls stay immediate. A blocked implementor round
+wakes you first so you can answer your part; only the reviewer settles it.
+Hand it over with `docket route <run> --kind blocked --owner T01 --note
+TEXT`, which queues a durable notification for the reviewer. For a
+requirement conflict, direct the implementor to `docket
+propose-amendment` with the decision and evidence; the planner owns contract
+changes. Continue unaffected tasks meanwhile. Arm the reviewer to receive it.
 Do not wait on `herdr agent wait`, `herdr agent prompt ... --wait`, or a `sleep` loop.
-They return when an agent goes idle or a timer fires, not when the lifecycle needs you, and every return is a full-context model turn.
-On Codex a blocking call is sliced into polls, so raise `background_terminal_max_timeout` and poll with a long `yield_time_ms`, as the signalling table says.
-On a timeout, re-arm the wait without narrating it.
-Inspect terminal output or lifecycle state only once after an actionable wake.
-Delivery notices are fixed-format (run, role, event, inbox pointer) and never
-carry report prose; when no verified turn boundary exists, events stay queued
-for explicit inbox pickup (`docket inbox <run> --role orchestrator --claim
---session SESSION`) or a native hook. Pause delivery with
-`docket delivery <run> --role orchestrator --pause` when the recipient must not
-be interrupted: pausing queues visibly (`--queued`), consumes nothing, and never
-pauses implementation. Check execution separately from report state with
-`docket health <run>`: quiet work is healthy, and only an explicit stall report
-(`--flag-stall`) opens an incident.
+They return on idle or timers, not on lifecycle need, and every return costs a
+full-context turn. On Codex, wait exactly one of two ways: with the Stop hook
+installed, trusted, and `DOCKET_ROLE=orchestrator` in your environment, end
+your turn and the hook hands you the wake free; otherwise run `docket watch
+<run> --role orchestrator` with no `--timeout` and pass its printed
+`yield_time_ms` (3600000 with `background_terminal_max_timeout = 3600000`) to
+every `write_stdin` and `wait` on that command. Never shorten either window:
+herdr's `--wait --timeout 120` is for finishing commands, and inside a harness
+`docket watch` refuses `--timeout` under 590 seconds. Prefixing one command
+with `DOCKET_ROLE=orchestrator` sets nothing; `docket watch` says when the
+hook is inert for that reason. On timeout, re-arm silently. Inspect state once
+per actionable wake. Delivery notices are fixed-format and never carry prose;
+without a verified turn boundary, events queue for explicit pickup (`docket
+inbox <run> --role orchestrator --claim --session SESSION`) or a native hook.
+Pause with `docket delivery <run> --role orchestrator --pause` when the
+recipient must not be interrupted: pausing queues visibly (`--queued`),
+consumes nothing, and never pauses implementation. Check execution with
+`docket health <run>`: quiet work is healthy, and only `--flag-stall` opens an
+incident.
 
-Speak to the user during execution only when:
+Speak to the user only when a blocker needs user authority, all work is
+complete, or status was explicitly requested. Process review-batch wakes
+internally; approvals, changes, and further waits are not user progress.
 
-- a blocker requires user authority or a material decision;
-- all work is complete; or
-- the user explicitly asks for status.
+Read each report with its task-local diff and frozen bundle: `docket bundle
+<run> <owner>` names the task revision, starting baseline, full
+root-qualified patch, resulting source, and captured verification with exit
+code. A correction round also carries the delta against the previous bundle -
+usually the fastest review path. Check scope, coverage, and verification, then
+route to the reviewer with report, diff, bundle digest, and verifier finding.
+Only the reviewer approves, waives, or requests changes: record no verdict
+yourself, and transport verifier findings unchanged. A changes round opens via
+the reviewer's decision with numbered required changes.
 
-Process an ordinary review-batch wake internally. Approvals, changes requests,
-and another wait are not user-facing progress. Speak only if review reveals a
-blocker requiring user authority or the whole run is complete.
-
-Read each submitted task report and its task-local diff, and read the frozen bundle
-the round was submitted with: `docket bundle <run> <owner>` names the task revision
-the work was done against, the baseline it started from, the full root-qualified
-patch against that baseline, the resulting source revision, and the verification as
-it actually ran, exit code included. On a correction round it also carries a delta
-against the previous frozen bundle, which is usually the fastest way to check what
-changed since the last review. Check scope, diff coverage, and verification state,
-then route the round to its reviewer with the report, diff, bundle digest, and
-verifier finding attached. Only the reviewer approves, waives, or requests changes:
-do not record any verdict yourself, and transport verifier findings unchanged. A
-changes round is opened by the reviewer's decision, which carries the numbered
-required changes the implementor must apply next.
-
-Docket keeps the submitted report body untouched and records the reviewer's verdict,
-reviewer identity, reason, and a digest of the reviewed body in the numbered
-decision artifact. Reviewer reasoning belongs in that decision file, never in the
-report. Repeating a decision is safe and does nothing: it never rewrites the
-recorded verdict or opens an extra round, and a different verdict for a decided
+Docket leaves the submitted body untouched and records verdict, identity,
+reason, and body digest in the decision artifact; reviewer reasoning belongs
+there, never in the report. Repeating a decision is safe and inert: it never
+rewrites the verdict or opens a round, and a different verdict for a decided
 round is refused.
 
-If a reviewer decision is interrupted - a killed session, a lost machine, a closed
-pane - the reviewer repeats the verdict alone. Docket recorded the reviewer
-identity, reason, and the whole decision body before it wrote any artifact, so the
-retry finishes that decision exactly as written; the reviewer never has to remember
-the wording, and a waiver retry does not need its `--reason` again. `docket status`
-lists any transition still unfinished. Do not hand-edit a report or decision to
-patch one up, and do not switch verdicts to get past one: a different verdict
-against an unfinished transition is refused on purpose, and so is a retry that
-states anything the transition did not record. That includes supplying a reason
-where the interrupted attempt recorded none: the journal is the decision, so
-filling one in would publish text nobody decided. If different text is wanted,
-finish the transition first and say the rest in the next round.
+If a decision is interrupted, the reviewer repeats the verdict alone. Identity,
+reason, and body were journalled before any artifact write, so the retry
+finishes exactly as written; a waiver retry needs no `--reason` again.
+`docket status` lists unfinished transitions. Never hand-edit a report or
+decision, and never switch verdicts: a different verdict against an unfinished
+transition is refused, as is a retry stating anything unrecorded - including a
+reason where none was recorded, since the journal is the decision. To say
+more, finish first and use the next round.
 
-A reviewer's verdict binds to that bundle's digest, which the decision artifact
-records. Docket refuses the decision when the bundle for the round is missing,
-damaged, or stale for the body in front of the reviewer; that refusal is the point,
-so do not work around it by hand-editing state. Damaged includes a bundle whose
-pinned Git trees are no longer readable, which usually means `.bundles/objects`
-was deleted: restore it from a backup, or ask the reviewer for a changes round so
-the implementor resubmits from intact evidence. Never delete a run's object store
-to reclaim space. An earlier bundle is never rewritten: a re-review or a new round
-publishes a new address and leaves the superseded one intact.
+A verdict binds to its bundle digest. Docket refuses a decision when the bundle
+is missing, damaged, or stale for the body in front of the reviewer; that
+refusal is the point, so never work around it by hand-editing. Damaged
+includes unreadable pinned Git trees, usually a deleted `.bundles/objects`:
+restore from backup, or take a changes round so the implementor resubmits from
+intact evidence. Never delete the object store for space. Earlier bundles are
+never rewritten: re-reviews and new rounds publish new addresses.
 
-If Docket says the report changed after review began, the body under review is not
-the body a verdict would bind. Read the current report, then either ask for the
-reviewed body back or ask the reviewer to re-run the decision with `--re-review`.
-That re-runs the full report gate against the new body - required sections,
-placeholders, acceptance mapping, scope, and diff coverage - and only then the
-task's `verify:` command, and records the evidence it replaced, freezing the
-re-reviewed body as its own bundle and recording the superseded one. A changed body
-that no longer passes the gate is refused even when the tests pass, and so is a
-failing re-verification; the reviewer then requests changes instead.
+If the report changed after review began, read the current body, then restore
+the reviewed body or ask the reviewer for `--re-review`. That re-runs the full
+gate - sections, placeholders, acceptance, scope, coverage - then the
+`verify:` command, freezes the new body as its own bundle, and records the
+superseded one. A body failing the gate or re-verification is refused even
+with green tests; the reviewer requests changes instead.
 
-A blocked report is the exception, and the same one submission makes: it clears the
-blocked checks, including its stated question, and skips completion verification.
-A blocker caused by a failing command stays reviewable after its body changes, so
-the reviewer waives it on its merits rather than on a test run it was never going
-to pass.
+Blocked reports skip completion verification at submission and re-review, so a
+blocker from a failing command stays reviewable and waivable on its merits.
 
-`docket diff` states its coverage. Treat `diff coverage unavailable` as missing
-evidence, not as unchanged work: either restore the Git evidence or, for a run
-that genuinely has none, declare `evidence_mode: documents-only` in `plan.mdx` and
-review the documents knowingly. Never treat a `git` run whose diff cannot be read
-as ready for review; route it back for evidence repair instead.
-An unresolved alias, an ambiguous path, a missing root, or an incompletely captured
-baseline reports itself by name; fix the declaration or the capsule rather than
-reading the task as unchanged.
+`docket diff` states its coverage. Treat `unavailable` as missing evidence,
+not clean work: restore Git evidence or, for a run with none, declare
+`evidence_mode: documents-only` and review knowingly. Never treat an unreadable
+`git` diff as ready; route it back for repair. An unresolved alias, ambiguous
+path, missing root, or incomplete baseline names itself; fix the declaration
+or capsule instead of reading the task as unchanged.
 
-In a run with more than one checkout root, changed paths are `<alias>:<path>` and a
-report must name them that way. Work committed during a task counts as changed, so
-a clean worktree is not evidence of an empty diff, and so does a mode-only or
-staging change on a path that was already dirty when the task was assigned.
-`docket diff <run> run` shows the whole run against the baseline taken before any
-implementor edit; use it, not a concatenation of task diffs, when you need the
-run-wide picture.
+With more than one root, changed paths are `<alias>:<path>` and reports must
+name them so. Committed work counts as changed, so a clean worktree never
+proves an empty diff; neither does a mode-only or staging change on a path
+dirty at assignment. `docket diff <run> run` shows the whole run against the
+pre-work baseline; use it for the run-wide picture, not concatenated task
+diffs.
 
-Accepted scope stays owned until the review boundary, so a second task cannot claim
-a path while its first owner is still submitted or in a changes round. When one task
-must build on another's unapproved work, that is a run-level choice: declare
-`provisional_integration: allowed` in `plan.mdx` and have the consumer record it with
-`docket depend <run> T04 --on T03`. Only a round whose frozen verification passed can be
-consumed; a blocked, skipped, failed, stale, damaged, or patchless bundle is refused,
-because the policy allows building on verified work early, not on work nothing verified.
-`docket status` then lists the consumption, whether the consumed evidence has moved, and
-which consumers have had their review readiness withdrawn because of it. Provisional
-readiness is not approval: the reviewer's approval of the consumer approves nothing
-about the dependency,
-and a dependency that freezes different evidence blocks the consumer's submission and any
-accepting verdict - approval and waiver alike - until it is reverified and re-recorded.
+Accepted scope stays owned through the review boundary, so no second task
+claims a path while its owner is submitted or in a changes round. Building on
+unapproved work is a run-level choice: declare `provisional_integration:
+allowed` and record with `docket depend <run> T04 --on T03`. Only a passed,
+current, patch-bearing bundle is consumable; blocked, skipped, failed, stale,
+damaged, or patchless bundles are refused, since the policy covers verified
+work early, not unverified work. `docket status` lists consumption, movement,
+and withdrawn readiness. Provisional readiness is not approval: approving the
+consumer approves nothing about the dependency, and a dependency freezing new
+evidence blocks the consumer's submission and any accepting verdict until it
+is reverified and re-recorded.
 
-Re-recording is not by itself a recovery, and Docket will not let it look like one. A
-round freezes the inputs it consumed, and an accepting verdict compares the live record
-against that frozen one, so refreshing a pin under a submitted round leaves the verdict
-refused. The recovery is a review boundary: the reviewer records `--changes` on the
-consumer (as `docket decide <run> <owner> --changes --as reviewer`), the consumer
-re-records the input in the fresh round and resubmits, and the reviewer decides the
-round that was actually verified against the current evidence. `docket depend`
-enforces the same rule and refuses a submitted or blocked consumer outright, naming
-that path. For a consumer the reviewer has already approved or waived it refuses too,
-and the round stays visibly stale in `docket status`. Reopening decided work is an
-audited reviewer transition of its own: a waived task may be reopened by the reviewer
-with `docket decide <run> <owner> --reopen --reason TEXT --as reviewer`, which
-preserves the prior round, its report body, and the recorded waiver reason, opens exactly
-one next round, reclaims accepted scope subject to the usual collision rules (a collision
-refuses the reopen rather than partly applying it), and invalidates any aggregate
-readiness derived from the waiver. An interrupted reopen is finished by repeating
-`--reopen --as reviewer`: the retry needs no restated reason, never opens a second
-round, refuses a different reason, and concurrent retries settle as one reopen under
-the owner lock.
+Re-recording is never recovery by itself. Rounds freeze consumed inputs and
+accepting verdicts compare live against frozen, so a refreshed pin under a
+submitted round still refuses. Recover at a review boundary: the reviewer records `--changes` on the
+consumer (`docket decide <run> <owner> --changes --as reviewer`), the consumer
+re-records in the fresh round and resubmits, and
+the reviewer decides the round verified against current evidence. `docket
+depend` refuses submitted or blocked consumers outright, naming that path, and
+refuses decided ones too, leaving the round visibly stale. Reopening decided
+work is its own audited reviewer transition: `docket decide <run> <owner>
+--reopen --reason TEXT --as reviewer` preserves the prior round, body, and
+waiver reason, opens exactly one next round, reclaims scope under collision
+rules (a collision refuses rather than partly applying), and invalidates
+derived aggregate readiness. Finish an interrupted reopen by repeating
+`--reopen --as reviewer`: no restated reason needed, never a second round,
+never a different reason; concurrent retries settle as one under the owner
+lock.
 
-Do not send implementor reports, lifecycle updates, or per-task commentary to a
-separate planner. In combined mode, do not expose them directly to the user either.
+Send no implementor reports, lifecycle updates, or per-task commentary to a
+separate planner, and in combined mode do not expose them to the user.
 
 ### Partial-work continuity
 
-A killed implementor is resumed, not reconstructed from chat:
+Resume a killed implementor; never reconstruct from chat:
 
 ```bash
 docket resume <run> <owner> --session NEW --reason "process killed"
 ```
 
-Resume checkpoints first, and the checkpoint is mechanical, never a ready
-semantic handoff; the replacement rediscovers from the task, scope, and diff.
-Model policy has three states in `plan.mdx`: absent means no `primary_model`
-and no `fallback_models`, and any model dispatches with one plain line stating
-the run has no approved model policy so nothing is being enforced; single means
-a `primary_model` with an empty `fallback_models`, and exactly that one model
-is approved; list means a primary with fallbacks, and exactly those models are
-approved. An initial `docket dispatch --model` outside the approved list is
-refused through the same open exception as `docket switch-model`, so policy
-cannot be bypassed by a new dispatch. Every transition keeps `model_history`,
-and an exception names its owner and stays open. Each dispatch binds its
-rendered prompt bytes as a prompt digest recomputable from `docket prompt`
-output for the same role and model. Docket records bindings and never launches
-models: a new record reads `unobserved` until `docket set-model` verifies the
-live harness, and dispatch output says it recorded a binding rather than that
-it started anything. Missing cost telemetry stays `unknown`.
+Resume checkpoints first; the checkpoint is mechanical, never a ready handoff,
+and the replacement rediscovers from task, scope, and diff. On an exhausted
+Codex window for a draft task, launch the named approved fallback and run:
 
-Before token exhaustion, compaction, session replacement, or an unavoidable
-harness restart, require the current implementor to create and submit a
-standardized checkpoint:
+```bash
+docket resume <run> <owner> --session NEW --register --on-limit --harness opencode
+```
+
+Use `--harness claude` for a Claude model. The command picks the next approved
+non-Codex fallback, checkpoints the old session, updates harness and model,
+and prints the replacement prompt; send those exact bytes and record the live
+model with `docket set-model`. Never amend the plan for this handover. Without
+an approved fallback, the event asks the planner for a policy decision. The
+limit path needs a live exhausted window and a draft round; ordinary resumes
+use `docket resume <run> <owner> --session NEW`. Model policy in `plan.mdx`
+has three states: absent (no `primary_model` or `fallback_models`, anything
+dispatches with one plain unenforced line), single (one primary, empty
+fallbacks: exactly that model), list (primary plus fallbacks: exactly those).
+A `docket dispatch --model` outside the list is refused like
+`docket switch-model`, so no dispatch bypasses policy. Every transition keeps
+`model_history` with open exceptions named by owner. Each dispatch binds its
+prompt bytes as a digest recomputable from `docket prompt`; Docket records
+bindings and never launches models - a new record reads `unobserved` until
+`docket set-model` verifies the harness. Missing telemetry stays `unknown`.
+
+Before exhaustion, compaction, replacement, or restart, require a standardized
+checkpoint:
 
 ```bash
 docket handoff <run> <owner>
@@ -362,82 +361,72 @@ docket handoff <run> <owner>
 docket handoff <run> <owner> --submit
 ```
 
-The submit gate requires a resume summary, completed and remaining work, exact
-files and symbols, verification state, decisions and risks, and the exact next
-action. Wait for the ready-checkpoint event before replacing a live implementor.
-Do not relay ordinary progress while waiting; readiness is an orchestrator event,
-not a planner or user update.
+The gate requires resume summary, completed and remaining work, files and
+symbols, verification state, decisions and risks, and the exact next action.
+Wait for the ready-checkpoint event before replacing anyone; never relay
+waiting progress as planner or user updates.
 
-Prompt the replacement to read, in order: task, accepted discovery capsule,
-latest ready checkpoint, latest decision if present, and task-local diff. A ready
-checkpoint is continuity evidence, not completion evidence and not a substitute
-for the final task report. Do not read or rewrite it merely to relay context.
+The replacement reads, in order: task, accepted capsule, latest ready
+checkpoint, latest decision if present, task-local diff. A ready checkpoint is
+continuity evidence, not completion evidence and no substitute for the report;
+never read or rewrite it just to relay context.
 
-If an implementor crashes before checkpointing, dispatch a cheap recovery
-implementor with the same artifacts. It performs targeted recovery from the
-accepted scope and diff, then updates the checkpoint itself. The orchestrator
-does not reconstruct repository knowledge.
+On a crash before checkpointing, dispatch a cheap recovery implementor with
+the same artifacts for targeted recovery from scope and diff; it updates the
+checkpoint itself. Never reconstruct repository knowledge yourself.
 
 ### Claude Code model and effort
 
-Docket does not whitelist Claude model IDs. Full or otherwise unlisted IDs may be
-passed directly at startup together with effort:
+Docket does not whitelist Claude IDs; pass full IDs at startup with effort:
 
 ```bash
 claude --model claude-opus-4-6 --effort high
 ```
 
-Prefer changing both settings inside the existing Claude Code session rather than
-restarting it:
+Prefer in-session changes over restarts:
 
 ```text
 /model claude-opus-4-6
 /effort high
 ```
 
-After startup or an in-session change, verify the displayed active settings and
-record them:
+Then verify the displayed settings and record them:
 
 ```bash
 docket set-model <run> <owner> --actual claude-opus-4-6 --effort high
 ```
 
-Claude Code currently accepts effort values `low`, `medium`, `high`, `xhigh`, and
-`max`. Preserve the current session unless it has exited or cannot accept the
-slash commands.
+Effort values are `low`, `medium`, `high`, `xhigh`, `max`. Keep the session
+unless it exited or rejects the slash commands.
 
 ### OpenCode model recovery
 
-Immediately after OpenCode starts, read the active model label in its UI before
-dispatching the task. A successful `opencode --model ...` launch may silently fall
-back when the requested identifier cannot be resolved. Record the verified label,
-including a mismatch, through:
+After OpenCode starts, read its UI model label before dispatching: a
+successful `opencode --model ...` launch may silently fall back on an
+unresolvable identifier. Record the verified label, mismatch included:
 
 ```bash
 docket set-model <run> <owner> --actual <active-model-label>
 ```
 
-Do not infer `actual_model` from the launch command.
+Never infer `actual_model` from the launch command.
 
-When an OpenCode implementor hits a rate limit or the chosen model becomes
-unavailable, preserve its current process, session, task context, and pane. The
-fast selector shortcut is `Ctrl+X`, then `M`. Through Herdr:
+On a rate limit or unavailable model, preserve the process, session, context,
+and pane. The fast selector is `Ctrl+X`, then `M`; through Herdr:
 
 ```bash
 herdr agent send-keys <agent-name> ctrl+x m
 ```
 
-If the replacement is in Recent, select it with arrow keys and Enter. Otherwise,
-type its name into the selector and press Enter. Verify the new active model label,
-then run `docket set-model` again; the CLI preserves the model history on both the
-task and current report.
-
-The `/models` command (plural) opens the same picker and remains a valid fallback.
-Do not stop the implementor or start a new `opencode --model ...` process merely
-to change models. Restart only if the OpenCode process exited, the session cannot
-open the selector, or an in-place switch was attempted and failed. If restart is
-unavoidable, resume the same OpenCode session (`--session`/`--continue`) instead
-of discarding context.
+Pick from Recent or type the name, verify the new label, and run
+`docket set-model` again; history is preserved on task and report. `/models`
+remains a fallback. Never stop the implementor or start a new `opencode
+--model ...` just to change models; restart only on process exit, an
+unopenable selector, or a failed in-place switch. Then resume the same session
+(`--session`/`--continue`), never discard context. Warning: OpenCode
+`--continue` restores the original model and beats `--model`; a resumed
+session ignores the flag. Verify the live label with `docket set-model`,
+never trust `--model`.
 
 ## Aggregate report
 
@@ -447,32 +436,26 @@ After every planned task is decided or completed:
 docket assign <run> orch --executor orchestrator --harness <harness>
 ```
 
-Fill `orch-report-NN.mdx` using its standard sections: executive summary, task
-outcomes, changes delivered, integrated verification, exceptions and waivers,
-and decisions needed. Submitting it freezes a content-addressed aggregate bundle
-that pins the constituent task-round digests and the run-baseline patch; read it
-with `docket bundle <run> orch`, and expect `docket status` to report that
-aggregate stale if a waived constituent is later reopened. In split mode, submit it for planner review in
-legacy runs and for reviewer review in `five-role-v1` runs. In combined
-mode, legacy submission records it as completed without a redundant
-self-handoff, while `five-role-v1` submission records it as submitted and it
-becomes terminal only through a reviewer decision. An `executor: orchestrator`
-task behaves the same way: `submitted` in `five-role-v1`, `completed` in
-legacy.
+Fill `orch-report-NN.mdx` (executive summary, task outcomes, changes
+delivered, integrated verification, exceptions and waivers, decisions needed).
+Submitting freezes a content-addressed aggregate bundle pinning constituent
+digests and the run-baseline patch; read it with `docket bundle <run> orch`,
+and expect
+`docket status` to report staleness when a waived constituent reopens. In
+split mode submit for planner review (legacy) or reviewer review
+(`five-role-v1`); in combined mode legacy records `completed` without
+self-handoff while `five-role-v1` records `submitted` until a reviewer
+decides. An `executor: orchestrator` task matches: `submitted` in
+`five-role-v1`, `completed` in legacy.
 
 ## Prompt rendering
 
-Dispatch binds the prompt bytes for the run workflow, role, and stage; the
-stage is derived from lifecycle documents and never supplied as authority.
-A `five-role-v1` run and a `legacy` run do not receive identical prompts
-where authority differs: five-role keeps reviewer-owned approval while legacy
-keeps its completion shortcuts. A missing required input refuses rendering
-with a diagnostic naming the artifact, and dispatch still records its binding
-with the digest explicitly unavailable. Replacement implementors read the
-latest ready handoff only; when none is ready the prompt labels recovery as
-mechanical and directs targeted rediscovery. Mandatory material is never
-truncated. Optional guidance lives under a token budget covering profile,
-cards, headers, and separators; zero selects nothing and an oversized first
-card is skipped. Model matching is exact and one-run defaults are removed;
-unknown models receive only task-relevant cards. The digest record carries
-workflow, stage, renderer revision, and every source revision.
+Dispatch binds prompt bytes for workflow, role, and derived stage; stage is
+never supplied as authority. Five-role and legacy prompts differ where
+authority differs. Missing inputs refuse with a naming diagnostic while
+dispatch records the binding with digest unavailable. Replacements read only
+the latest ready handoff, else mechanical recovery with targeted rediscovery.
+Mandatory material is never truncated; optional guidance lives under a token
+budget (zero selects nothing, oversized first cards skip). Model matching is
+exact with no one-run defaults; unknown models get only task-relevant cards.
+The digest record carries workflow, stage, renderer, and source revisions.

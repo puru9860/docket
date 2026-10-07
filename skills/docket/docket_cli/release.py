@@ -22,7 +22,7 @@ from .baselines import evidence_digest
 from .bundles import (
     BUNDLE_VERSION, baseline_roots, bundle_dir, bundle_objects, bundle_problems,
     bundles_for, check_frozen_digest, digest_of, freeze_record, latest_bundle, load_bundle,
-    owner_bundles, source_tree,
+    owner_bundles, pinned_trees, private_git, private_git_env, source_tree,
 )
 from .state import list_amendments, list_incidents, state_of
 from .aggregates import aggregate_bundle_problems
@@ -450,14 +450,81 @@ def pinned_bundle_entries(d: Path, digests: list[str]) -> list[tuple[str, dict]]
     return pinned
 
 
+def needed_store_objects(d: Path, pinned: list[tuple[str, dict]]) -> set[str] | None:
+    """Object SHAs a release needs: every tree its pinned bundles pin, expanded.
+
+    Each pinned bundle names top trees per root; `ls-tree` expands them to the
+    blobs and subtrees a rebuild reads. Commits stay in user history and are
+    never needed here. None means unknown (fall back to a full copy); an empty
+    set means no Git trees are pinned, so nothing needs copying.
+    """
+    needed: set[str] = set()
+    for owner, entry in pinned:
+        manifest = load_bundle(d, owner, entry)
+        if not manifest:
+            return None
+        trees = pinned_trees(manifest)
+        if not trees:
+            continue
+        baseline = manifest.get("baseline", {})
+        roots = baseline.get("roots", []) if isinstance(baseline, dict) else []
+        by_alias = {str(r.get("alias", "")): r for r in roots if isinstance(r, dict)}
+        for alias, ids in trees.items():
+            record = by_alias.get(alias, {})
+            if not record.get("git_dir"):
+                return None
+            needed.update(ids)
+            env = private_git_env(d, record, "release-needs.index")
+            for tree in ids:
+                code, out, _ = private_git(env, root(), "ls-tree", "-r", "-t", "-z", tree)
+                if code:
+                    return None
+                for item in out.decode(errors="surrogateescape").split("\0"):
+                    fields = item.split("\t", 1)[0].split(" ") if item else []
+                    if len(fields) == 3 and fields[1] != "commit":
+                        needed.add(fields[2])
+    return needed
+
+
+def copy_needed_objects(objects: Path, dest: Path, needed: set[str] | None) -> bool:
+    """Copy only needed loose objects; True when the selective copy is complete.
+
+    Pack files are never selective: any non-trivial pack falls back to a full
+    copy so integrity cannot silently shrink. None means unknown needs and
+    also falls back; an empty set is a complete copy of nothing.
+    """
+    if needed is None:
+        return False
+    for pack in (objects / "pack").glob("*.pack"):
+        try:
+            if pack.stat().st_size > 0:
+                return False
+        except OSError:
+            return False
+    dest.mkdir(parents=True, exist_ok=True)
+    for sha in sorted(needed):
+        src = objects / sha[:2] / sha[2:]
+        if not src.is_file():
+            continue
+        target = dest / sha[:2] / sha[2:]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, target)
+        except OSError:
+            return False
+    return True
+
+
 def stage_bundle_dependencies(staging: Path, d: Path,
                               pinned: list[tuple[str, dict]]) -> None:
-    """Copy every pinned bundle and the object store it reconstructs from.
+    """Copy every pinned bundle and only the objects it reconstructs from.
 
     The release carries each pinned round directory, a ledger filtered to
-    exactly the pinned entries, and the run-private Git object store, so
-    bundle and integration validation never reads mutable `.bundles` after
-    freeze. Names, modes, symlinks, and bytes travel together.
+    exactly the pinned entries, and the reachable slice of the run-private Git
+    object store, so bundle and integration validation never reads mutable
+    `.bundles` after freeze. A selective copy that cannot prove completeness
+    falls back to the whole store; integrity never shrinks to save space.
+    Names, modes, symlinks, and bytes travel together.
     """
     owners_seen: dict[str, list[dict]] = {}
     for owner, entry in pinned:
@@ -473,7 +540,10 @@ def stage_bundle_dependencies(staging: Path, d: Path,
                      {"version": BUNDLE_VERSION, "entries": entries})
     objects = bundle_objects(d)
     if objects.is_dir():
-        copy_release_tree(objects, staging / "bundles" / "objects")
+        needed = needed_store_objects(d, pinned)
+        selective = copy_needed_objects(objects, staging / "bundles" / "objects", needed)
+        if not selective:
+            copy_release_tree(objects, staging / "bundles" / "objects")
     # The private reconstruction environment creates these directories on
     # demand; staging them here keeps the frozen release byte-stable when it
     # is validated again.

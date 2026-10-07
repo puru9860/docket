@@ -12,18 +12,24 @@ from .common import ACTING_ROLES, STATE_DIR, die, stamp
 from .frontmatter import checkbox_items, parse, render, sections, set_section
 from .paths import _ordered, decisions, handoffs, latest, owners, reports, root, scope_path
 from .publication import publish, publish_json
-from .policy import authority_for, is_five_role
+from .policy import authority_for, is_five_role, is_quick_milestone, is_tiered
 from .roots import declared_roots, resolve_scope, split_qualified
 from .locks import owner_lock_held
+from .bundles import digest_of as _bundle_digest_of
+from .bundles import latest_bundle as _latest_bundle
+from .bundles import load_bundle as _load_bundle
+from .bundles import bundle_problems as _bundle_problems
+from .baselines import evidence_digest as _evidence_digest
 
 
 def seed_report_acceptance(d: Path, owner: str, rep: Path | None = None) -> bool:
-    """Copy the task's acceptance criteria into a report still holding the template.
+    """Refresh only acceptance and launch fields still carrying Docket's seed.
 
     The gate requires the report's criteria to match the task's exactly, and a
     worker retyping them is the commonest way to fail it; seeded unchecked
     boxes leave the worker only the honest part, checking what passes. Only an
-    untouched placeholder is replaced, so nothing a worker wrote is overwritten.
+    Seed digests track the exact section Docket wrote. An edited section is
+    never replaced when a task amendment changes its criteria.
     """
     if owner == "orch":
         return False
@@ -32,8 +38,9 @@ def seed_report_acceptance(d: Path, owner: str, rep: Path | None = None) -> bool
     if rep is None or not rep.is_file() or not task.is_file():
         return False
     try:
-        meta, body = parse(rep.read_text())
-        _, task_body = parse(task.read_text())
+        original = rep.read_text()
+        meta, body = parse(original)
+        task_meta, task_body = parse(task.read_text())
     except (OSError, ValueError):
         return False
     if meta.get("status", "draft") != "draft":
@@ -43,14 +50,35 @@ def seed_report_acceptance(d: Path, owner: str, rep: Path | None = None) -> bool
                 if "<!--" not in item]
     current = sections(body).get("Acceptance", "")
     written = [item for item in checkbox_items(current) if "<!--" not in item]
-    if not criteria or "- [ ] <!-- TODO -->" not in current or written:
-        return False
-    comment = re.search(r"<!--.*?-->", current.replace("- [ ] <!-- TODO -->", ""), re.S)
-    seeded = "\n".join(f"- [ ] {item}" for item in criteria)
-    body = set_section(body, "Acceptance",
-                       (comment.group(0) + "\n\n" if comment else "") + seeded)
-    publish(rep, render(meta, body))
-    return True
+    changed = False
+    seed_digest = str(meta.get("seeded_acceptance_digest", ""))
+    untouched = bool(seed_digest and seed_digest == hashlib.sha256(current.encode()).hexdigest())
+    initial = "- [ ] <!-- TODO -->" in current and not written
+    if criteria and (initial or untouched):
+        comment = re.search(r"<!--.*?-->", current.replace("- [ ] <!-- TODO -->", ""), re.S)
+        seeded = "\n".join(f"- [ ] {item}" for item in criteria)
+        body = set_section(body, "Acceptance",
+                           (comment.group(0) + "\n\n" if comment else "") + seeded)
+        current = sections(body).get("Acceptance", "")
+        meta["seeded_acceptance_digest"] = hashlib.sha256(current.encode()).hexdigest()
+        changed = True
+        if initial:
+            meta["seeded_harness"] = str(meta.get("harness", ""))
+            meta["seeded_requested_model"] = str(meta.get("requested_model", ""))
+    for field, marker in (("harness", "seeded_harness"),
+                          ("requested_model", "seeded_requested_model")):
+        if marker in meta and meta.get(field, "") == meta[marker]:
+            updated = str(task_meta.get(field, ""))
+            if updated != meta.get(field, ""):
+                meta[field] = updated
+                meta[marker] = updated
+                changed = True
+    if changed:
+        updated = render(meta, body)
+        if updated != original:
+            publish(rep, updated)
+            return True
+    return False
 
 
 def normalized_scope(meta: dict[str, str]) -> list[str]:
@@ -82,8 +110,102 @@ def paths_overlap(left: str, right: str) -> bool:
     )
 
 
+def quick_submitted_pass(d: Path, member: str, rnd: int) -> bool:
+    """A current submitted round has an intact, passing task-gate bundle."""
+    if not is_quick_milestone(d):
+        return False
+    try:
+        entry = _latest_bundle(d, member, rnd)
+        if not entry or _bundle_problems(d, member, entry):
+            return False
+        frozen = _load_bundle(d, member, entry)
+        if not isinstance(frozen, dict) or (frozen.get("verification") or {}).get("status") != "passed":
+            return False
+        task_revision = _bundle_digest_of((d / f"{member}-task.mdx").read_bytes())
+        if (frozen.get("contract") or {}).get("revision") != task_revision:
+            return False
+        report = d / f"{member}-report-{rnd:02d}.mdx"
+        _, body = parse(report.read_text())
+        return (frozen.get("report") or {}).get("body_digest") == _evidence_digest(body)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _tiered_settled_local(d: Path, member: str) -> bool:
+    """Whether a tiered run treats this member as settled, read without later modules.
+
+    Uses only modules before state in MODULES (policy, bundles, baselines,
+    frontmatter, paths), so the import-order test holds. A settled round is
+    submitted with resolved verification for its current round and evidence.
+    """
+    if not is_tiered(d):
+        return False
+    try:
+        rnd, st = state_of(d, member)
+    except (OSError, ValueError):
+        return False
+    if st != "submitted" or not rnd:
+        return False
+    if is_quick_milestone(d):
+        return quick_submitted_pass(d, member, rnd)
+    try:
+        plan_text = (d / "plan.mdx").read_text()
+        exempt_raw = parse(plan_text)[0].get("verifier_exempt", "")
+        exempt = {item.strip() for item in exempt_raw.split(",") if item.strip()}
+    except (OSError, ValueError):
+        exempt = set()
+    if member in exempt:
+        return True
+    try:
+        latest = _latest_bundle(d, member)
+    except (OSError, ValueError):
+        return False
+    digest = str((latest or {}).get("digest", "")) if latest else ""
+    if not digest:
+        try:
+            rep = d / f"{member}-report-{rnd:02d}.mdx"
+            digest = _evidence_digest(rep.read_text()) if rep.is_file() else ""
+        except (OSError, ValueError):
+            return False
+    if not digest:
+        return False
+    try:
+        task_bytes = (d / f"{member}-task.mdx").read_bytes()
+        contract_rev = _bundle_digest_of(task_bytes)
+    except OSError:
+        contract_rev = ""
+    try:
+        found = verification_paths(d, member, rnd)
+    except (OSError, ValueError):
+        return False
+    matched: list[dict[str, str]] = []
+    for path in found:
+        try:
+            meta, _ = parse(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if digest and str(meta.get("bundle_digest", "")) != digest:
+            continue
+        if contract_rev and str(meta.get("contract_revision", "")) != contract_rev:
+            continue
+        matched.append(meta)
+    if not matched:
+        return False
+    newest = matched[-1]
+    return (newest.get("result") == "pass"
+            and newest.get("opened_correction") not in ("yes", "requested"))
+
+
 def scope_collisions(d: Path, owner: str, proposed: list[str]) -> list[str]:
-    """Overlapping writers, compared root-qualified so distinct checkouts stay distinct."""
+    """Overlapping writers, compared root-qualified so distinct checkouts stay distinct.
+
+    Accepted scope stays owned through verification and the review boundary, so
+    releasing an execution slot never releases scope by itself. Under the tiered
+    policy a verifier-settled round additionally releases its scope for
+    sequencing: the verifier settled it for dispatch while the milestone verdict
+    still decides approval. A correction reopens with a fresh baseline and
+    reclaims its scope the same way any dispatch does.
+    """
     collisions: list[str] = []
     terminal = {"approved", "waived", "completed"}
     roots = declared_roots(d)
@@ -91,6 +213,11 @@ def scope_collisions(d: Path, owner: str, proposed: list[str]) -> list[str]:
     for other in owners(d):
         if other in (owner, "orch") or state_of(d, other)[1] in terminal:
             continue
+        try:
+            if _tiered_settled_local(d, other):
+                continue
+        except (OSError, ValueError):
+            pass
         other_files: list[str] = []
         other_task = d / f"{other}-task.mdx"
         if other_task.is_file():
@@ -529,6 +656,8 @@ def derive_stage(d: Path, owner: str) -> str:
         except (OSError, ValueError):
             last_verdict = ""
     if status == "submitted":
+        if is_quick_milestone(d):
+            return "review" if quick_submitted_pass(d, owner, rnd) else "verification"
         paths = _ordered(d.glob(f"{owner}-verification-*.mdx"))
         resolved = False
         for path in paths:

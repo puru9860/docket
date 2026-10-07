@@ -38,6 +38,73 @@ with something cleverer.
 - **Sessions die.** A file-based run survives a killed session, a compacted context, and
   a machine restart. In-memory coordination does not.
 
+## Peer discussions
+
+`docket discuss` is an independent file protocol for brainstorming, feedback,
+and second opinions. The user's current harness session is the invoker; one
+visible peer session participates across Claude Code, Codex, or OpenCode.
+It does not create a coding run, assign roles, capture Git, or bypass any gate.
+
+```
+.docket/conversations/<id>/
+  discussion.mdx          immutable topic, briefing, requested harness/model, turn cap
+  participants/invoker.mdx current invoker session and generation
+  participants/peer.mdx   current peer session and generation
+  messages/000001.mdx     immutable attributed reply and lifecycle state
+  .prompts/peer.txt       rendered launch guidance; the caller starts the harness
+  .delivery/*-receipt.json generation-bound receipt cursor
+  .delivery/*-announce.json bounded announcement lease
+  .locks/run.lock         serializes message allocation, controls, joins, and delivery
+```
+
+The original briefing is sequence 0. Each message records its sender kind
+(`agent` or `human`), participant, recipient, session generation, harness metadata,
+reply sequence, predecessor digest, and status in flat frontmatter. The newest
+message's status is lifecycle truth, or `open` from the original document before
+the first reply. There is no separate state JSON. Readers validate contiguous
+sequence numbers and predecessor digests, refusing a missing or altered historical
+predecessor. APIs never rewrite earlier messages; content that a local user edits
+outside Docket is not authenticated. Conversation directories are private because
+briefings and replies can carry private session context.
+
+Agents alternate turns and every reply names the current sequence under the lock.
+A stale reply refuses rather than overwriting or silently answering old context.
+One agent's proposal is accepted only by the other agent against that exact latest
+proposal. Acceptance records `concluded`, not coding approval. A turn cap records
+`paused`, never agreement; an accepting reply can still settle the last proposal
+at that cap. A user interruption appends a pause even when already paused at
+the cap, invalidating the latest proposal for acceptance; later replies refuse.
+It does not kill a running harness call. The invoker or human can append new direction
+with `--continue`, preserving the earlier conclusion and opening another phase
+with a fresh allowance. The peer cannot auto-continue past the cap. A permanent
+`closed` discussion requires a new ID for later work.
+
+Participants join from their own harness session, pinning a proven process ID,
+start identity, and native session when available. A replacement requires
+`--replace`, advances the generation, invalidates old receipt and announcement
+state, and refuses the old writer. Explicit session IDs support terminal use;
+the protocol is a trusted local-file convention, not authentication. Sender
+markers are rendered from metadata and `--read --json` separates envelopes from
+prose. A peer contribution never acquires human or coding reviewer authority.
+OpenCode auto-binding requires a unique running tool whose parsed literal Docket
+arguments exactly match the current invocation. Shell variables, compound or
+unparseable commands, unavailable records, and ambiguity use explicit registration
+rather than guessing the newest session in its shared database. Explicit startup
+session IDs are validated before creating a discussion or publishing its files.
+
+The native Stop hook selects only discussions bound to its proven current
+process/session, or an explicitly selected participant. It works without
+`DOCKET_ROLE` or `watch.conf`; coding supervisors multiplex their role events
+with their joined conversations. Hooks emit fixed metadata and pickup pointers,
+never peer prose. Announcement leases prevent concurrent duplicate wakes and
+allow recovery when a hook never delivers. Pickup prints the captured messages
+before publishing its generation-bound cursor. An authored reply from that
+generation also proves consumption of its predecessors. `--read` and `--list`
+remain inspection and touch no receipt or announcement. Blocking watchers cover
+harnesses without native hooks and retain the minimum useful wait window.
+Canonical launch and exchange guidance lives in `references/discussion.md`,
+available through `docket help discussion`.
+
 ## Data model
 
 ```
@@ -403,7 +470,7 @@ evidence, where resolved means a recorded `pass` or `uncertain` verdict or
 Every open lifecycle state wakes exactly the role that can move it, and `test_every_open_lifecycle_state_wakes_a_supervisor` holds that across both presets and both executors.
 Under `five-role-v1` review readiness means verified: the whole-run review batch and every closed batch, milestone or not, wait until each submitted member holds a resolved verification, and verdicts and findings are part of the identity.
 Readiness at submission woke a supervisor with nothing to route and no later event to wait for, so it polled until the verifier finished.
-A standard run routes that wake to the orchestrator, which sends verified work to the reviewer; a quick run routes it to the checker, which holds the review duty itself, and leaves the coordinator asleep.
+A standard run routes that wake to the orchestrator, which sends verified work to the reviewer. Old `combined-checker` quick runs route it to the checker; new quick runs wake the reviewer only after a milestone full-suite pass.
 An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, since five-role submission is never terminal for it; a blocked one wakes the reviewer directly, as a blocked aggregate does.
 A delegated task's block wakes the orchestrator first, since it may own the answer, but only the reviewer can settle the round, so the hand-off is durable: `docket route <run> --kind blocked --owner T01 --note TEXT` writes `.routes/T01-01-blocked.json`, the orchestrator's event retires, and the reviewer (the checker in quick) derives `T01:1:blocked-routed` carrying the note until a verdict moves the round.
 A message typed into the reviewer's session would sit behind a Codex poll for up to an hour, while a derived event ends `docket watch` at once.
@@ -447,13 +514,50 @@ The quick preset is the default for new runs, held in `MODE_NEW_RUN_DEFAULT`.
 Most runs have one clear outcome, and three sessions start and wait far more cheaply than five: every waiting supervisor is a session the harness re-enters with its whole context.
 The standard preset is selected with `--mode standard`.
 It uses workflow `five-role-v1` with `split` topology and five sessions: planner, orchestrator, implementor, verifier, reviewer.
-Its review policy is `independent-verifier-reviewer`, so a later reader can tell an independent verifier stood behind each decision.
-The quick preset is three roles for work with one clear outcome, established local verification, one writer, and no unresolved requirement or architecture decision.
-A coordinator combines planning and orchestration, an implementor implements, and a checker combines verification and review.
-It uses workflow `five-role-v1` with `combined` topology and review policy `combined-checker`.
-Quick merges duties through explicit recorded policy, never through `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut. A skipped verification may still be recorded in quick, but it cannot support an approval there either: the same rule refuses an approval over skipped evidence in every mode, and only a waiver accepts such work without claiming it passed.
-Every artifact a quick run produces records `review_policy: combined-checker`, so no reader can mistake a quick decision for one an independent verifier stood behind.
-Every place that names a role accepts the roles the active preset declares from one declaration: session, prompt, watch, events, inbox, arm, help, and the wake hook all advertise the union of acting roles, and quick coordinator and checker succeed in a quick run while they are rejected in a standard or legacy run with a diagnostic naming the run's actual preset. A role that does not apply fails visibly, never silently.
+New standard runs record `tiered-verifier-reviewer`. A verifier pass settles a task for
+capacity, scope reuse, and dependency dispatch, but never claims reviewer approval.
+The default `verifier_correction: allowed` lets a failing focused check open its own
+correction round. Existing runs that recorded `independent-verifier-reviewer` keep their
+per-task review policy and correction setting.
+A tiered correction takes a versioned correction baseline at dispatch; the earlier
+baseline and its reconstruction artifacts remain immutable, and frozen bundles retain
+the precise baseline they used.
+The new quick preset has three roles: planner, implementor, and reviewer. The planner
+owns the objective, constraints, task assignments, closed milestone membership, and
+each milestone's full-suite command before dispatch. The implementor coordinates the
+task work and runs focused task checks. There is no verifier session. An intact
+passing task bundle settles work for scope reuse and dispatch. The implementor runs
+the planner-declared full suite once per milestone with `docket batch --verify`;
+only then does the reviewer wake and approve the batch. A routed blocker can wake
+review once every unfinished peer has completed implementation or cannot dispatch
+because of dependencies, including a transitive dependency on that blocker. An
+independent runnable peer still completes its work before the reviewer wakes.
+The reviewer can waive the blocker or request a correction. Milestones execute in natural ID order (M1,
+M2, ...): a
+later milestone cannot dispatch until the preceding milestone has a valid
+full-suite pass and an intact reviewer approval. The implementor watches its
+own role for that approval or a correction after running the suite.
+Before an initial approval or reuse, a Git-backed quick milestone pass must match
+the live checkout as well as its frozen member bundles. After approval, its pinned
+source trees and output remain historical evidence while a later milestone edits
+the checkout. Reopening a waived member makes the old milestone decision stale;
+a fresh full-suite result and reviewer decision bind the new bundle, even when
+the reopened task is blocked and waived again and no member remains submitted.
+Readiness suppresses a terminal milestone only when the approval binds its
+current member bundles and full-suite digest. The old
+decision and transition remain under batch history. Batch approval checks every
+member's approval prerequisites while holding their locks, before it journals
+approval intent or applies any member decision. An old in-progress intent that
+published no member approval may be archived as abandoned when its evidence
+moves; one that already published approval still requires exact recovery.
+New quick runs use workflow `five-role-v1`, `split` topology, and review policy
+`quick-milestone-reviewer`. Existing quick runs recorded as `combined-checker` keep
+their coordinator, implementor, checker roles and their original authority.
+After every planned task has a terminal verdict and every milestone has an intact
+approved batch decision, the planner receives the run-complete event. New quick runs
+do not need an additional aggregate report or reviewer decision.
+Both quick policies keep the gate, exact bundle binding, and honest blocks. A skipped
+task check cannot support approval. A role that does not apply fails visibly.
 Both presets keep every invariant: scope claims, complete baselines, immutable content-addressed evidence, source-drift rejection, honest blocking, and decisions bound to exact bundle digests.
 The two-role quick variant is deferred: `--mode quick --agents 2` refuses explicitly and never silently produces the three-role preset.
 A run that outgrows quick records an explicit escalation request with `docket escalate-mode --reason TEXT`.
@@ -502,6 +606,12 @@ other obligation or risk that discovery reveals.
 
 Every prompt has one shape: the role contract, one metadata line (`stage | workflow | mode | review_policy`), the authority line, the task contract, the latest decision on a correction, the applicable obligations for verification, selected guidance, numbered steps, pointers, and one revisions line.
 The steps, rendered by `prompt_steps`, carry the run's real file paths and the exact commands for that role and stage with the `--as` identity the preset requires, so a worker can act on the prompt alone instead of reading its playbook first.
+`docket help <role> --run RUN --owner TASK` uses this same renderer without
+writing a prompt record; generic role help keeps the full reference, including
+historical policies. Implementor steps use submission as the captured final
+focused verification, with preflight when a baseline matters and additional
+checks for concrete risks or debugging, instead of requiring a duplicate manual
+run of the same command. The verification floor and milestone suite still apply.
 A contract field nobody stated is left out rather than rendered as `none`; `hard constraints` always appears so its absence is explicit.
 Reference prose is hard-wrapped for human editors, and `unwrap_markdown` joins it so each paragraph and list item is one line in prompts and in `docket help`, while fences, tables, and headings keep their bytes.
 Guidance-card triggers match at the start of a word, so a stem like `concurren` still selects while `input` no longer pulls in harness guidance and `lock` no longer fires on `block`.
@@ -526,7 +636,14 @@ When a role runs one of its own commands (`watch`, `arm`, `submit`, `verify`, `d
 Claude Code and Codex name their session in every command's environment (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
 OpenCode names only its process (`OPENCODE_PID`), so its session is the one whose running shell call, in OpenCode's own database, is this very command; newest-session guesses are wrong whenever several sessions are open.
 Variables inherited from an unrelated session are never trusted: the harness process must be an ancestor of the docket process (`CLAUDE_PID`, `OPENCODE_PID`, or a `codex` process).
-`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) and prints tokens per role; `--archive` also copies each transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the usage there, and the final aggregate verdict archives automatically.
+A session is noted for one role per run, the first it speaks for.
+A supervisor routinely runs commands on another role's behalf, arming the verifier or handing off a stuck implementor's task, and noting those would attribute its tokens to roles it never played; a command whose role differs from the session's `DOCKET_ROLE` is not noted either.
+`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) and prints tokens from the time the role first joined this run. Codex's cumulative counters subtract the last count before that boundary. `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the run-window usage there, and the final aggregate verdict archives automatically.
+When a worker records its actual model from inside its harness, the live
+dispatch also records that proven harness process identity. If a draft round
+still holds the dispatch 60 seconds after that process exits, `docket health`
+shows `stalled` and the orchestrator receives a worker-exited event. A resume
+clears the old process observation until the replacement records its model.
 `docket feedback --digest` then shows token usage by role across runs.
 Transcripts can hold secrets, so the copies stay in the user's own state directory with private permissions, never in the project; `DOCKET_SESSION_CAPTURE=off` disables noting sessions.
 
@@ -610,6 +727,15 @@ silent higher-tier spend. An initial `docket dispatch --model` outside the
 approved list is refused through that same open exception before any record is
 published, so an approved policy cannot be bypassed by a new dispatch.
 `docket resume` launches a new session too, so it is held to the policy in force now: a recorded model the plan no longer approves is refused, and `--model` names an approved replacement, recorded in `model_history` as a resume and read back as unobserved until `docket set-model` verifies it.
+For an active Codex draft whose current account window is exhausted,
+the orchestrator gets a derived limit event naming the next approved non-Codex fallback.
+`docket resume --on-limit --harness opencode|claude` selects that model without a
+planner amendment, checkpoints the previous session, binds the new session,
+and updates the task harness and requested model. A model with an obvious
+provider prefix must match the replacement harness. The command refuses a
+missing live limit, an unavailable approved fallback, or a round that is no
+longer draft. The worker is still launched by the orchestrator; Docket records
+and prompts the handover.
 Carrying the predecessor's model forward unchecked let a policy change be bypassed by resuming a correction round instead of dispatching it. Model
 policy has three states: absent means no `primary_model` and no
 `fallback_models`, and any model dispatches with one plain line stating the run
@@ -624,28 +750,49 @@ records bindings and never launches models: a new record reads
 `model_observed: unobserved` until `docket set-model` verifies the live
 harness, and dispatch output says it recorded a binding rather than that it
 started anything. Policy lives in flat plan frontmatter
-(`primary_model`, `fallback_models`, `max_concurrency`, `correction_limit`)
-or not at all - never nested. No numeric spend limit is enforced, because usage
-is not observable; missing cost and model
-telemetry reads `unknown`, with invocation counts only as a labelled proxy and
-never as a spend guarantee,
-and task sizing warns on guessed breadth without ever rejecting on file
+(`primary_model`, `fallback_models`, `max_concurrency`, `correction_limit`,
+`premium_models`, `token_budget`, `review_reserve`, per-role `<role>_model`,
+`<role>_effort` and `<role>_fallback_models`, per-provider
+`max_concurrency_<provider>`, and `high_risk_verifier_model`) or not at all -
+never nested. A role's effective chain is its own model (or the primary), then
+its own fallbacks, then the remaining run-wide fallbacks; a usage-limit
+fallback follows that chain.
+When a token budget is configured, new launches of the named premium models
+are refused once measured run usage reaches `token_budget - review_reserve`.
+The check runs before a premium dispatch, resume, or model switch; an ongoing
+session can consume more tokens, so this is an admission guard, not a hard
+account spend limit. If any noted session's usage is unavailable, the guard
+refuses a new premium launch. Missing cost and model telemetry reads `unknown`,
+and tokens are not a currency guarantee. The account-wide Codex usage reading
+also derives one planner wake per warning threshold and current reset window;
+the Stop hook can deliver that wake without a status poll.
+Task sizing warns on guessed breadth without ever rejecting on file
 count.
 
 Amendments version the contract. `docket propose-amendment` carries only the
 decision needed, conflicting constraints, evidence pointers, a recommended
 alternative, and impact; the planner accepts against the edited task, which
-records old and new revisions. Acceptance retires the affected dependents'
+records old and new revisions. On acceptance, seeded draft reports refresh
+their unchecked acceptance criteria and recorded harness and requested model
+from the edited task. The report stores flat seed markers and refreshes a
+field only when its live bytes still equal Docket's previous seed; authored
+acceptance or launch fields stay untouched. Acceptance retires the affected dependents'
 events and blocks their accepting verdicts until a fresh round reverifies the
 new contract, while unaffected tasks continue and delayed old-revision events
 cannot act.
+An accepted amendment records the exact frozen bundles it invalidated. A
+reviewer may cite that amendment on `decide --changes --amendment ID` for one
+of those bundles; the decision opens a fresh round without charging the
+implementation correction budget. A different bundle or an unaccepted ID
+cannot use that path.
 
 ## Review packets, release, and qualification
 
 `docket review-packet --role reviewer` assembles a self-contained packet for a
 fresh context: objective, per-task acceptance coverage with exact bundle,
-verification, and decision revisions plus stable acceptance IDs and evidence
-states, evidence deltas with root-qualified patches, the aggregate bundle with
+verification, and decision revisions plus stable acceptance IDs, full criterion
+wording, evidence pointers, states, and gaps from the frozen contract and report,
+evidence deltas with root-qualified patches, the aggregate bundle with
 its digest, root-qualified aggregate diff, and constituent pins when one exists,
 verifier findings, integration evidence, waivers, open stalls, escalations,
 pending amendments, and complete plan risks. The default packet selects only
@@ -661,7 +808,11 @@ a `--final` packet keep their current selection and behavior exactly. Evidence b
 toward roughly 1,000-2,000 estimated tokens. The substantive Findings body of
 every named verifier artifact, each complete waiver reason including its final
 qualification, every outstanding numbered required change, and every report's
-actual Decisions needed text are mandatory and are never shortened. A late
+actual Decisions needed text and complete acceptance wording are mandatory and
+are never shortened. Full frozen contract, report, and patch paths remain
+available when excerpts shrink. Reviewers read the complete relevant patches
+and changed tests and independently check material expectations; the packet is
+an index to that evidence. A late
 finding is rendered in the same order as the earlier findings, not discarded
 by a summary. When mandatory material alone exceeds the target, the packet
 states the overage and adds an explicit required-reading manifest naming the
@@ -728,6 +879,17 @@ The resulting qualification artifact is published to the live run only after the
 
 Operational usage accounting is kept separate from review judgment.
 `docket metrics` keeps approval counts from reviewer decisions, prompt renders as an invocation proxy and never proven model calls, wall time as the first-to-last artifact span, and delivery receipts and duplicates as observed.
+It also reads noted session transcripts to show other input, cached input, cache
+write, and output tokens separately, with run-level tokens per accepted task only
+when every noted session is measurable and every policy role has telemetry.
+Measured subsets remain visible without claiming a complete run total.
+Correction attempts and recorded resume
+launches show recovery effort beside that total. `docket feedback --add
+--category escaped-defect --task T01 --round 1 --evidence PATH` records a defect
+found after an applied approval or waiver; metrics counts these reports and says
+unreported defects are unknown. No monetary estimate is inferred from tokens.
+Compare tasks of similar recorded risk and complexity before using these
+measurements to change model policy; acceptance alone does not prove correctness.
 A required unknown stays unknown and never blocks ordinary verification; READY means ready for independent review, never approved. `delivery --qualify`
 exercises a real hook announcement, a SIGKILLed hook restart, a real
 claim/send/ack/retry round-trip with generation-reuse refusal, an
@@ -1082,7 +1244,13 @@ the durable pending event behind, and the next watcher re-announces the same
 actionable event once the announcement lease expires. An active lease suppresses
 duplicate wakes so concurrent watchers converge on one exit 2, and explicit
 inbox pickup stays claimable throughout.
-The watcher marks an announcement `delivered_at` only after writing its banner and immediately before exiting 2, and a delivered announcement is not re-announced while its identity holds.
+Native-hook output is an announcement, never proof of harness receipt. Each
+announcement pins the event revision and registered recipient generation.
+`docket pickup RUN --role ROLE` claims the announced events and acknowledges them
+for that recipient; only then is `received_at` recorded. Without receipt, a killed
+hook or failed forwarding step remains retryable after the announcement lease.
+An active, valid handling lease also suppresses a duplicate native wake. A manual
+`docket watch` retains its output contract and records `delivered_at` after printing.
 An event usually stays derived after delivery because another role is still working on it: the reviewer deciding a routed batch, an implementor answering a correction.
 Re-announcing it every lease period re-entered the supervisor every five minutes for news it had already acted on, which is polling by another name.
 An identity that moves is retired and re-derived by `sweep_role`, which removes the announcement, so a changed event still wakes.
@@ -1091,12 +1259,27 @@ A harness re-entry replays the whole session context, so how a supervisor waits 
 Claude Code waits for free through the Stop hook, or once per event through a background `docket watch`.
 Codex slices a blocking call into polls, each a full-context turn, capped per empty poll by `background_terminal_max_timeout`; its own awaiter agent sets that to an hour, and the signalling playbook tells supervisors to do the same.
 OpenCode blocks for the whole shell timeout and has no idle wake.
+A standard run on 2026-09-26 spent a Codex 5-hour window in 93 minutes on waiting alone: the orchestrator re-armed `docket watch --timeout 120` fifteen times, and the session the user launched the run from kept checking on it long after the handoff.
+Three mechanical guards came out of it.
+Inside a harness, `docket watch` refuses a `--timeout` under 590 seconds, OpenCode's longest useful window, because anything shorter only re-enters the model to start the same wait; the hook is exempt.
+Under Codex the watcher says whether the installed Stop hook serves the session or is inert because the session's own `DOCKET_ROLE` is missing, which is how that orchestrator lost its zero-cost wait: the playbook created its tab without the variable.
+And `docket status` tells a session that re-reads an unchanged status how many times it has, keyed by harness session under `.status-seen/`, which is not delivery state.
+When a Codex session plays or is assigned a role, `docket status` also shows the account's Codex usage windows, taking the highest use per current window across the newest local rollouts because one session can log a stale snapshot after newer ones.
+The launcher itself is a playbook rule, not a mechanism: when the user wants the planner on another harness, the session they spoke to starts it and ends its turn.
 Waiting on agent state (`herdr agent wait`) or timers instead of Docket events returns on idle transitions that need nobody, which is why the playbooks forbid it. `docket events <run> --role R --peek`
 derives the same list, marks each key `pending` or `delivered`, and writes
 nothing: it never creates, migrates, or appends a ledger, so repeated inspection
 cannot consume a wake. `status` and `doctor` touch no delivery state either.
 The native hook routes planner, orchestrator, verifier, and reviewer through the
 same foreground watcher with separate registrations and ledgers.
+It also routes the quick implementor. Arming from the role's harness session binds
+that session to the run and process generation; restarting requires arming again.
+Hooks select those bindings, never every same-role run in the workspace.
+`DOCKET_RUN=R01` narrows the binding; a comma-separated list explicitly selects
+several runs. `DOCKET_SESSION` selects an explicit transport registration created
+with `arm --session`. A terminal hook without a provable harness uses a single-run
+console fallback and refuses ambiguous armed runs. The hook resolves the nearest
+`.docket` ancestor just as the CLI does, including non-Git checkout parents.
 
 Events come from `derive_events(run_dir, role)`, a pure projection of lifecycle
 documents into records carrying key, destination role, workflow version, owner,
@@ -1146,6 +1329,34 @@ writes the same numbers instead of incrementing twice, and reconciliation retire
 readiness derived from the old generation. A frontier key carries the batch and
 generation while its revision carries the verification shape, so consumed
 frontiers retire on revision movement and unchanged frontiers stay stable.
+
+Under the tiered standard policy, `docket batch RUN --verify BID --command CMD` runs the
+full suite once after member verification resolves. Settled members derive
+`batch:<id>:verify-ready` for the orchestrator (the implementor in new quick),
+bound to member verification and current source. A held batch lock suppresses
+the event; a current result retires it. A failed result routes recovery to the
+runner, and only the reviewer receives the passing milestone review wake.
+The all-decided wake still starts the standard aggregate. An uncertain standard
+verifier verdict derives an immediate reviewer exception bound to its exact
+findings artifact and bundle, while dependencies, scope, and capacity remain held.
+Reviewer recovery events for interrupted decisions and granted correction budgets
+apply in both presets. A budget-refused reviewer correction preserves its draft,
+including command-line changes, so the grant can finish the original correction.
+Only the quick implementor derives `launch:reviewer`; standard retains the planner
+as launch owner. The existing registered inbox lease serializes launch pickup
+among sessions of the same role.
+The content-addressed batch verification
+stores complete stdout and stderr, the command, source identity, and member bundle digests
+in one private directory rename. A changed source or member invalidates the pass, and a
+failed or timed-out result routes to the orchestrator. The normal reviewer readiness wake
+waits for an intact passing batch result. `docket batch RUN --approve BID --as reviewer`
+records one milestone decision bound to that digest and applies each member approval
+through its ordinary evidence-bound transition. An interrupted group decision resumes
+from its journal; it never substitutes a later batch result for the one reviewed.
+In new quick runs the planner declares that exact command at `batch --create` and
+`batch --verify` uses it without accepting a different command from the implementor.
+The verified source tree is retained in Docket's private store and checked for
+availability, so approved milestone evidence remains reproducible after later edits.
 
 Execution health is derived separately from report lifecycle: `report=` is the
 lifecycle truth while `execution=` (running, idle-unsubmitted, awaiting-review,
@@ -1259,7 +1470,9 @@ Break these and the system stops being trustworthy.
       the report write are a single locked transition, and the verification is bound to
       the exact contract, report, scope, and consumed inputs it described. The freeze is
       handed the bytes that were verified and never re-reads a document after the drift
-      recheck.
+      recheck. A background submit child runs this same transition while its
+      short-lived caller returns; an inherited job lock prevents a retry from
+      launching a second verification until that child exits.
   24. Verification is captured whole - command, environment, source, model, timing,
       outputs, and parsed counts - and never reused across a changed identity. An
       accepting verdict binds to the frozen contract revision as well as the frozen
@@ -1307,7 +1520,16 @@ Stated plainly so nobody assumes otherwise.
 - **`events --peek` reports pending work but cannot acknowledge it.** Leased
   acknowledgement exists (`inbox --claim`, `events --ack/--retry`, `reconcile`).
   `watch` reconciles pending events and takes a bounded announcement lease before it appends the wake ledger.
-  An announcement that never reached the harness can be retried after lease expiry; a delivered wake is not repeated while its event identity is unchanged.
+  An unreceived native announcement can be retried after lease expiry; a received
+  wake is not repeated while its event identity and recipient generation hold.
+- **A native idle hook has a finite wait window.** After roughly eight hours with
+  no event it exits silently; the harness does not automatically re-arm an already
+  idle session. Longer unattended runs still require external session renewal.
+  Timer-driven model wakeups are not implemented as a substitute for event delivery.
+- **Historical session liveness can be unknown.** New session notes retain proven
+  harness process identity, and a dead supervisor derives a replacement-launch event
+  after the exit grace period. Historical notes without process evidence remain
+  unknown and conservatively suppress automatic duplicate launches.
 - **No `verify:` sanity check at scope submission.** Docket could warn when the first word
   of a discovered verification command is not resolvable in `sh`. It does not yet.
 - **Wake events are not authenticated.** A wake banner telling an agent to review and
@@ -1320,6 +1542,16 @@ The CLI is the stdlib-only package `skills/docket/docket_cli/`, one module per r
 `skills/docket/bin/docket` is a short launcher that imports the package and calls `main()`.
 Python recompiles a script it runs directly on every call, and compiling the CLI cost most of each call, so the launcher imports the package from bytecode instead.
 That bytecode is checked against each module's source hash, so an edit never runs stale code, and it lives under `PYTHONPYCACHEPREFIX` when set, otherwise `~/.cache/docket/pycache` (`XDG_CACHE_HOME` moves it), never beside the package, so a checkout docket measures gains no `__pycache__`.
+That guarantee covers the supported entry points (`bin/docket`, which sets the
+prefix before importing anything, and `tests/test.sh`, which exports
+`PYTHONPYCACHEPREFIX`). It cannot cover a bare `import docket_cli` without the
+variable set: Python compiles `docket_cli/__init__.py` before running any of
+its code, so exactly `docket_cli/__pycache__/__init__.*.pyc` can still land
+beside the package (a later import of the submodules is redirected once the
+package code runs). The same holds for a bare `pytest` run, whose collection
+can write `tests/__pycache__/` before `conftest.py` executes. Never run
+`py_compile` or `compileall` on skill files; use the supported entry points or
+set `PYTHONPYCACHEPREFIX` first.
 The package finds its own files through `SKILL_DIR` and re-invokes itself through `LAUNCHER`, both in `common`.
 
 `docket_cli/__init__.py` lists the modules in `MODULES`, lowest first, and that order is the dependency order: a module imports only from modules listed before it, with explicit `from .module import name` lines and no import cycle.
@@ -1349,14 +1581,16 @@ Tests that read the CLI's constants or source read every package module through 
 | `verification` | `task_env`, `parse_framework_counts`, `run_verification`, `execute_verify`, verify slots, `latest_reusable_verification`, `matching_verifications`, `current_round_digest` |
 | `templates` | `TEMPLATES` dict and `template()`, which honours per-project overrides |
 | `feedback` | `feedback_log_path`, `log_feedback`, `machine_feedback` |
+| `hook_config` | shared defensive Stop-hook recognition, local Codex JSON/TOML configuration, runtime skill-copy comparison |
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
+| `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |
 | `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
 | `liveness` | session registrations, `dispatch_liveness`, `round_dispatched`, `live_dispatches`, `reconcile_dispatches`, `dispatch_dependencies_unmet` |
 | `five_role` | `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `blocked_route`, `route_blocked`, `cmd_route`, `cmd_escalate_mode` |
 | `batches` | `verification_fragment`, `batch_ready`, `frontier_ready`, `cmd_batch` |
 | `events` | `derive_events`, `reviewer_verifier_events`, `review_scope_states`, `review_readiness_events` |
 | `delivery` | `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `announce_delivered`, `paused_flag`, `claim_event`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
-| `signalling` | `ledger_for`, `delivered_keys`, `cmd_arm`, `cmd_disarm`, `cmd_watch`, `cmd_events` |
+| `signalling` | `ledger_for`, `delivered_keys`, `cmd_arm`, `cmd_disarm`, `cmd_watch`, `cmd_events`, `cmd_pickup` |
 | `health` | `execution_health`, `latest_verify_text`, `cmd_health` |
 | `gate` | `gate_problems`, shared by `cmd_submit` and changed-evidence re-review; `placeholder_problems`, `task_intent_problems`, `task_criterion_ids`, `parse_evidence_table`, `evidence_artifact_problems`, `evidence_problems` |
 | `submission` | `submission_identity`, `drifted_inputs`, `cmd_submit` and `submit_locked` under `owner_lock` |
@@ -1366,7 +1600,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `qualification` | `worktree_identity`, `probe_boundary`, `fixed_notice`, `cmd_delivery_qualify`, `qualification_problems`, `cmd_delivery` |
 | `doctor` | `cmd_doctor` |
 | `playbooks` | `contracts_dir`, `load_contract`, `read_contract`, and `cmd_help`, which prints `references/*.md` |
-| `prompts` | `RENDERER_SOURCE_FUNCTIONS`, `package_namespace`, `renderer_revision`, `select_guidance`, `select_cards`, `compose_prompt`, `prompt_steps`, `cmd_prompt` |
+| `prompts` | `RENDERER_SOURCE_FUNCTIONS`, `package_namespace`, `renderer_revision`, `select_guidance`, `select_cards`, `compose_prompt`, `prompt_steps`, `cmd_prompt`, `cmd_role_help` |
 | `improvements` | `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
 | `suite` | `parse_suite_summary`, `parse_suite_streams`, `cmd_suite`, `resolve_suite_artifact`, `suite_problems` |
 | `metrics` | `cmd_metrics`, `run_artifact_span` |

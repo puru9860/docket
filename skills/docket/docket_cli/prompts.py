@@ -17,13 +17,15 @@ from .frontmatter import is_empty, parse, sections, stated, unwrap_markdown
 from .paths import _ordered, handoffs, latest, next_numbered, reports, root, scope_path
 from .publication import publish_exclusive
 from .policy import (
-    authority_for, is_five_role, mode_of, need_run, require_preset_role, run_policy,
-    submit_op_for, verifier_correction_allowed, workflow_of,
+    authority_for, high_risk_verifier_model, is_five_role, is_quick_milestone, is_tiered,
+    mode_of, need_run,
+    require_preset_role, role_effort, role_model, run_policy, submit_op_for,
+    verifier_correction_allowed, workflow_of,
 )
 from .bundles import digest_of
 from .state import (
     decide_as, derive_stage, group_numbered_items, latest_checkpoint, latest_verification,
-    raw_checkbox_lines, ready_handoff, state_of,
+    list_batches, raw_checkbox_lines, ready_handoff, state_of,
 )
 from .profiles import (
     PROFILE_TOKEN_BUDGET, estimate_tokens, list_cards, match_model_profile,
@@ -31,10 +33,23 @@ from .profiles import (
 )
 from .freeze import current_bundle
 from .gate import task_intent_problems
-from .playbooks import contract_path, load_contract, read_contract
+from .playbooks import cmd_help, contract_path, load_contract, read_contract
 
 
 PROMPT_STAGES = ("initial", "correction", "resume", "verification", "review")
+
+
+def cmd_role_help(a: argparse.Namespace) -> None:
+    """Expose active guidance through the renderer while keeping full references."""
+    if not a.run and not a.owner:
+        cmd_help(a)
+        return
+    if not a.run or not a.owner:
+        die("active guidance needs both --run RUN and --owner TASK (or orch)")
+    if a.role in ("signalling", "discussion"):
+        die(f"{a.role} help is shared across presets; use `docket help {a.role}`")
+    prompt, _ = compose_prompt(need_run(a.run), a.run, a.owner, a.role)
+    print(prompt, end="" if prompt.endswith("\n") else "\n")
 
 # These entry points render prompt bytes. renderer_revision follows their calls
 # into every package module, including selectors and shared readers, so a new helper
@@ -302,6 +317,11 @@ def applicable_verification_obligations(claim_text: str) -> tuple[str, str]:
 
 def workflow_authority(d: Path, workflow: str, role: str) -> str:
     """Workflow and mode authority, including quick's explicitly combined checker."""
+    if is_quick_milestone(d):
+        return ("Authority: quick milestone - the planner defines tasks and milestones; "
+                "the implementor coordinates "
+                "submissions; no verifier session runs; only the reviewer decides after "
+                "a milestone full-suite pass; " + f"role {role} keeps its own gate")
     if mode_of(d) == MODE_QUICK:
         return ("Authority: quick - five-role-v1 gates remain active; the checker session "
                 "performs verification and review as two recorded duties, never as an "
@@ -382,7 +402,7 @@ def rendering_problem(d: Path, run: str, owner: str, role: str, stage: str,
         if status not in ("submitted", "approved", "completed", "waived") \
                 and not (status == "blocked" and stage == "review"):
             return f"missing required artifact: submitted {owner} report for {stage} (found {status})"
-        if stage == "review" and status != "blocked":
+        if stage == "review" and status != "blocked" and not is_quick_milestone(d):
             # A blocked submission skips verification by design - the reviewer
             # decides the waiver on the stated question, not on a test run -
             # so no verification artifact may be demanded for it here.
@@ -461,17 +481,35 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
             ("discovery constraints", task_secs.get("Discovery constraints", "")),
             ("plan hard constraints", "" if plan_constraints == "none stated" else plan_constraints),
             ("plan risks", "" if plan_risks == "none" else plan_risks),
-            ("starting hints (advisory only)", task_secs.get("Starting hints", "")),
+            ("starting hints (advisory default, not a hard constraint)",
+             stated(task_secs.get("Starting hints", ""))),
+            ("files to read and quote", stated(task_secs.get("Files to read", ""))),
+            ("reuse this existing function", stated(task_secs.get("Reuse", ""))),
         ]
+        risk = str(task_meta.get("risk", "low") or "low").strip() or "low"
+        if risk not in ("low", "high"):
+            risk = "low"
         contract_lines = [
             f"run: {run} task: {owner} role: {role}",
             f"goal: {goal_text or 'none'}",
             "acceptance:",
             *([f"- {item}" for item in criteria] or ["- none"]),
+            f"risk: {risk}",
             f"hard constraints: {task_secs.get('Out of scope', '').strip() or 'none stated'}",
             *(f"{label}: {value.strip()}" for label, value in optional_fields
               if value.strip() and value.strip().lower() not in ("none", "none stated")),
         ]
+        if risk == "high" and role in ("verifier", "checker"):
+            strong = high_risk_verifier_model(d)
+            if strong:
+                contract_lines.append(f"high-risk verification model: {strong}")
+        if role in ("verifier", "checker", "reviewer"):
+            configured_model = role_model(d, role)
+            configured_effort = role_effort(d, role)
+            if configured_model:
+                contract_lines.append(f"{role} model: {configured_model}")
+            if configured_effort:
+                contract_lines.append(f"{role} effort: {configured_effort}")
         task_text = task_body + "\n" + str(task_meta.get("files", "")) + "\n" + str(task_meta.get("verify_hint", ""))
         claim_text = (goal_text + "\n" + "\n".join(criteria)).strip()
         source_task_rev = digest_of(task.read_bytes())
@@ -634,6 +672,18 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         guidance_section = "# Selected guidance\n\n" + "\n\n".join(guidance_blocks)
         parts.append(guidance_section)
     steps = prompt_steps(d, run, owner, role, eff_stage)
+    if role == "implementor" and is_quick_milestone(d):
+        milestone = next((str(batch.get("batch")) for batch in list_batches(d)
+                          if batch.get("milestone") and owner in batch.get("members", [])), "")
+        steps.append(
+            f"After every task in milestone {milestone} has submitted, run "
+            f"`docket batch {run} --verify {milestone} --as implementor`. "
+            f"Arm once with `docket arm {run} --role implementor`, then wait with "
+            f"`docket watch {run} --role implementor` for the reviewer approval or a "
+            "correction. Start the next milestone only after its approval wake. "
+            "See `docket help signalling` for the per-harness wait method.")
+    elif role in SUPERVISOR_WAIT_ROLES and not any("docket watch" in step for step in steps):
+        steps.append(supervisor_wait_step(run, role))
     if steps:
         steps.append(
             f"Last, record what docket itself cost you this round, or `none`: `docket feedback "
@@ -710,6 +760,22 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
     return prompt, info
 
 
+SUPERVISOR_WAIT_ROLES = ("planner", "orchestrator", "coordinator",
+                           "verifier", "reviewer", "checker")
+
+
+def supervisor_wait_step(run: str, role: str) -> str:
+    """One clear wait method for a supervising role.
+
+    Every supervisor waits the same way: one blocking `docket watch` for its
+    own role. Harness differences live in `docket help signalling`, never as a
+    second wait method in the prompt.
+    """
+    return (f"Wait with `docket watch {run} --role {role}`; "
+            "see `docket help signalling` for the per-harness table. "
+            "Do not wait on `herdr agent wait`, a sleep loop, or status polling.")
+
+
 def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[str]:
     """The exact commands and files one role needs for one stage, in order.
 
@@ -733,6 +799,32 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
 
     report = f"{rel}/{owner}-report-{rnd:02d}.mdx"
     decide_as = as_role("decide:approve")
+    if role == "reviewer" and is_tiered(d) and owner != "orch":
+        milestone = next((str(batch.get("batch")) for batch in list_batches(d)
+                          if batch.get("milestone") and batch.get("state") == "closed"
+                          and owner in batch.get("members", [])), "")
+        if status == "blocked":
+            blocked = (f"Milestone {milestone} has blocked work." if milestone
+                       else "The round is blocked: answer its Decisions needed question.")
+            return [f"{blocked} Read `docket bundle {run} {owner}` ",
+                    f"and decide changes or a waiver for {owner} with `docket decide {run} "
+                    f"{owner} --changes --as reviewer` or `docket decide {run} {owner} "
+                    "--waive --reason TEXT --as reviewer`."]
+        if milestone:
+            return [f"Read `docket review-packet {run} --role reviewer --batch {milestone}` ",
+                    f"and the complete frozen patches and changed tests for milestone {milestone}; "
+                    "check material expectations independently.",
+                    f"Approve the milestone once with `docket batch {run} --approve "
+                    f"{milestone} --as reviewer --reason TEXT`; request changes for an "
+                    f"affected task with `docket decide {run} {owner} --changes --as reviewer`."]
+        if is_quick_milestone(d):
+            return ["New quick runs finish when all planned milestones are approved."]
+        return [f"Task {owner} needs a closed milestone before approval. Ask the "
+                "orchestrator to define and close its milestone and capture the full-suite "
+                "pass; individual task approval is forbidden under this policy.",
+                f"Then review its frozen packet and approve the milestone with `docket "
+                f"batch {run} --approve BID --as reviewer --reason TEXT`. Request changes "
+                f"for this task with `docket decide {run} {owner} --changes --as reviewer`."]
     checker = mode_of(d) == MODE_QUICK and role == "checker"
     if checker:
         decide_as += " --reviewer checker"
@@ -755,8 +847,9 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
             if status == "blocked":
                 return [read, "The round is blocked: answer its Decisions needed question.",
                         *decide]
-            return [read, "Judge correctness, design, and integration from the contract, "
-                    "inspecting source wherever the evidence leaves doubt.", *decide]
+            return [read, "Read the complete relevant frozen patch and changed tests; "
+                    "judge correctness, design, and integration against independently "
+                    "checked material expectations.", *decide]
         verify_as = as_role("verify-record") + (" --verifier checker" if checker else "")
         steps = [
             read,
@@ -771,7 +864,7 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
             steps.append("Then review it as the second duty. " + decide[0])
         return steps
     if owner == "orch":
-        if role in ("orchestrator", "coordinator"):
+        if role in ("orchestrator", "coordinator") or (is_quick_milestone(d) and role == "implementor"):
             return [f"Fill every section of `{report}` from the decided task rounds.",
                     f"Submit with `docket submit {run} orch{as_role('submit:orchestrator')}`."]
         return []
@@ -780,23 +873,43 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
     finish = [
         f"Fill `{report}`: summary, files changed (every path `docket diff {run} {owner}` lists, "
         "earlier rounds included), the acceptance boxes (criteria exactly as "
-        "the task states them, each checked only when it genuinely passes), the verify command "
-        "with its real output, and decisions needed.",
+        "the task states them, each checked only when it genuinely passes), the registered "
+        "verify command and any observed output (or say submit will capture it), and decisions needed.",
         f"Submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
         f"write the question under Decisions needed and run `docket submit {run} {owner} "
         f"--blocked{submit_as}`. Never edit the report after submitting.",
     ]
+    task_path = d / f"{owner}-task.mdx"
+    if task_path.is_file():
+        task_meta = parse(task_path.read_text())[0]
+        if task_meta.get("verify") or task_meta.get("verify_hint"):
+            try:
+                declared_timeout = max(1, int(task_meta.get("verify_timeout", "900") or "900"))
+            except ValueError:
+                declared_timeout = 900
+            finish.append(
+                f"The declared verify may run for {declared_timeout} seconds. Allow at least "
+                f"{declared_timeout + 30} seconds for a synchronous submit, including its freeze. "
+                f"If your shell call has a shorter limit, use `docket submit {run} {owner}"
+                f"{submit_as} --background`; it returns while the full gate continues in a "
+                "separate process. Read the printed private log path and never start a second "
+                "submit while that job is running."
+            )
     if submit_op == "submit:orchestrator":
         if role not in ("orchestrator", "coordinator"):
             return []
-        return ["Implement inside the task's `files:` and run its verify command.", *finish]
+        return ["Implement inside the task's `files:`; submit captures its final verify command.", *finish]
     if role != "implementor":
         return []
     handoff = (f"Only if you must stop before submitting (your context is running out), run "
                f"`docket handoff {run} {owner}`, fill the checkpoint, then "
                f"`docket handoff {run} {owner} --submit`; a submitted round needs no handoff.")
-    build = (f"Run `docket preflight {run} {owner}`, implement only inside the accepted "
-             "files, and run the verify command.")
+    build = (f"Run `docket preflight {run} {owner}` when a before-change baseline matters, "
+             "then implement only inside the accepted files. Submission runs and freezes "
+             "the registered final verify once in a fresh process each round; run extra "
+             "checks for failures or concrete risks. Compare old and new behavior with "
+             "the same method on both sides when that comparison "
+             "is needed.")
     if stage == "correction":
         return [
             "Apply every required change listed above.",

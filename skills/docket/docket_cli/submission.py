@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
-from .common import COVERAGE_AVAILABLE, die
+from .common import COVERAGE_AVAILABLE, LAUNCHER, die, stamp
 from .frontmatter import parse, render, sections
-from .paths import latest, reports, scope_path
-from .publication import perturb, publish
+from .paths import latest, reports, root, scope_path
+from .publication import perturb, publish, publish_json
 from .policy import is_five_role, need_run, require_five_role, submit_op_for, topology
 from .baselines import baseline_path, evidence_mode, task_verify
 from .bundles import digest_of, source_identity
@@ -65,6 +69,11 @@ def drifted_inputs(d: Path, owner: str, rep: Path, verified: dict[str, str]) -> 
 def cmd_submit(a: argparse.Namespace) -> None:
     """The gate. A report becomes visible to the reviewer only if it passes here."""
     d = need_run(a.run)
+    if a.background:
+        return background_submit(a, d)
+    if not a.background_worker and background_submit_busy(d, a.owner):
+        die(f"{a.owner} has a background submit already running; wait for its result "
+            f"under {d / '.submit-jobs'} before retrying")
     slot = verify_slot_path(d, a.owner)
     if verify_slot_busy(slot):
         verify, _ = task_verify(d, a.owner)
@@ -77,6 +86,94 @@ def cmd_submit(a: argparse.Namespace) -> None:
     # leave a published report pointing at a bundle the ledger no longer retains.
     with owner_lock(d, a.owner):
         submit_locked(a, d)
+
+
+def background_submit_lock(d: Path, owner: str) -> Path:
+    return d / ".locks" / f"{owner}.submit-job.lock"
+
+
+def background_submit_busy(d: Path, owner: str) -> bool:
+    path = background_submit_lock(d, owner)
+    if not path.is_file():
+        return False
+    try:
+        with path.open("r") as holder:
+            try:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def background_submit(a: argparse.Namespace, d: Path) -> None:
+    """Launch the existing locked submit in an independent process session.
+
+    The child inherits this job lock through exec, so even a killed caller
+    cannot leave a gap in which a retry starts another verify command. The
+    child runs the ordinary submit path, holding owner_lock through verify,
+    freeze, ledger publication, and the report write.
+    """
+    lock_path = background_submit_lock(d, a.owner)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"background submit for {a.owner} is already running; "
+                  f"read {d / '.submit-jobs' / (a.owner + '.json')} for its log")
+            return
+        rep = latest(reports(d, a.owner))
+        if not rep:
+            die(f"no report for {a.owner} in {a.run}")
+        status = parse(rep.read_text())[0].get("status", "")
+        if status not in ("draft", "blocked"):
+            print(f"{rep.name} is already {status}; no background submit started")
+            return
+        slot = verify_slot_path(d, a.owner)
+        if verify_slot_busy(slot):
+            verify, _ = task_verify(d, a.owner)
+            die(verify_slot_refusal(slot, verify or "the registered verify command"))
+        job_dir = d / ".submit-jobs"
+        job_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(job_dir, 0o700)
+        log = job_dir / f"{a.owner}-{time.time_ns()}.log"
+        argv = [sys.executable, str(LAUNCHER), "submit", a.run, a.owner,
+                "--background-worker"]
+        if a.blocked:
+            argv.append("--blocked")
+        if a.skip_verify:
+            argv.append("--skip-verify")
+        if a.skip_verify_reason:
+            argv.extend(("--skip-verify-reason", a.skip_verify_reason))
+        if a.verify_timeout is not None:
+            argv.extend(("--verify-timeout", str(a.verify_timeout)))
+        if a.as_role:
+            argv.extend(("--as", a.as_role))
+        env = dict(os.environ, DOCKET_SESSION_CAPTURE="off")
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                child = subprocess.Popen(
+                    argv, cwd=root(), stdin=subprocess.DEVNULL,
+                    stdout=output, stderr=subprocess.STDOUT, env=env,
+                    start_new_session=True, pass_fds=(holder.fileno(),),
+                )
+        except BaseException:
+            log.unlink(missing_ok=True)
+            raise
+        publish_json(job_dir / f"{a.owner}.json", {
+            "owner": a.owner, "run": a.run, "pid": child.pid,
+            "started_at": stamp(), "log": str(log),
+        })
+        print(f"background submit started for {a.owner} (pid {child.pid}); "
+              f"the full gate continues after this call returns. Log: {log}")
+    finally:
+        # Do not unlock: the child inherited this open file description and
+        # keeps the lock until its whole submit transition exits.
+        holder.close()
 
 
 def submit_locked(a: argparse.Namespace, d: Path) -> None:

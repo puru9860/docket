@@ -26,6 +26,30 @@ def body_line_offset(text: str, body: str) -> int:
     return text[: len(text) - len(body)].count("\n") if body and text.endswith(body) else 0
 
 
+TRUNCATION_MARKERS = ("[truncated]", "truncated due to", "output truncated",
+                      "content truncated", "response truncated")
+
+
+def truncation_problems(body: str) -> list[str]:
+    """Refuse a report that ends abruptly instead of completing its sections.
+
+    Only clear truncation signals count: explicit markers, an unclosed code
+    fence, or a body ending with an ellipsis. Free-text prose is never
+    policed beyond these mechanical signals.
+    """
+    stripped = body.strip()
+    lowered = stripped.lower()
+    for marker in TRUNCATION_MARKERS:
+        if marker in lowered:
+            return [f"report looks truncated ({marker!r}): finish every section instead of submitting a cut-off body"]
+    if stripped.endswith(("...", "…")):
+        return ["report ends with an ellipsis: finish every section instead of submitting a cut-off body"]
+    # An unclosed fence leaves the rest of the report as quoted output.
+    if stripped.count("```") % 2:
+        return ["report has an unclosed code fence: close it before submitting"]
+    return []
+
+
 def placeholder_problems(body: str, pattern: re.Pattern = PLACEHOLDER, offset: int = 0,
                          quoted_sections: tuple[str, ...] = ()) -> list[str]:
     """One problem per line still holding a placeholder, at its line in the file.
@@ -121,7 +145,21 @@ def parse_evidence_table(body: str) -> tuple[list[dict[str, str]] | None, list[s
     text = sections(body).get("Evidence", "")
     if is_empty(text):
         return None, []
-    lines = [line for line in text.splitlines() if line.strip().startswith("|")]
+    # Quoted output is never the table: strip fenced blocks before looking for
+    # one, so pasted tool output in Evidence does not force table enforcement.
+    unfenced: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        marker = CODE_FENCE.match(line)
+        if marker:
+            fence = "" if fence and marker.group(1) == fence else (fence or marker.group(1))
+            continue
+        if fence:
+            continue
+        unfenced.append(line)
+    if is_empty("\n".join(unfenced)):
+        return None, []
+    lines = [line for line in unfenced if line.strip().startswith("|")]
     if len(lines) < 3:
         return [], ["'## Evidence' must hold a table with one row per acceptance criterion"]
     rows: list[dict[str, str]] = []
@@ -266,6 +304,7 @@ def gate_problems(
     except OSError:
         offset = 0
     problems.extend(placeholder_problems(body, PLACEHOLDER, offset, quoted_sections=("Acceptance",)))
+    problems.extend(truncation_problems(body))
 
     acc = secs.get("Acceptance", "")
     unchecked = [l.strip() for l in acc.splitlines() if re.match(r"^\s*-\s*\[\s*\]", l)]

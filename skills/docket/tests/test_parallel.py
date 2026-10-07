@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_file_location, spec_from_loader
 from pathlib import Path
@@ -90,6 +91,12 @@ class SuiteRunner(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_default_worker_count_uses_available_cpus(self) -> None:
+        runner = load(RUNNER, "docket_parallel_worker_count")
+        with patch.object(runner.os, "cpu_count", return_value=12):
+            self.assertEqual(12, runner.worker_count({}))
+            self.assertEqual(3, runner.worker_count({"DOCKET_TEST_JOBS": "3"}))
 
     def fixture(self, body: str, name: str = "test_fixture.py") -> None:
         header = "import os, subprocess, sys, tempfile, time, unittest\n" \

@@ -3,36 +3,21 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from .common import MODE_QUICK, STATE_DIR, SUPPORTED_HARNESSES, _has
+from .common import SKILL_DIR, STATE_DIR, SUPPORTED_HARNESSES, _has
 from .paths import root, run_dir
-from .policy import is_five_role, mode_of, topology
+from .policy import is_quick_milestone, run_policy
 from .evidence import git_argv, git_env
 from .state import ROLES, armed
 from .events import derive_events
 from .delivery import paused_flag
 from .qualification import probe_boundary
-
-
-def wake_hook_configured(path: Path, *, claude: bool) -> bool:
-    """Recognize a configured Stop command that actually runs docket's wake hook."""
-    try:
-        data = json.loads(path.read_text())
-        stops = data.get("hooks", {}).get("Stop", [])
-        return any(
-            hook.get("type") == "command"
-            and "docket/hooks/wake.sh" in str(hook.get("command", ""))
-            and (not claude or hook.get("asyncRewake") is True)
-            for item in stops if isinstance(item, dict)
-            for hook in item.get("hooks", []) if isinstance(hook, dict)
-        )
-    except (OSError, ValueError, AttributeError, TypeError):
-        return False
+from .hook_config import codex_hook_configuration, skill_copy_differences, wake_hook_configured
+from .sessions import codex_home
 
 
 def cmd_doctor(a: argparse.Namespace) -> None:
@@ -48,6 +33,22 @@ def cmd_doctor(a: argparse.Namespace) -> None:
     print(f"  [{ok if inrepo else warn}] inside a git repo"
           + ("" if inrepo else "  - no diff evidence; a run must declare"
                               " evidence_mode: documents-only"))
+
+    print(f"\nSkill files\n  [{ok}] running {SKILL_DIR}")
+    installed = Path.home() / ".agents" / "skills" / "docket"
+    if not (installed / "SKILL.md").is_file():
+        print(f"  [{warn}] no installed copy at {installed}")
+    elif installed.resolve() != SKILL_DIR.resolve():
+        try:
+            differences = skill_copy_differences(SKILL_DIR, installed)
+        except OSError as exc:
+            print(f"  [{warn}] installed/source comparison unavailable: {exc}")
+        else:
+            print(f"  [{warn if differences else ok}] installed copy {installed}: "
+                  + (f"differs in {len(differences)} runtime file(s)" if differences else "matches runtime files"))
+            if differences:
+                print("         " + ", ".join(differences[:5]))
+                print("         sync the whole validated skill after approval and active runs finish.")
 
     print("\nDispatch (how a supervisor launches and prompts a subordinate)")
     herdr = _has("herdr")
@@ -90,12 +91,18 @@ def cmd_doctor(a: argparse.Namespace) -> None:
         checked = ", ".join(label for _, label in claude_settings)
         print(f"  [{warn}] Stop hook (Claude) absent in {checked}"
               "  - see `docket help signalling`")
-    codex_settings = Path.home() / ".codex" / "hooks.json"
-    codex_label = "~/.codex/hooks.json"
-    wired_codex = wake_hook_configured(codex_settings, claude=False)
+    codex_config = codex_hook_configuration(codex_home())
+    codex_label = ", ".join(str(path).replace(str(Path.home()), "~", 1)
+                            for path in codex_config["locations"]) or str(
+                                codex_home() / "hooks.json").replace(str(Path.home()), "~", 1)
+    wired_codex = bool(codex_config["locations"] and codex_config["enabled"])
     print(f"  [{ok if wired_codex else warn}] Stop hook (Codex) "
           f"{'in' if wired_codex else 'absent in'} {codex_label}"
           + ("" if wired_codex else "  - see `docket help signalling`"))
+    if codex_config["locations"]:
+        print("         synchronous adapter configured; local hooks "
+              + ("enabled" if codex_config["enabled"] else "disabled")
+              + "; trust and effective overrides unknown; confirm in /hooks and test a wake.")
     role = os.environ.get("DOCKET_ROLE", "")
     print(f"  [{ok if role in ROLES else warn}] DOCKET_ROLE"
           + (f"={role}" if role in ROLES else " is unset - this session cannot consume wake events"))
@@ -108,17 +115,12 @@ def cmd_doctor(a: argparse.Namespace) -> None:
             present = {ro for r, ro in pairs if r == run}
             d = run_dir(run)
             try:
-                run_mode = mode_of(d) if d.is_dir() else ""
+                policy = run_policy(d) if d.is_dir() else None
             except SystemExit:
-                run_mode = ""
-            if run_mode == MODE_QUICK:
-                expected = {"coordinator", "checker"}
-            else:
-                expected = {"orchestrator"}
-                if d.is_dir() and topology(d) == "split":
-                    expected.add("planner")
-                if d.is_dir() and is_five_role(d):
-                    expected.update({"verifier", "reviewer"})
+                policy = None
+            expected = set(policy["role_sessions"].split(", ")) if policy else set()
+            if policy and not is_quick_milestone(d):
+                expected.discard("implementor")
             missing = expected - present
             if missing:
                 print(f"  [{warn}] {run} is missing role(s): {', '.join(sorted(missing))}")

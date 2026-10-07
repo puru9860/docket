@@ -13,6 +13,13 @@ provenance separate from independently derived expectations, exercise materially
 different inputs when the behavior depends on input, and state any unverified
 condition explicitly. A check that fails when the behavior is removed in an
 isolated copy is the minimum evidence that the check observes the claimed behavior.
+Look for sibling sites that share the defect, including another caller, mode, or
+path through the same behavior; either test them or explain why they differ.
+Prove existing behavior still works where the change could disturb it, with a
+focused regression assertion rather than an unchanged broad-suite result.
+Check side effects on things the change did not create, such as pre-existing
+files, records, sessions, and user data. A passing happy path does not prove
+those effects stayed within the task contract.
 
 ## offline-operation
 

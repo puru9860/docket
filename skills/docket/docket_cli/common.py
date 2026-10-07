@@ -32,6 +32,8 @@ MODE_NEW_RUN_DEFAULT = MODE_QUICK
 RECORDED_MODES = (MODE_STANDARD, MODE_QUICK, MODE_CUSTOM)
 REVIEW_INDEPENDENT = "independent-verifier-reviewer"
 REVIEW_COMBINED_CHECKER = "combined-checker"
+REVIEW_TIERED = "tiered-verifier-reviewer"
+REVIEW_QUICK_MILESTONE = "quick-milestone-reviewer"
 # One role declaration every caller reads. Logical five, quick two, and the
 # union all session, event, prompt, and help choices advertise. Per-run preset
 # checks then accept exactly the roles the active preset declares.

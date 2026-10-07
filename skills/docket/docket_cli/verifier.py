@@ -10,8 +10,8 @@ from .frontmatter import parse, render, sections
 from .paths import latest, next_numbered, reports
 from .publication import fault, publish, publish_exclusive
 from .policy import (
-    artifact_policy_fields, authority_for, is_five_role, need_run, require_five_role,
-    verifier_correction_allowed, workflow_of,
+    artifact_policy_fields, authority_for, high_risk_verifier_model, is_five_role, need_run,
+    require_five_role, task_risk, verifier_correction_allowed, workflow_of,
 )
 from .baselines import evidence_digest
 from .bundles import digest_of
@@ -61,6 +61,14 @@ def cmd_verify(a: argparse.Namespace) -> None:
         if status != "submitted" and interrupted is None:
             die(f"{rep.name} is {status}, not submitted; "
                 "verification records against the submitted round only")
+        if a.result == "pass" and task_risk(d, a.owner) == "high":
+            strong = high_risk_verifier_model(d)
+            if strong and (a.model or "").strip() != strong:
+                die(f"{a.owner} is high-risk: a pass counts only from the configured "
+                    f"stronger verifier model {strong!r}; record it with "
+                    f"`docket verify {a.run} {a.owner} --result pass --model {strong} "
+                    f"--as {a.as_role or 'verifier'}`. Failing or uncertain findings "
+                    "from any model stay recordable.")
         if interrupted is not None:
             finish_verifier_correction(a, d, rnd, interrupted)
             return
@@ -102,6 +110,10 @@ def cmd_verify(a: argparse.Namespace) -> None:
                     "bundle_digest": bundle_digest,
                     "opened_correction": "requested" if opening else "no",
                     **artifact_policy_fields(d)}
+            if (a.model or "").strip():
+                meta["verifier_model"] = (a.model or "").strip()
+            if (a.effort or "").strip():
+                meta["verifier_effort"] = (a.effort or "").strip()
             try:
                 publish_exclusive(path, render(meta, body))
             except FileExistsError:

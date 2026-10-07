@@ -3,7 +3,8 @@
 Lifecycle state is never proof of task completion. Submitted reports are the
 review handoff; ready partial-work checkpoints are resumable context only.
 
-Use a role-scoped watcher so the supervisor can idle without polling.
+Use a role-scoped watcher so each waiting role can idle without polling. In new
+quick runs this includes the implementor while a milestone is under review.
 
 ## Waiting without burning tokens
 
@@ -15,24 +16,42 @@ One `docket watch <run> --role "$DOCKET_ROLE"` returns exactly when something is
 | --- | --- |
 | Claude Code | Best: the Stop hook with `asyncRewake` below, which waits at zero token cost. Otherwise run `docket watch` as one background command (`run_in_background`) without a short `--timeout`; the model is re-entered only when it exits. A foreground call is capped at 10 minutes by the tool. |
 | Codex | Best: the Stop hook in `hooks/codex-hooks.json.example`, merged into `~/.codex/hooks.json` and trusted once in `/hooks`. When your turn ends it waits at no model cost and hands you the wake as your next prompt, so end your turn instead of starting a watcher. Without it: start `docket watch` once and keep waiting on that same command: pass the `yield_time_ms` that `docket watch` prints when it starts to every `write_stdin` and `wait` poll. With `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` that is 3600000: one poll then idles for up to an hour at no model cost and returns the moment the wake lands. Codex re-enters the model on every return, and its first yields come back after about 30 seconds whatever you pass, so only the long window keeps a wait to a few turns. |
-| OpenCode | Run `docket watch <run> --role R --timeout 590` with the shell tool's `timeout` at 600000 ms, its ceiling. The call blocks for the whole window, so waiting costs one turn per ten minutes; there is no idle wake. |
+| OpenCode | Run `docket watch <run> --role R --timeout 590` only in a terminal or adapter whose shell call can last at least 600 seconds. OpenCode `run` mode can cap a shell call at 120 seconds, which cannot host this foreground watch. Use a longer-lived terminal or delivery adapter for unattended supervision; a short retry loop burns a model turn on every return. |
+
+A planner can wake an armed supervisor with `docket instruct <run> --role
+reviewer --message TEXT`. The role handles the instruction and closes it with
+`docket instruct <run> --role reviewer --resolve <ID>`. The watcher returns
+as soon as the instruction event is derived. If text typed into a Codex pane
+waits behind a blocking tool call, send Escape to that pane, for example
+`herdr agent send-keys <agent> Escape`, so Codex can process the queued text.
 
 The watcher exits 0 silently when its timeout passes with nothing actionable; re-arm the same wait without narrating it.
+
+Inside a harness, `docket watch` refuses a `--timeout` under 590 seconds: a shorter window only returns to the model to start the same wait again.
+The hook is exempt, since its waits cost nothing.
+Under Codex the watcher also says whether the installed docket Stop hook serves this session or is inert because the session's own `DOCKET_ROLE` is missing or names another role.
+A session gets that variable only from the pane or tab that started it (`--env DOCKET_ROLE=<role>`), never from a prefix on one command.
+
+`docket status` names the same waste from the other side.
+When the calling session reads a status identical to the one it read last, the output says so and how many times it has been read unchanged.
+When a Codex session plays or is assigned any role, `docket status` also shows the account's Codex 5-hour and weekly usage, read from the newest local rollouts, and warns at 70% of the 5-hour window or 90% of the weekly one.
+Relay that warning to the user once: a Codex role stops mid-task when a window runs out, and moving roles to another harness is the user's call.
 
 Arm every role that waits. A role that is not armed is never woken by the hook.
 
 ```bash
-docket arm <run> --role coordinator   # quick (the default): the session you talk to
-docket arm <run> --role checker       # quick: every submitted round waits on it
+docket arm <run> --role planner       # new quick and standard: objective and completion
+docket arm <run> --role implementor   # new quick: execution and milestone suite runs
+docket arm <run> --role reviewer      # new quick: milestone decisions
+docket arm <run> --role coordinator   # old combined-checker quick runs
+docket arm <run> --role checker       # old combined-checker quick runs
 docket arm <run> --role orchestrator  # standard
-docket arm <run> --role planner       # standard, split topology
 docket arm <run> --role verifier      # standard: submissions route promptly
-docket arm <run> --role reviewer      # standard: milestone batches and frontiers
 ```
 
 Every watching session must set `DOCKET_ROLE` to the one role it performs. The
 native hook (`hooks/wake.sh`) routes coordinator, checker, planner, orchestrator,
-verifier, and reviewer through the same foreground watcher; it is intentionally inert when the
+implementor, verifier, and reviewer through the same foreground watcher; it is intentionally inert when the
 variable is absent or names another role. This prevents a verifier submission
 from waking or acting as reviewer, and keeps every role's registration and
 ledger separate.
@@ -75,8 +94,20 @@ resolved `pass` or `uncertain` verification or exempt coverage.
 Under `five-role-v1` every review readiness wake means verified, not merely submitted.
 The whole-run review batch and every closed batch, milestone or not, wait until each submitted member holds a resolved verification, and the verdicts and findings are part of the event identity.
 A supervisor woken at submission would have nothing to route and no later event to wait for, so it would poll.
-In a standard run that wake goes to the orchestrator, which routes verified work to the reviewer.
-In a quick run it goes to the checker, which holds the review duty itself, and the coordinator is not woken for it.
+In tiered standard runs, settled batch members wake the orchestrator with
+`batch:<id>:verify-ready` to start the full suite. A running suite suppresses
+that event. A current failure wakes the orchestrator for recovery; a current
+pass wakes only the reviewer for milestone review. An uncertain verifier verdict
+wakes the reviewer immediately with its findings and frozen bundle identity,
+without releasing dependent work. Earlier independent-policy standard runs
+keep their review relay through the orchestrator.
+In a new quick run the reviewer wakes once a whole milestone has its full-suite pass.
+The implementor then waits for a milestone approval event before dispatching the
+next milestone, or for a correction event that needs its action.
+The quick implementor alone owns `launch:reviewer`; standard keeps that launch
+with the planner. Use the registered inbox claim before launching, so competing
+sessions of the same role cannot hold the launch lease together.
+Old `combined-checker` quick runs route ready work to the checker instead.
 An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, because five-role submission is never terminal for it either.
 
 Every correction wakes whoever must start it, and only until it starts.
@@ -90,10 +121,43 @@ It goes to the reviewer in five-role runs, including for a verifier-opened corre
 A verifier correction interrupted before its transition began wakes the reviewer as a failed verification whose correction did not finish.
 A transition whose owner lock is held is still running and derives nothing.
 
-A delivered wake stays delivered while its identity holds.
-The watcher marks an announcement delivered only after writing the banner and immediately before exiting 2.
+After a native hook wakes you, record receipt before acting:
+
+```bash
+docket pickup <run> --role "$DOCKET_ROLE"
+```
+
+Pickup claims and acknowledges the current announced events in one operation,
+bound to their revision and this recipient's registered session generation.
+Printing or forwarding a banner never records native receipt. If the hook dies,
+forwarding fails, or the session never picks up the announcement, it retries after
+the announcement lease. A received wake stays quiet while its identity holds.
+Manual watchers retain their output-based delivery contract.
 An event usually stays derived after delivery because another role is still working on it, and re-announcing it every lease period would be polling by another name, so it is not re-announced.
 An announcement that crashed before delivery is re-announced once its lease expires, and an event whose round, revision, role, workflow, or generation moves is retired and re-derived as a new wake.
+
+Arm each waiting role from its own harness session. Arming registers its run,
+role, and process generation; a restarted session must arm again. The native hook
+selects that recipient's runs. Set `DOCKET_RUN=R01` to narrow the binding or use
+an explicit comma-separated list for multi-run supervision. If harness detection
+is unavailable, `docket arm R01 --role reviewer --session reviewer-1` plus a
+session started with `DOCKET_SESSION=reviewer-1` uses the existing transport
+registry. Re-register that explicit ID when restarting. A terminal hook with no
+identity can serve one armed run, but refuses ambiguous same-role runs.
+The hook finds the nearest `.docket` ancestor when started in a subdirectory.
+
+`doctor` and the Codex wait hint share one detector. It accepts the Docket adapter,
+checks synchronous Codex behavior, honors `CODEX_HOME`, and reads `hooks.json` and
+inline `config.toml` hooks. Local configuration and enablement are evidence only:
+effective overrides and current trust remain unknown until confirmed in `/hooks`
+and a real wake. An async Codex handler cannot continue an idle turn.
+
+The native hook's wait expires after approximately eight idle hours. It then
+exits 0 without a continuation, so an already idle session is not automatically
+re-armed. Use external session renewal for longer unattended waits. Docket does
+not add timer-driven model wakeups to hide that harness limit. New session notes
+retain proven process identity so a dead supervisor can request a replacement
+launch after the exit grace period; old notes without that evidence stay unknown.
 
 `docket events <run> --role "$DOCKET_ROLE" --peek` inspects the same events without
 claiming them, so nothing is consumed and no ledger is created or migrated. Use it

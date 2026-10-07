@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+from datetime import datetime
 from pathlib import Path
 
-from .common import STATE_DIR, die, stamp
+from .common import STATE_DIR, die, now_s, stamp
 from .paths import read_dispatch, root
 from .publication import publish_json
 from .locks import owner_lock
-from .state import list_batches, state_of, task_depends_on
+from .policy import is_tiered, is_quick_milestone
+from .state import list_batches, quick_submitted_pass, state_of, task_depends_on
+from .verification import verifier_exempt_set as _verifier_exempt_set
+from .verification import current_round_digest as _current_round_digest
+from .verification import current_task_revision as _current_task_revision
+from .verification import matching_verifications as _matching_verifications
 
 
 def sessions_dir() -> Path:
@@ -40,6 +47,73 @@ def read_registration(sid: str) -> dict:
 
 
 TERMINAL_REPORT_STATES = {"approved", "waived", "completed"}
+WORKER_EXIT_GRACE_SECONDS = 60
+
+
+def worker_process_state(record: dict) -> str:
+    """Observed harness process health; unknown when no worker process was proven."""
+    process = record.get("worker_process") if isinstance(record, dict) else None
+    if not isinstance(process, dict):
+        return "unknown"
+    try:
+        pid = int(process.get("pid", 0) or 0)
+        noted = datetime.fromisoformat(str(process.get("noted_at", "")).replace(
+            "Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return "unknown"
+    if pid <= 0:
+        return "unknown"
+    if now_s() - noted < WORKER_EXIT_GRACE_SECONDS:
+        return "grace"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "exited"
+    except PermissionError:
+        return "alive"
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] == "Z" or (process.get("start") and fields[19] != process["start"]):
+            return "exited"
+    except (OSError, ValueError, IndexError):
+        pass
+    return "alive"
+
+
+def _tiered_settled_live(d: Path, member: str) -> bool:
+    """Whether a tiered run treats this member as settled, using allowed imports only.
+
+    Liveness sits after verification in MODULES, so it reads resolved verification
+    directly instead of importing the later batches module.
+    """
+    try:
+        if not is_tiered(d):
+            return False
+    except SystemExit:
+        return False
+    try:
+        rnd, st = state_of(d, member)
+    except (OSError, ValueError):
+        return False
+    if st != "submitted" or not rnd:
+        return False
+    if is_quick_milestone(d):
+        return quick_submitted_pass(d, member, rnd)
+    try:
+        if member in _verifier_exempt_set(d):
+            return True
+        digest = _current_round_digest(d, member, rnd)
+        contract_rev = _current_task_revision(d, member)
+        matched = _matching_verifications(d, member, rnd, digest, contract_rev)
+    except (OSError, ValueError):
+        return False
+    if not matched:
+        return False
+    _, vmeta, _ = matched[-1]
+    result = str(vmeta.get("result", ""))
+    if str(vmeta.get("opened_correction", "")) in ("yes", "requested"):
+        return False
+    return result == "pass"
 
 
 def dispatch_liveness(d: Path, record: dict) -> tuple[bool, str]:
@@ -75,6 +149,12 @@ def dispatch_liveness(d: Path, record: dict) -> tuple[bool, str]:
         return False, f"superseded: record round {rec_round} != current round {rnd}"
     if st in TERMINAL_REPORT_STATES:
         return False, f"round {rnd} {st}"
+    if st == "submitted":
+        try:
+            if _tiered_settled_live(d, owner):
+                return False, f"round {rnd} verification-settled for milestone review"
+        except (OSError, ValueError):
+            pass
     sess = str(record.get("session", ""))
     if sess:
         reg = read_registration(sess)
@@ -178,15 +258,31 @@ DEPENDENCY_MET_STATES = {"approved", "completed", "waived"}
 
 
 def dispatch_dependencies_unmet(d: Path, owner: str) -> list[str]:
-    """Task and batch dependencies that are not approved, completed, or waived yet."""
+    """Task and batch dependencies that are not settled yet.
+
+    Approved, completed, or waived work always satisfies a dependency. Under the
+    tiered policy a submitted predecessor with resolved verification also
+    satisfies it for dispatch: the verifier settled the round for sequencing,
+    while the milestone verdict still decides approval. Readiness is never
+    approval, and a settled input that later moves still withdraws readiness.
+    """
     terminal = DEPENDENCY_MET_STATES
+
+    def settled(dep: str) -> bool:
+        if state_of(d, dep)[1] in terminal:
+            return True
+        try:
+            return bool(_tiered_settled_live(d, dep))
+        except (OSError, ValueError):
+            return False
+
     unmet = []
     for dep in task_depends_on(d, owner):
-        if state_of(d, dep)[1] not in terminal:
+        if not settled(dep):
             unmet.append(f"{dep} ({state_of(d, dep)[1]})")
     for batch in list_batches(d):
         if owner in [str(m) for m in (batch.get("members") or [])]:
             for dep in ((batch.get("depends_on") or {}).get(owner) or []):
-                if state_of(d, str(dep))[1] not in terminal:
+                if not settled(str(dep)):
                     unmet.append(f"{dep} ({state_of(d, str(dep))[1]}) via batch {batch.get('batch')}")
     return sorted(set(unmet))

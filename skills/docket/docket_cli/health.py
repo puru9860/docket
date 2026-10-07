@@ -9,13 +9,15 @@ from pathlib import Path
 
 from .common import die, now_s, stamp
 from .frontmatter import parse
-from .paths import next_numbered, owners, planned_tasks, scope_path
+from .paths import next_numbered, owners, planned_tasks, read_dispatch, scope_path
 from .publication import publish_exclusive, publish_json
 from .policy import max_concurrency_of, need_run
 from .bundles import bundle_dir, latest_bundle, load_bundle
 from .locks import owner_lock
 from .state import handoff_state, incidents_dir, list_incidents, reopen_epoch, state_of
-from .liveness import live_dispatches
+from .liveness import live_dispatches, worker_process_state
+from .verification import write_checkpoint
+from .events import ensure_worker_exit_checkpoint
 
 
 HEALTH_UNKNOWN = "unknown"
@@ -54,7 +56,8 @@ def execution_health(d: Path, owner: str) -> tuple[str, str]:
 
     Agent `done` is never task approval: `report=` is the lifecycle truth and
     `execution=` is what the checkout appears to be doing. Quiet work is
-    healthy; only an explicit stall report opens an incident.
+    healthy. A proven harness process that exited after grace is shown as
+    stalled and derives an orchestrator wake; explicit flags still open incidents.
     """
     task = d / f"{owner}-task.mdx"
     if not task.is_file():
@@ -66,6 +69,8 @@ def execution_health(d: Path, owner: str) -> tuple[str, str]:
         return "done", f"round {rnd} {st}"
     if st in ("submitted", "blocked"):
         return "awaiting-review", f"round {rnd} {st}"
+    if st == "draft" and worker_process_state(read_dispatch(d, owner) or {}) == "exited":
+        return "stalled", f"round {rnd} worker process exited after grace"
     hn, hs = handoff_state(d, owner)
     if hs == "ready":
         return "stopped-recoverable", f"handoff {hn} ready for a replacement"
@@ -128,6 +133,11 @@ def cmd_health(a: argparse.Namespace) -> None:
                 die(f"could not flag a stall for {a.flag_stall}; retry the command")
             print(f"flagged stall {iid}: {cause}")
             print("One incident yields one recovery event until it is resolved or its generation changes.")
+            try:
+                checkpoint = write_checkpoint(d, a.flag_stall)
+                print(f"automatic checkpoint {checkpoint.name} for stalled {a.flag_stall}")
+            except (OSError, ValueError):
+                pass
         return
     if a.resolve_stall:
         path = incidents_dir(d) / f"{a.resolve_stall}.json"
@@ -154,6 +164,13 @@ def cmd_health(a: argparse.Namespace) -> None:
         if RATE_LIMIT_HINT.search(stdout_text + "\n" + stderr_text):
             hint = "  [hint] provider rate-limit text seen in verification output (not state)"
         print(f"  {owner:<8} report={st:<18} execution={exec_state:<20} {detail}{hint}")
+        if exec_state == "stalled":
+            try:
+                checkpoint = ensure_worker_exit_checkpoint(d, owner)
+            except (OSError, ValueError):
+                checkpoint = None
+            if checkpoint is not None:
+                print(f"  automatic checkpoint {checkpoint.name} for stalled {owner}")
     try:
         live = live_dispatches(d)
     except (OSError, ValueError):

@@ -12,11 +12,11 @@ from .common import (
 )
 from .profiles import PROFILE_TOKEN_BUDGET
 from .sessions import cmd_usage, note_command_session
+from .discussions import DISCUSSION_PARTICIPANTS, cmd_discuss
 from .models import cmd_feedback, cmd_models
 from .five_role import ROUTE_TABLE, cmd_escalate_mode, cmd_escalation, cmd_route
-from .batches import cmd_batch
 from .delivery import cmd_inbox, cmd_reconcile, cmd_session
-from .signalling import cmd_arm, cmd_disarm, cmd_events, cmd_watch
+from .signalling import cmd_arm, cmd_disarm, cmd_events, cmd_instruct, cmd_pickup, cmd_watch
 from .health import cmd_health
 from .submission import cmd_submit
 from .amendments import cmd_amendment, cmd_propose_amendment
@@ -24,8 +24,8 @@ from .transitions import cmd_decide
 from .verifier import cmd_verify
 from .qualification import cmd_delivery
 from .doctor import cmd_doctor
-from .playbooks import HELP_TOPICS, cmd_help
-from .prompts import cmd_prompt
+from .playbooks import HELP_TOPICS
+from .prompts import cmd_prompt, cmd_role_help
 from .improvements import cmd_improvements, cmd_retrospective
 from .suite import cmd_suite
 from .metrics import cmd_metrics
@@ -33,8 +33,9 @@ from .release import cmd_release
 from .packets import cmd_review_packet
 from .dispatch import cmd_dispatch, cmd_resume, cmd_switch_model
 from .commands import (
-    cmd_assign, cmd_bundle, cmd_depend, cmd_diff, cmd_handoff, cmd_init, cmd_migrate,
-    cmd_preflight, cmd_roots, cmd_scope, cmd_set_model, cmd_status, cmd_validate_task,
+    cmd_assign, cmd_batch_entry, cmd_bundle, cmd_depend, cmd_diff, cmd_handoff, cmd_init,
+    cmd_migrate, cmd_preflight, cmd_roots, cmd_scope, cmd_set_model, cmd_status,
+    cmd_validate_task,
 )
 
 
@@ -84,6 +85,41 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="docket", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    q = sub.add_parser("discuss", help="exchange attributed peer messages outside the coding lifecycle")
+    q.add_argument("discussion", nargs="?", help="stable discussion ID, e.g. C01")
+    g = q.add_mutually_exclusive_group()
+    g.add_argument("--start", action="store_true", help="create a discussion and peer launch prompt")
+    g.add_argument("--join", action="store_true", help="bind this harness session to a participant")
+    g.add_argument("--send", action="store_true", help="reply to the latest message")
+    g.add_argument("--propose", action="store_true", help="propose a conclusion for the peer to accept")
+    g.add_argument("--accept", type=int, metavar="N", help="accept the other agent's latest proposal")
+    g.add_argument("--pause", action="store_true", help="interrupt the discussion with a reason")
+    g.add_argument("--continue", dest="continue_discussion", action="store_true",
+                   help="continue a paused or concluded discussion with new direction")
+    g.add_argument("--close", action="store_true", help="close permanently with a summary or reason")
+    g.add_argument("--read", action="store_true", help="inspect the transcript without consuming messages")
+    g.add_argument("--pickup", action="store_true", help="read incoming messages and record receipt")
+    g.add_argument("--watch", action="store_true", help="wait for an incoming message; exits 2 on wake")
+    g.add_argument("--prompt", action="store_true", help="render a participant's launch or recovery prompt")
+    g.add_argument("--list", action="store_true", help="list discussions and their states")
+    g.add_argument("--watch-joined", action="store_true", help=argparse.SUPPRESS)
+    q.add_argument("--as", dest="as_participant", choices=DISCUSSION_PARTICIPANTS, default="")
+    q.add_argument("--session", default="", help="explicit session ID; otherwise identify this harness")
+    q.add_argument("--replace", action="store_true", help="replace an old participant session at join")
+    q.add_argument("--reply-to", type=int, metavar="N", help="latest transcript sequence, initially 0")
+    q.add_argument("--topic", default="", help="discussion topic")
+    q.add_argument("--purpose", choices=("feedback", "brainstorm", "second-opinion"), default="feedback")
+    text_input = q.add_mutually_exclusive_group()
+    text_input.add_argument("--message", default="", help="briefing, reply, or control reason")
+    text_input.add_argument("--message-file", default="", help="read exact message text from a file")
+    q.add_argument("--harness", choices=SUPPORTED_HARNESSES, default="", help="requested peer harness")
+    q.add_argument("--model", default="", help="requested peer model; never claimed as observed")
+    q.add_argument("--max-turns", type=int, default=12, help="agent turns per phase before pausing")
+    q.add_argument("--json", action="store_true", help="inspect structured message envelopes")
+    q.add_argument("--timeout", type=int, default=28800)
+    q.add_argument("--interval", type=int, default=5)
+    q.set_defaults(fn=cmd_discuss)
+
     q = sub.add_parser("init", help="scaffold a run and its plan")
     q.add_argument("run")
     q.add_argument("--harness", default="claude", choices=SUPPORTED_HARNESSES)
@@ -109,6 +145,9 @@ def main() -> None:
     q.add_argument("run")
     q.add_argument("owner", type=owner_argument, help="task id such as T03, or 'orch'")
     q.add_argument("--complexity", default="low", choices=["low", "high"])
+    q.add_argument("--risk", default="low", choices=["low", "high"],
+                   help="risk tier: high for concurrency, security, oracle-change, or "
+                        "harness-plumbing work needing stronger verification")
     q.add_argument("--executor", default="implementor", choices=["implementor", "orchestrator"])
     q.add_argument("--tier", choices=["small", "self"], help=argparse.SUPPRESS)
     q.add_argument("--harness", default="", choices=("", *SUPPORTED_HARNESSES),
@@ -129,10 +168,14 @@ def main() -> None:
     q.add_argument("--goal", default="", help="what must be true when the task is done")
     q.add_argument("--criterion", action="append", default=[], metavar="TEXT",
                    help="mechanically checkable acceptance criterion; repeat per criterion")
+    q.add_argument("--no-default-criteria", action="store_true",
+                   help="omit the standard sibling-site, regression, and side-effect criteria")
     q.add_argument("--out-of-scope", action="append", default=[], metavar="TEXT",
                    help="hard constraint the task must not cross; repeat per constraint")
     q.add_argument("--decision", action="append", default=[], metavar="TEXT",
                    help="decision already made that the implementor must follow; repeat")
+    q.add_argument("--as", dest="as_role", default="", choices=("", *ACTING_ROLES),
+                   help="acting role; new quick task assignments belong to the planner")
     q.set_defaults(fn=cmd_assign)
 
     q = sub.add_parser("validate-task", help="gate functional task intent before implementor discovery")
@@ -168,6 +211,9 @@ def main() -> None:
     q.add_argument("--skip-verify", action="store_true", help="skip the task's verify command")
     q.add_argument("--skip-verify-reason", default="", help="required audit reason when skipping verification")
     q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
+    q.add_argument("--background", action="store_true",
+                   help="run the full submit transition detached from a short harness shell call")
+    q.add_argument("--background-worker", action="store_true", help=argparse.SUPPRESS)
     q.add_argument("--as", dest="as_role", default="",
                    choices=("", *ACTING_ROLES),
                    help="acting role; required and enforced in five-role runs")
@@ -182,6 +228,10 @@ def main() -> None:
                    help="numbered defects or uncertainty, linked to evidence")
     q.add_argument("--verifier", default="",
                    help="verifier identity recorded in the artifact (default: verifier)")
+    q.add_argument("--model", default="",
+                   help="verifier model that ran the check, recorded as metadata")
+    q.add_argument("--effort", default="",
+                   help="verifier reasoning effort, recorded as metadata when supported")
     q.add_argument("--open-correction", action="store_true",
                    help="open a correction round from a failure under configured policy")
     q.add_argument("--as", dest="as_role", default="",
@@ -261,6 +311,8 @@ def main() -> None:
                    help="backfill cases from runs' artifacts (every run here when none named)")
     q.add_argument("--since", default="", help="only cases at or after this date")
     q.add_argument("--log", default="", help="read this log instead of the user-level one")
+    q.add_argument("--run", default="", metavar="RUN",
+                   help="per-run scorecard: only cases from this run")
     q.set_defaults(fn=cmd_models)
 
     q = sub.add_parser("escalation", help="grant an exhausted correction chain more rounds")
@@ -281,6 +333,8 @@ def main() -> None:
 
     q = sub.add_parser("improvements", help="list and advance the improvement backlog")
     q.add_argument("--add", action="store_true", help="record a cross-run finding")
+    q.add_argument("--from-feedback", default="", metavar="RUN/FID",
+                   help="promote a run observation into this project's backlog")
     q.add_argument("--title", default="", help="finding title, for --add")
     q.add_argument("--body", default="", help="finding detail, for --add")
     q.add_argument("--category", default="", help="filter, or category for --add")
@@ -373,6 +427,10 @@ def main() -> None:
     q.add_argument("--reason", default="", help="why the previous session stopped")
     q.add_argument("--model", default="",
                    help="approved model for the replacement session (default: the recorded one)")
+    q.add_argument("--on-limit", action="store_true",
+                   help="select the next approved fallback after Codex usage exhaustion")
+    q.add_argument("--harness", default="", choices=("", "claude", "codex", "opencode"),
+                   help="replacement harness for --on-limit; use a non-Codex provider")
     q.add_argument("--register", action="store_true",
                    help="register --session for this run and role first when it is new")
     q.set_defaults(fn=cmd_resume)
@@ -418,6 +476,9 @@ def main() -> None:
                    help="one required change for --changes; repeat for more. Each item is "
                         "numbered and the correction is applied in one call instead of "
                         "opening a draft first")
+    q.add_argument("--amendment", default="", metavar="ID",
+                   help="accepted requirement change that invalidated this frozen round; "
+                        "use with --changes to open an uncharged re-verification round")
     q.add_argument("--reviewer", default=None,
                    help=f"reviewer recorded in the decision artifact (default: {DEFAULT_REVIEWER})")
     q.add_argument("--re-review", action="store_true",
@@ -466,6 +527,16 @@ def main() -> None:
     q.add_argument("owner", type=owner_argument)
     q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
     q.set_defaults(fn=cmd_preflight)
+
+    q = sub.add_parser("instruct", help="wake a supervising role with a direct instruction")
+    q.add_argument("run")
+    q.add_argument("--role", required=True, choices=KNOWN_EVENT_ROLES,
+                   help="recipient role")
+    q.add_argument("--message", default="", help="instruction text")
+    q.add_argument("--resolve", default="", metavar="ID",
+                   help="close an instruction after handling it")
+    q.add_argument("--by", default="planner", help="issuing role, recorded for audit")
+    q.set_defaults(fn=cmd_instruct)
 
     q = sub.add_parser("watch", help="block until something needs you, then exit 2")
     q.add_argument("run", nargs="?")
@@ -523,7 +594,7 @@ def main() -> None:
                    help="role this session may claim and acknowledge")
     q.set_defaults(fn=cmd_session)
 
-    q = sub.add_parser("batch", help="create, close, and list explicit review batches")
+    q = sub.add_parser("batch", help="create, close, verify, and decide explicit review batches")
     q.add_argument("run")
     q.add_argument("--create", default="", metavar="ID",
                    help="open a batch with explicit membership (requires --members)")
@@ -536,8 +607,27 @@ def main() -> None:
                    help="this batch is an integration milestone for capable review")
     q.add_argument("--close", default="", metavar="ID",
                    help="close batch membership before dispatch")
+    q.add_argument("--verify", default="", metavar="ID",
+                   help="run the declared full-suite command once this batch is ready and "
+                        "freeze command, output, source, and member bundles (new quick uses "
+                        "the planner-declared --create command; standard requires --command)")
+    q.add_argument("--command", default="",
+                   help="the exact full-suite invocation: at --create in new quick, "
+                        "at --verify in standard")
+    q.add_argument("--timeout", default="900",
+                   help="abort the batch verify run after this many seconds, for --verify")
+    q.add_argument("--approve", default="", metavar="ID",
+                   help="record one milestone reviewer decision approving every submitted "
+                        "member, bound to the frozen full-suite pass")
+    q.add_argument("--reviewer", default=None,
+                   help="reviewer recorded in the milestone decision (default: reviewer)")
+    q.add_argument("--reason", default="",
+                   help="reviewer-authored milestone decision reason, frozen before approval")
+    q.add_argument("--as", dest="as_role", default="",
+                   choices=("", *ACTING_ROLES),
+                   help="acting role; milestone approval requires the reviewer")
     q.add_argument("--list", action="store_true", help="show this run's batches")
-    q.set_defaults(fn=cmd_batch)
+    q.set_defaults(fn=cmd_batch_entry)
 
     q = sub.add_parser("health", help="show execution health separately from report state")
     q.add_argument("run")
@@ -577,7 +667,14 @@ def main() -> None:
     q = sub.add_parser("arm", help="arm the watcher for a run and role")
     q.add_argument("run")
     q.add_argument("--role", required=True, choices=KNOWN_EVENT_ROLES)
+    q.add_argument("--session", default="", help="bind an explicit transport session; otherwise detect this harness")
     q.set_defaults(fn=cmd_arm)
+
+    q = sub.add_parser("pickup", help="receive native wakes for this registered session generation")
+    q.add_argument("run")
+    q.add_argument("--role", required=True, choices=KNOWN_EVENT_ROLES)
+    q.add_argument("--session", default="", help="explicit registered transport session")
+    q.set_defaults(fn=cmd_pickup)
 
     q = sub.add_parser("disarm", help="disarm a run/role, or everything")
     q.add_argument("run", nargs="?")
@@ -589,7 +686,10 @@ def main() -> None:
 
     q = sub.add_parser("help", help="print a role playbook")
     q.add_argument("role", choices=HELP_TOPICS)
-    q.set_defaults(fn=cmd_help)
+    q.add_argument("--run", default="", help="render guidance for this recorded run")
+    q.add_argument("--owner", type=owner_argument, default=None,
+                   help="task or orch for active run guidance")
+    q.set_defaults(fn=cmd_role_help)
 
     a = p.parse_args()
     note_command_session(a)
