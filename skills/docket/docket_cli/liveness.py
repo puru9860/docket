@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
-from .common import STATE_DIR, die, now_s, stamp
+from .common import DELIVERY_LEASE_SECONDS, STATE_DIR, die, now_s, stamp
 from .paths import read_dispatch, root
 from .publication import publish_json
 from .locks import owner_lock
@@ -18,6 +20,7 @@ from .verification import verifier_exempt_set as _verifier_exempt_set
 from .verification import current_round_digest as _current_round_digest
 from .verification import current_task_revision as _current_task_revision
 from .verification import matching_verifications as _matching_verifications
+from .batches import milestone_dependency_problem
 
 
 def sessions_dir() -> Path:
@@ -81,11 +84,7 @@ def worker_process_state(record: dict) -> str:
 
 
 def _tiered_settled_live(d: Path, member: str) -> bool:
-    """Whether a tiered run treats this member as settled, using allowed imports only.
-
-    Liveness sits after verification in MODULES, so it reads resolved verification
-    directly instead of importing the later batches module.
-    """
+    """Whether this submitted member's current verification settles execution."""
     try:
         if not is_tiered(d):
             return False
@@ -269,6 +268,8 @@ def dispatch_dependencies_unmet(d: Path, owner: str) -> list[str]:
     terminal = DEPENDENCY_MET_STATES
 
     def settled(dep: str) -> bool:
+        if milestone_dependency_problem(d, owner, dep):
+            return False
         if state_of(d, dep)[1] in terminal:
             return True
         try:
@@ -279,10 +280,76 @@ def dispatch_dependencies_unmet(d: Path, owner: str) -> list[str]:
     unmet = []
     for dep in task_depends_on(d, owner):
         if not settled(dep):
-            unmet.append(f"{dep} ({state_of(d, dep)[1]})")
+            unmet.append(milestone_dependency_problem(d, owner, dep)
+                         or f"{dep} ({state_of(d, dep)[1]})")
     for batch in list_batches(d):
         if owner in [str(m) for m in (batch.get("members") or [])]:
             for dep in ((batch.get("depends_on") or {}).get(owner) or []):
                 if not settled(str(dep)):
-                    unmet.append(f"{dep} ({state_of(d, str(dep))[1]}) via batch {batch.get('batch')}")
+                    unmet.append(milestone_dependency_problem(d, owner, str(dep))
+                                 or f"{dep} ({state_of(d, str(dep))[1]}) via batch {batch.get('batch')}")
     return sorted(set(unmet))
+
+
+def _seconds_between(earlier: str, later: str) -> float:
+    try:
+        return (calendar.timegm(time.strptime(later, "%Y-%m-%dT%H:%M:%SZ"))
+                - calendar.timegm(time.strptime(earlier, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def handoff_outcome(wake: dict[str, object]) -> str:
+    """How a missed handoff ended, in the words metrics and the retrospective share."""
+    if wake.get("open"):
+        return "still untaken"
+    if wake.get("taken"):
+        return f"taken {wake['taken']}"
+    return f"resolved {wake.get('resolved', '')} without a receipt"
+
+
+def missed_wakes(d: Path) -> list[dict[str, object]]:
+    """Wakes announced again before anything took them, oldest first.
+
+    An announcement is re-sent only after its lease lapsed with no receipt, so a
+    repeat with no receipt, claim, retirement, or re-derivation between is a
+    handoff that did not land: the role's session was busy, gone, or not
+    listening. `open` means nothing has taken it yet.
+    """
+    out: list[dict[str, object]] = []
+    root_dir = d / ".delivery"
+    for log in sorted(root_dir.glob("*/log.jsonl")) if root_dir.is_dir() else []:
+        role = log.parent.name
+        try:
+            lines = log.read_text().splitlines()
+        except OSError:
+            continue
+        current: dict[str, dict[str, object]] = {}
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            key, kind, at = str(entry.get("key", "")), entry.get("kind"), str(entry.get("at", ""))
+            if not key:
+                continue
+            if kind == "announced":
+                record = current.get(key)
+                if record is None:
+                    current[key] = {"role": role, "key": key, "first": at, "repeats": 0,
+                                    "last": at, "taken": "", "resolved": "", "open": True}
+                    continue
+                # Two watchers of one role announce together; only a repeat after
+                # the lease lapsed means the first announcement was not taken.
+                if _seconds_between(str(record["last"]), at) >= DELIVERY_LEASE_SECONDS * 0.8:
+                    record["repeats"] = int(record["repeats"]) + 1
+                record["last"] = at
+                continue
+            record = current.pop(key, None)
+            if record and int(record["repeats"]):
+                record["open"] = False
+                record["taken"] = at if kind in ("receipt", "claimed") else ""
+                record["resolved"] = at
+                out.append(record)
+        out += [r for r in current.values() if int(r["repeats"])]
+    return sorted(out, key=lambda r: str(r["first"]))

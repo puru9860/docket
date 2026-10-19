@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .docket/
 improvements/
+ui/node_modules/
+ui/test-results/

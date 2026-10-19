@@ -16,9 +16,11 @@ from datetime import datetime
 from pathlib import Path
 
 from .common import MODE_QUICK, now_s, stamp
-from .paths import root, run_dir
+from .frontmatter import parse
+from .paths import planned_tasks, root, run_dir
 from .publication import publish_json
 from .policy import is_quick_milestone, mode_of, need_run
+from .state import list_batches, state_of
 from .feedback import ensure_private_dir, feedback_log_path, log_feedback
 from .hook_config import codex_hook_configuration
 
@@ -33,7 +35,7 @@ from .hook_config import codex_hook_configuration
 
 HARNESS_SESSION_LEDGER = ".harness-sessions.jsonl"
 SESSION_ROLE_COMMANDS = ("watch", "arm", "feedback", "submit", "handoff", "verify", "decide",
-                         "assign", "dispatch", "resume", "batch", "release")
+                         "assign", "dispatch", "resume", "batch", "release", "session")
 
 
 def claude_config_dir() -> Path:
@@ -47,6 +49,32 @@ def codex_home() -> Path:
 def opencode_db() -> Path:
     base = os.environ.get("XDG_DATA_HOME", "").strip() or str(Path.home() / ".local" / "share")
     return Path(base) / "opencode" / "opencode.db"
+
+
+def opencode_default_model() -> str:
+    """The model a new OpenCode session starts on: the config's `model`, else the last one used."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME", "").strip() or Path.home() / ".config") / "opencode"
+    for name in ("opencode.json", "opencode.jsonc"):
+        try:
+            text = (config / name).read_text()
+        except OSError:
+            continue
+        # JSONC: drop comments and trailing commas; an unparseable file names no model.
+        text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", text,
+                      flags=re.S)
+        try:
+            model = json.loads(re.sub(r",(\s*[}\]])", r"\1", text)).get("model")
+        except (ValueError, AttributeError):
+            model = None
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    state = Path(os.environ.get("XDG_STATE_HOME", "").strip() or Path.home() / ".local" / "state")
+    try:
+        recent = json.loads((state / "opencode" / "model.json").read_text()).get("recent") or []
+        first = recent[0]
+        return f"{first['providerID']}/{first['modelID']}"
+    except (OSError, ValueError, AttributeError, IndexError, KeyError, TypeError):
+        return ""
 
 
 def process_ancestors(limit: int = 48) -> list[tuple[int, str]] | None:
@@ -100,6 +128,21 @@ def calling_harness() -> str:
     return ""
 
 
+def codex_app_server(pid: int) -> bool:
+    """Whether pid is a Codex app-server rather than a Codex window."""
+    try:
+        argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+        return b"app-server" in argv[1:]
+    except OSError:
+        pass
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "app-server" in args[1:]
+
+
 def harness_process_ref() -> dict[str, object]:
     """The calling harness process identity, when an ancestor proves the claim."""
     harness = calling_harness()
@@ -115,6 +158,10 @@ def harness_process_ref() -> dict[str, object]:
             continue
         if harness == "codex" and not comm.lower().startswith("codex"):
             continue
+        # Codex runs tools under one app-server shared by every Codex window; its
+        # pid names no session, and its parent is whichever window started it.
+        if harness == "codex" and codex_app_server(pid):
+            return {}
         start = ""
         try:
             start = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -142,6 +189,26 @@ def opencode_command_argv(command: str) -> list[str] | None:
             and Path(tokens[1]).name == "docket"):
         return tokens[2:]
     return None
+
+
+def _opencode_root(con: object, sid: str) -> str:
+    """The top-level session of a subagent session: the TUI the user sees.
+
+    A subagent's usage is already summed under its root, so noting the child as
+    its own session would count those tokens twice and hide whose they are.
+    """
+    import sqlite3
+    seen = {sid}
+    while True:
+        try:
+            row = con.execute("select parent_id from session where id = ?", (sid,)).fetchone()
+        except sqlite3.Error:  # an older schema without parent_id has no subagents
+            return sid
+        parent = str(row[0]) if row and row[0] else ""
+        if not parent or parent in seen or len(seen) > 64:
+            return sid
+        seen.add(parent)
+        sid = parent
 
 
 def opencode_running_session(needles: list[str], *, require_unique: bool = False,
@@ -183,7 +250,7 @@ def opencode_running_session(needles: list[str], *, require_unique: bool = False
                     matches = (opencode_command_argv(command) == command_argv
                                if command_argv is not None else all(needle in command for needle in needles))
                     if matches:
-                        candidate = (str(sid), str(version or ""))
+                        candidate = (_opencode_root(con, str(sid)), str(version or ""))
                         if not require_unique:
                             return candidate
                         if matched[0] and matched[0] != candidate[0]:
@@ -275,6 +342,8 @@ def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
     owner = str(getattr(a, "owner", "") or getattr(a, "task", "") or "")
     if a.cmd in ("watch", "arm"):
         return str(getattr(a, "role", "") or ""), ""
+    if a.cmd == "session":
+        return (str(getattr(a, "role", "") or "") if getattr(a, "register", False) else ""), ""
     if a.cmd == "feedback":
         return (str(a.role or ""), owner) if a.add else ("", "")
     quick = mode_of(d) == MODE_QUICK and not is_quick_milestone(d)
@@ -290,6 +359,10 @@ def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
         return explicit or ("checker" if quick else "verifier"), owner
     if a.cmd == "decide":
         return explicit or ("checker" if quick else "reviewer"), owner
+    if explicit:
+        return explicit, ""
+    if a.cmd == "batch" and getattr(a, "list", False):
+        return "", ""
     return ("coordinator" if quick else "implementor" if is_quick_milestone(d)
             else "orchestrator"), ""
 
@@ -297,6 +370,7 @@ def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
 def note_command_session(a: argparse.Namespace) -> None:
     """Record the calling harness session when a command speaks for a role."""
     a.harness_session_ref = None
+    a.harness_session_role = ""
     if a.cmd not in SESSION_ROLE_COMMANDS or not getattr(a, "run", ""):
         return
     try:
@@ -311,6 +385,7 @@ def note_command_session(a: argparse.Namespace) -> None:
     declared = os.environ.get("DOCKET_ROLE", "").strip()
     if role and (not declared or declared == role):
         a.harness_session_ref = note_harness_session(d, role, owner, [a.run, a.cmd])
+        a.harness_session_role = role if a.harness_session_ref else ""
 
 
 def run_harness_sessions(d: Path) -> list[dict[str, object]]:
@@ -373,10 +448,47 @@ def session_transcripts(ref: dict[str, object]) -> list[Path]:
         extra = mains[0].parent / sid
         return [mains[0], *sorted(p for p in extra.rglob("*") if p.is_file())]
     if ref.get("harness") == "codex":
-        home = codex_home()
-        found = sorted(home.glob(f"sessions/*/*/*/rollout-*-{sid}.jsonl"))
-        return (found or sorted(home.glob(f"archived_sessions/rollout-*-{sid}.jsonl")))[:1]
+        return codex_thread_shards(sid)
     return []
+
+
+def _codex_shard_thread(path: Path) -> str:
+    """The thread id a rollout's opening session_meta names, or ''."""
+    try:
+        with path.open(errors="replace") as fh:
+            for _ in range(8):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if record.get("type") == "session_meta" and isinstance(payload, dict):
+                    return str(payload.get("id", "") or "")
+    except OSError:
+        pass
+    return ""
+
+
+def codex_thread_shards(sid: str) -> list[Path]:
+    """Every rollout of one Codex thread, oldest first.
+
+    A resumed thread writes a new `rollout-<time>-<sid>_<shard>.jsonl`, often in a
+    later day's directory, whose cumulative token counter continues the original's.
+    Only a shard whose session_meta names this exact thread is accepted.
+    """
+    home = codex_home()
+    by_name: dict[str, Path] = {}
+    for base in ("sessions/*/*/*", "archived_sessions"):
+        for path in home.glob(f"{base}/rollout-*-{sid}.jsonl"):
+            by_name.setdefault(path.name, path)
+        for path in home.glob(f"{base}/rollout-*-{sid}_*.jsonl"):
+            if path.name not in by_name and _codex_shard_thread(path) == sid:
+                by_name[path.name] = path
+    # The name starts with the shard's creation time, so name order is time order.
+    return [by_name[name] for name in sorted(by_name)]
 
 
 def session_transcript_path(ref: dict[str, object]) -> str:
@@ -405,10 +517,16 @@ def session_transcript_path(ref: dict[str, object]) -> str:
     return str(files[0]) if files else ""
 
 
+USAGE_COUNTS = ("input", "cache_read", "cache_write", "output", "reasoning", "total")
+
+
 def empty_usage() -> dict[str, object]:
-    return {"found": False, "calls": 0, "input": 0, "cache_read": 0, "cache_write": 0,
-            "output": 0, "reasoning": 0, "total": 0, "cost": 0.0, "models": [],
-            "started": "", "ended": "", "harness_cwd": "", "transcript": ""}
+    """`telemetry` is `missing` without a transcript, `empty` when one holds no call
+    inside the window, and `measured` otherwise; only `measured` is a token count."""
+    return {"found": False, "telemetry": "missing", "calls": 0,
+            **{field: 0 for field in USAGE_COUNTS}, "cost": 0.0, "models": [], "by_model": {},
+            "started": "", "ended": "", "since": "", "until": "", "harness_cwd": "",
+            "transcript": ""}
 
 
 def _span(usage: dict[str, object], when: str) -> None:
@@ -417,16 +535,27 @@ def _span(usage: dict[str, object], when: str) -> None:
         usage["ended"] = max(str(usage["ended"]), when)
 
 
-def _in_run_window(when: str, since: str) -> bool:
-    if not since:
-        return True
-    if not when:
-        return False
+def _instant(when: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(when.replace("Z", "+00:00")) >= datetime.fromisoformat(
-            since.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
+        return datetime.fromisoformat(when.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _in_window(when: str, since: str, until: str = "") -> bool:
+    """`since` is inclusive and `until` exclusive; an empty bound is open."""
+    if not since and not until:
+        return True
+    moment = _instant(when) if when else None
+    if moment is None:
         return False
+    lower, upper = _instant(since) if since else None, _instant(until) if until else None
+    return (lower is None or moment >= lower) and (upper is None or moment < upper)
+
+
+def _call(when: str, model: str, counts: dict[str, int], cost: float = 0.0) -> dict[str, object]:
+    return {"at": when, "model": model, "cost": cost,
+            **{field: int(counts.get(field) or 0) for field in USAGE_COUNTS}}
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -445,82 +574,153 @@ def _jsonl(path: Path) -> list[dict]:
     return out
 
 
-def claude_session_usage(files: list[Path], since: str = "") -> dict[str, object]:
-    """Tokens from a Claude Code transcript and its subagents, one count per API message."""
-    usage = empty_usage()
-    counted: dict[str, dict] = {}
-    seen_messages: set[str] = set()
+def claude_calls(files: list[Path]) -> tuple[list[dict], list[str], str]:
+    """(calls, activity times, cwd) from a Claude Code transcript and its subagents."""
+    calls: dict[str, dict] = {}
+    times: list[str] = []
+    cwd = ""
     for path in (p for p in files if p.suffix == ".jsonl"):
         for record in _jsonl(path):
             when = str(record.get("timestamp", "") or "")
-            if not usage["harness_cwd"] and record.get("cwd"):
-                usage["harness_cwd"] = str(record["cwd"])
+            if not cwd and record.get("cwd"):
+                cwd = str(record["cwd"])
+            if when:
+                times.append(when)
             message = record.get("message")
             if record.get("type") != "assistant" or not isinstance(message, dict):
-                if _in_run_window(when, since):
-                    _span(usage, when)
                 continue
-            key = f"{path.name}:{message.get('id') or record.get('uuid')}"
-            if key in seen_messages:
-                continue
-            seen_messages.add(key)
-            if not _in_run_window(when, since):
-                continue
-            _span(usage, when)
             model = str(message.get("model", "") or "")
-            if not model or model.startswith("<"):
+            counts = message.get("usage")
+            if not model or model.startswith("<") or not isinstance(counts, dict):
                 continue
-            if model not in usage["models"]:
-                usage["models"].append(model)
-            if isinstance(message.get("usage"), dict):
-                counted[key] = message["usage"]
-    for counts in counted.values():
+            call = calls.setdefault(f"{path.name}:{message.get('id') or record.get('uuid')}",
+                                    _call(when, model, {}))
+            # A streamed API message repeats its usage on each content block, and the
+            # largest value of each field is the message's final count.
+            for field, source in (("input", "input_tokens"),
+                                  ("cache_write", "cache_creation_input_tokens"),
+                                  ("cache_read", "cache_read_input_tokens"),
+                                  ("output", "output_tokens")):
+                call[field] = max(int(call[field]), int(counts.get(source) or 0))
+    for call in calls.values():
+        call["total"] = sum(int(call[f]) for f in ("input", "cache_write", "cache_read", "output"))
+    return list(calls.values()), times, cwd
+
+
+CODEX_COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                  "output_tokens", "reasoning_output_tokens", "total_tokens")
+
+
+def codex_calls(files: list[Path]) -> tuple[list[dict], list[str], str]:
+    """(calls, activity times, cwd) from a Codex thread's rollouts, oldest shard first.
+
+    Codex logs a cumulative counter, so a call is the advance between two readings.
+    A repeated reading advances nothing and is not another call; a counter that
+    goes backwards started over.
+    """
+    calls: list[dict] = []
+    times: list[str] = []
+    cwd = ""
+    model = ""
+    previous: dict[str, int] = {}
+    when = ""
+    for record in (r for path in files for r in _jsonl(path)):
+        when = str(record.get("timestamp", "") or "") or when
+        if when:
+            times.append(when)
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if record.get("type") == "session_meta" and payload.get("cwd") and not cwd:
+            cwd = str(payload["cwd"])
+        if record.get("type") == "turn_context" and payload.get("model"):
+            model = str(payload["model"])
+        if not (record.get("type") == "event_msg" and payload.get("type") == "token_count"
+                and isinstance(payload.get("info"), dict)):
+            continue
+        counts = payload["info"].get("total_token_usage")
+        if not isinstance(counts, dict):
+            continue
+        current = {key: int(counts.get(key) or 0) for key in CODEX_COUNTERS}
+        if current["total_tokens"] < previous.get("total_tokens", 0):
+            previous = {}
+        delta = {key: max(0, current[key] - previous.get(key, 0)) for key in CODEX_COUNTERS}
+        previous = current
+        if not delta["total_tokens"]:
+            continue
+        cached, written = delta["cached_input_tokens"], delta["cache_write_input_tokens"]
+        calls.append(_call(when, model, {
+            "input": max(0, delta["input_tokens"] - cached - written), "cache_read": cached,
+            "cache_write": written, "output": delta["output_tokens"],
+            "reasoning": delta["reasoning_output_tokens"], "total": delta["total_tokens"]}))
+    return calls, times, cwd
+
+
+def opencode_calls(rows: dict[str, object] | None) -> tuple[list[dict], list[str], str]:
+    """(calls, activity times, cwd) from an OpenCode session and its subagent sessions."""
+    if not rows:
+        return [], [], ""
+    calls: list[dict] = []
+    times: list[str] = []
+    for message in rows["messages"]:
+        info = message["info"] if isinstance(message.get("info"), dict) else {}
+        created = (info.get("time") or {}).get("created")
+        if not isinstance(created, (int, float)):
+            continue
+        when = stamp(created / 1000)
+        times.append(when)
+        if info.get("role") != "assistant":
+            continue
+        tokens = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
+        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        parts = {"input": tokens.get("input"), "output": tokens.get("output"),
+                 "reasoning": tokens.get("reasoning"), "cache_read": cache.get("read"),
+                 "cache_write": cache.get("write")}
+        total = int(tokens.get("total") or 0) or sum(int(v or 0) for v in parts.values())
+        model = "/".join(str(v) for v in (info.get("providerID"), info.get("modelID")) if v)
+        calls.append(_call(when, model, {**parts, "total": total}, float(info.get("cost") or 0)))
+    return calls, times, str(rows["sessions"][0].get("directory", "") or "")
+
+
+def summarize_calls(calls: list[dict], times: list[str], since: str = "",
+                    until: str = "") -> dict[str, object]:
+    """Usage inside [since, until), with a per-model split taken call by call."""
+    usage = empty_usage()
+    usage["since"], usage["until"] = since, until
+    for when in times:
+        if _in_window(when, since, until):
+            _span(usage, when)
+    for call in calls:
+        if not _in_window(str(call["at"]), since, until):
+            continue
         usage["calls"] += 1
-        usage["input"] += int(counts.get("input_tokens") or 0)
-        usage["cache_write"] += int(counts.get("cache_creation_input_tokens") or 0)
-        usage["cache_read"] += int(counts.get("cache_read_input_tokens") or 0)
-        usage["output"] += int(counts.get("output_tokens") or 0)
-    usage["total"] = (usage["input"] + usage["cache_write"] + usage["cache_read"]
-                      + usage["output"])
+        usage["cost"] += float(call.get("cost") or 0)
+        for field in USAGE_COUNTS:
+            usage[field] += int(call[field])
+        model = str(call["model"])
+        if not model:
+            continue
+        if model not in usage["models"]:
+            usage["models"].append(model)
+        slot = usage["by_model"].setdefault(model, {"calls": 0, **{f: 0 for f in USAGE_COUNTS}})
+        slot["calls"] += 1
+        for field in USAGE_COUNTS:
+            slot[field] += int(call[field])
+    usage["telemetry"] = "measured" if usage["calls"] else "empty"
     return usage
 
 
-def codex_session_usage(files: list[Path], since: str = "") -> dict[str, object]:
-    """Tokens from the Codex cumulative count after the role joined the run."""
-    usage = empty_usage()
-    last: dict = {}
-    baseline: dict = {}
-    record_when = ""
-    for record in (r for path in files for r in _jsonl(path)):
-        record_when = str(record.get("timestamp", "") or "") or record_when
-        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        if record.get("type") == "session_meta" and payload.get("cwd"):
-            usage["harness_cwd"] = str(payload["cwd"])
-        if (record.get("type") == "event_msg" and payload.get("type") == "token_count"
-                and isinstance(payload.get("info"), dict)):
-            counts = payload["info"].get("total_token_usage")
-            if not _in_run_window(record_when, since):
-                if isinstance(counts, dict):
-                    baseline = counts
-                continue
-            usage["calls"] += 1
-            if isinstance(counts, dict):
-                last = counts
-        if not _in_run_window(record_when, since):
-            continue
-        _span(usage, record_when)
-        if record.get("type") == "turn_context" and payload.get("model"):
-            if payload["model"] not in usage["models"]:
-                usage["models"].append(str(payload["model"]))
-    def delta(key: str) -> int:
-        return max(0, int(last.get(key) or 0) - int(baseline.get(key) or 0))
-    cached = delta("cached_input_tokens")
-    written = delta("cache_write_input_tokens")
-    usage["input"] = max(0, delta("input_tokens") - cached - written)
-    usage["cache_read"], usage["cache_write"] = cached, written
-    usage["output"] = delta("output_tokens")
-    usage["reasoning"] = delta("reasoning_output_tokens")
-    usage["total"] = delta("total_tokens")
+def claude_session_usage(files: list[Path], since: str = "", until: str = "") -> dict[str, object]:
+    """Tokens from a Claude Code transcript and its subagents, one count per API message."""
+    calls, times, cwd = claude_calls(files)
+    usage = summarize_calls(calls, times, since, until)
+    usage["harness_cwd"] = cwd
+    return usage
+
+
+def codex_session_usage(files: list[Path], since: str = "", until: str = "") -> dict[str, object]:
+    """Tokens from a Codex thread's cumulative counter after the role joined the run."""
+    calls, times, cwd = codex_calls(files)
+    usage = summarize_calls(calls, times, since, until)
+    usage["harness_cwd"] = cwd
     return usage
 
 
@@ -676,55 +876,111 @@ def opencode_session_rows(sid: str) -> dict[str, object] | None:
     return {"sessions": sessions, "messages": messages}
 
 
-def opencode_session_usage(rows: dict[str, object] | None, since: str = "") -> dict[str, object]:
+def opencode_session_usage(rows: dict[str, object] | None, since: str = "",
+                           until: str = "") -> dict[str, object]:
     """Tokens summed over an OpenCode session's assistant messages, subagents included."""
-    usage = empty_usage()
-    if not rows:
-        return usage
-    usage["harness_cwd"] = str(rows["sessions"][0].get("directory", "") or "")
-    for message in rows["messages"]:
-        info = message["info"] if isinstance(message.get("info"), dict) else {}
-        created = (info.get("time") or {}).get("created")
-        when = stamp(created / 1000) if isinstance(created, (int, float)) else ""
-        if not _in_run_window(when, since):
-            continue
-        if isinstance(created, (int, float)):
-            _span(usage, when)
-        if info.get("role") != "assistant":
-            continue
-        tokens = info.get("tokens") if isinstance(info.get("tokens"), dict) else {}
-        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
-        usage["calls"] += 1
-        usage["input"] += int(tokens.get("input") or 0)
-        usage["output"] += int(tokens.get("output") or 0)
-        usage["reasoning"] += int(tokens.get("reasoning") or 0)
-        usage["cache_read"] += int(cache.get("read") or 0)
-        usage["cache_write"] += int(cache.get("write") or 0)
-        usage["total"] += int(tokens.get("total") or 0) or sum(
-            int(v or 0) for v in (tokens.get("input"), tokens.get("output"),
-                                  tokens.get("reasoning"), cache.get("read"), cache.get("write")))
-        usage["cost"] += float(info.get("cost") or 0)
-        model = "/".join(str(v) for v in (info.get("providerID"), info.get("modelID")) if v)
-        if model and model not in usage["models"]:
-            usage["models"].append(model)
+    calls, times, cwd = opencode_calls(rows)
+    usage = summarize_calls(calls, times, since, until)
+    usage["harness_cwd"] = cwd
     return usage
 
 
 def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path], object]:
-    """Usage, transcript files, and OpenCode rows for one noted session."""
+    """Usage inside the session's run window, transcript files, and OpenCode rows."""
     since = str(ref.get("first_seen", "") or "")
+    until = str(ref.get("until", "") or "")
     if ref.get("harness") == "opencode":
         rows = opencode_session_rows(str(ref.get("session_id", "")))
-        usage = opencode_session_usage(rows, since)
+        usage = opencode_session_usage(rows, since, until)
         usage["found"] = rows is not None
         usage["transcript"] = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
-        return usage, [], rows
-    files = session_transcripts(ref)
-    usage = (claude_session_usage if ref.get("harness") == "claude"
-             else codex_session_usage)(files, since)
-    usage["found"] = bool(files)
-    usage["transcript"] = str(files[0]) if files else ""
-    return usage, files, None
+    else:
+        files = session_transcripts(ref)
+        usage = (claude_session_usage if ref.get("harness") == "claude"
+                 else codex_session_usage)(files, since, until)
+        usage["found"] = bool(files)
+        usage["transcript"] = str(files[0]) if files else ""
+        return (usage if usage["found"] else {**usage, "telemetry": "missing"}), files, None
+    if not usage["found"]:
+        usage["telemetry"] = "missing"
+    return usage, [], rows
+
+
+# The planner reports the outcome, records feedback, and archives usage after the
+# last decision; a session's later activity belongs to whatever it did next.
+RUN_WRAP_UP_SECONDS = 900
+
+
+def run_completed_at(d: Path) -> float | None:
+    """When a finished run's last decision landed, or None while it is open.
+
+    Only bounds a usage window, so it reads decisions without revalidating the
+    evidence they bind; `run_complete_event` stays the authority for waking.
+    """
+    terminal = ("approved", "waived", "completed")
+    try:
+        if is_quick_milestone(d):
+            milestones = [batch for batch in list_batches(d) if batch.get("milestone")]
+            done = bool(milestones) and all(
+                (batch.get("milestone_decision") or {}).get("verdict") == "approved"
+                for batch in milestones) and all(
+                state_of(d, owner)[1] in terminal for owner in planned_tasks(d))
+        else:
+            done = state_of(d, "orch")[1] in terminal
+    except (OSError, ValueError):
+        return None
+    if not done:
+        return None
+    moments = [_instant(str((batch.get("milestone_decision") or {}).get("decided_at", "")))
+               for batch in list_batches(d)]
+    latest = max((m.timestamp() for m in moments if m is not None), default=0.0)
+    for path in d.glob("*-decision-*.mdx"):
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest or None
+
+
+def session_until(d: Path, ref: dict[str, object]) -> str:
+    """Where a session stops counting for this run: its run's end or its next run.
+
+    A role session kept open (or a TUI reused after /clear keeps its process) goes
+    on to other work, and counting that here would inflate a closed run.
+    """
+    bounds: list[float] = []
+    done = run_completed_at(d)
+    if done is not None:
+        # Feedback recorded for this run after its last decision is still its work.
+        closing = [done]
+        for path in d.glob("feedback/*.mdx"):
+            try:
+                observed = _instant(str(parse(path.read_text())[0].get("observed_at", "")))
+            except (OSError, ValueError):
+                continue
+            if observed is not None:
+                closing.append(observed.timestamp())
+        bounds.append(max(done + RUN_WRAP_UP_SECONDS, max(closing) + 60))
+    joined = _instant(str(ref.get("first_seen", "") or ""))
+    for ledger in d.parent.glob(f"*/{HARNESS_SESSION_LEDGER}"):
+        if ledger.parent == d:
+            continue
+        try:
+            lines = ledger.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("session_id") != ref.get("session_id") \
+                    or entry.get("harness") != ref.get("harness"):
+                continue
+            moment = _instant(str(entry.get("at", "") or ""))
+            if moment is not None and (joined is None or moment > joined):
+                bounds.append(moment.timestamp())
+    return stamp(min(bounds)) if bounds else ""
 
 
 def opencode_export(sid: str) -> bytes | None:
@@ -801,6 +1057,7 @@ def collect_run_usage(d: Path, archive: bool) -> list[dict[str, object]]:
     """Usage per noted session; archiving also copies transcripts and logs usage."""
     out = []
     for ref in run_harness_sessions(d):
+        ref = {**ref, "until": session_until(d, ref)}
         usage, files, rows = session_usage(ref)
         target = None
         if archive:
@@ -848,6 +1105,10 @@ def cmd_usage(a: argparse.Namespace) -> None:
             print(f"  {roles:<14} {task:<8} {r['harness']:<9} transcript not found "
                   f"for session {r['session_id']}")
             continue
+        if r.get("telemetry") == "empty":
+            print(f"  {roles:<14} {task:<8} {r['harness']:<9} no call inside the run window "
+                  f"({r.get('since') or 'start'} to {r.get('until') or 'now'}); unknown, not zero")
+            continue
         print(f"  {roles:<14} {task:<8} {r['harness']:<9} {r['calls']:>6} "
               f"{tokens_h(r['input']):>8} {tokens_h(r['cache_read']):>9} "
               f"{tokens_h(r['cache_write']):>9} {tokens_h(r['output']):>8} "
@@ -857,6 +1118,13 @@ def cmd_usage(a: argparse.Namespace) -> None:
         by_role.setdefault("+".join(r["roles"]) or "unknown", []).append(int(r["total"]))
     print("  by role: " + "; ".join(f"{role} {tokens_h(sum(v))} ({len(v)})"
                                     for role, v in sorted(by_role.items())))
+    by_model: dict[str, int] = {}
+    for r in rows:
+        for model, counts in (r.get("by_model") or {}).items():
+            by_model[model] = by_model.get(model, 0) + int(counts.get("total") or 0)
+    if by_model:
+        print("  by model: " + "; ".join(f"{model} {tokens_h(count)}" for model, count
+                                         in sorted(by_model.items(), key=lambda i: -i[1])))
     for r in rows:
         print(f"  {r['harness']} {r['session_id']}: "
               f"{r['transcript'] or 'no transcript'}")

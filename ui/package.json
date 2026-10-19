@@ -1,0 +1,20 @@
+{
+  "name": "docket-ui-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "python3 -B -m unittest discover -s tests -p 'test_*.py' && node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser-smoke.mjs && node tests/browser-acceptance.mjs",
+    "test:design": "node tests/design-smoke.mjs",
+    "design": "python3 -m http.server 4320 --bind 127.0.0.1 --directory ../docs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "ws": "8.22.0"
+  },
+  "devDependencies": { "playwright": "1.63.0" }
+}

@@ -17,6 +17,54 @@ from .bundles import (
 from .state import state_of, task_depends_on
 
 
+def packet_staleness(d: Path, owner: str, rnd: int,
+                       manifest: dict[str, object] | None) -> list[str]:
+    """Why a frozen bundle no longer binds the live report, contract, or inputs."""
+    problems: list[str] = []
+    if manifest is None:
+        return ["bundle manifest is missing or unreadable"]
+    rep = d / f"{owner}-report-{rnd:02d}.mdx"
+    if rep.is_file():
+        try:
+            live_body = parse(rep.read_text())[1]
+            live_digest = evidence_digest(live_body)
+        except (OSError, ValueError):
+            live_digest = ""
+        frozen_digest = str((manifest.get("report") or {}).get("body_digest", "")
+                            if isinstance(manifest.get("report"), dict) else "")
+        if live_digest and frozen_digest and live_digest != frozen_digest:
+            problems.append(
+                f"{owner} round {rnd} report body changed since the bundle "
+                f"{manifest.get('digest')} was frozen; re-verify before review")
+    task = d / f"{owner}-task.mdx"
+    if task.is_file():
+        try:
+            live_contract = digest_of(task.read_bytes())
+        except OSError:
+            live_contract = ""
+        frozen_contract = str((manifest.get("contract") or {}).get("revision", "")
+                              if isinstance(manifest.get("contract"), dict) else "")
+        if live_contract and frozen_contract and live_contract != frozen_contract:
+            problems.append(
+                f"{owner} contract changed since bundle {manifest.get('digest')} "
+                "was frozen; the captured verification no longer binds it")
+    if owner == "orch":
+        plan = d / "plan.mdx"
+        if plan.is_file():
+            try:
+                live_plan = digest_of(plan.read_bytes())
+            except OSError:
+                live_plan = ""
+            frozen_plan = str((manifest.get("contract") or {}).get("revision", "")
+                              if isinstance(manifest.get("contract"), dict) else "")
+            if live_plan and frozen_plan and live_plan != frozen_plan:
+                problems.append(
+                    f"orch plan changed since bundle {manifest.get('digest')} "
+                    "was frozen; the captured integration verification no longer "
+                    "binds it")
+    return problems
+
+
 def pin_final_dependencies(d: Path, owner: str) -> list[tuple[str, str]]:
     """Record each approved `depends_on` task as a final consumed input.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 from pathlib import Path
 
@@ -29,7 +30,8 @@ from .verification import (
     current_round_digest, current_task_revision, matching_verifications,
     round_failed_verification, verifier_exempt_set, write_checkpoint,
 )
-from .liveness import dispatch_dependencies_unmet, live_dispatches, round_dispatched, worker_process_state
+from .liveness import (dispatch_dependencies_unmet, live_dispatches, missed_wakes,
+                       round_dispatched, worker_process_state)
 from .sessions import (CODEX_LIMIT_WARN_PERCENT, codex_limit_exhausted,
                        codex_rate_limits, run_harness_sessions)
 from .five_role import (
@@ -39,7 +41,8 @@ from .five_role import (
 from .batches import (batch_ready, batch_verification_historical_valid,
                       batch_verification_matches, batch_verification_valid,
                       batch_verify_failed, current_batch_source, current_member_bundles,
-                      frontier_ready, verification_fragment)
+                      frontier_ready, quick_milestone_implementation_problem,
+                      verification_fragment)
 
 
 def instruction_events(d: Path, role: str) -> list[dict[str, object]]:
@@ -380,6 +383,67 @@ def reviewer_verifier_events(d: Path, role: str) -> list[dict[str, object]]:
     return out
 
 
+def quick_next_task_event(d: Path) -> tuple[str, str, str, str] | None:
+    """(key, message, revision, owner) when a quick milestone has work nobody dispatched.
+
+    The quick implementor's contract ends a round at submission, and a coordinator that
+    takes that literally stops between tasks with nothing pending to wake it. Only an
+    undispatched first round counts: corrections, handoffs, and dependency gates carry
+    their own wakes.
+    """
+    if live_dispatches(d):
+        return None
+    milestones = sorted(
+        (batch for batch in list_batches(d)
+         if batch.get("milestone") and batch.get("state") == "closed"),
+        key=lambda batch: tuple((1, int(part)) if part.isdigit() else (0, part.lower())
+                                for part in re.split(r"(\d+)", str(batch.get("batch", "")))))
+    for batch in milestones:
+        for member in (str(m) for m in batch.get("members", [])):
+            rnd, st = state_of(d, member)
+            if (st != "draft" or rnd != 1 or round_dispatched(d, member, rnd)
+                    or task_depends_on(d, member) or derive_stage(d, member) != "initial"
+                    or dispatch_dependencies_unmet(d, member)
+                    or quick_milestone_implementation_problem(d, member)):
+                continue
+            sessions = [str(read_dispatch(d, o).get("session", "")) for o in owners(d)
+                        if read_dispatch(d, o)]
+            session = next((s for s in reversed(sessions) if s), "SESSION")
+            bid = str(batch.get("batch"))
+            return (f"{member}:1:next-task",
+                    f"{member} is the next task of milestone {bid} and nothing is dispatched: run "
+                    f"`docket dispatch {d.name} {member} --session {session}` now and keep going; "
+                    "do not stop to ask between tasks",
+                    "sha256:" + hashlib.sha256(f"{bid}:{member}".encode()).hexdigest(), member)
+    return None
+
+
+# Two lapsed leases: a busy role takes its wake at its next stop, well inside this.
+HANDOFF_STALL_REPEATS = 2
+
+
+def handoff_stall_events(d: Path) -> list[tuple[str, str, str]]:
+    """(key, message, revision) for another role's wake that nobody has taken.
+
+    Its watcher keeps re-announcing while the session is busy elsewhere, gone,
+    or not delivering, and nothing else notices: the planner is the one session
+    the user is talking to. The event retires once the wake is taken.
+    """
+    out = []
+    for wake in missed_wakes(d):
+        if not wake["open"] or wake["role"] == "planner" \
+                or int(wake["repeats"]) < HANDOFF_STALL_REPEATS:
+            continue
+        role, key = str(wake["role"]), str(wake["key"])
+        out.append((f"handoff-stalled:{role}:{key}",
+                    f"{role} has not taken its wake '{key}' since {wake['first']}: its session "
+                    f"is busy, gone, or not delivering wakes. Look at its pane once; if it is "
+                    f"idle, send it `docket pickup {d.name} --role {role}` and let it act, and if "
+                    f"it is gone, start {role} again. Do not relay normal progress",
+                    "sha256:" + hashlib.sha256(f"{role}:{key}:{wake['first']}".encode()).hexdigest()))
+    return out
+
+
 def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, object]]:
     """Actionable event records for a supervising role, derived from documents.
 
@@ -408,11 +472,22 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
                     continue
                 bid = str(batch.get("batch", ""))
                 verification = str(decision.get("batch_verification", ""))
+                pending = [str(other.get("batch")) for other in list_batches(d)
+                           if other.get("milestone") and
+                           (other.get("milestone_decision") or {}).get("verdict") != "approved"]
+                follow = (f"continue with milestone {', '.join(sorted(pending))}" if pending else
+                          "it was the last planned milestone, so your work on this run is done; "
+                          "stop here, the planner reports the outcome")
                 mapped.append({"key": f"batch:{bid}:approved", "role": role,
                                "workflow": workflow_of(d), "owner": "", "round": 0,
                                "generation": 1, "revision": verification,
-                               "message": f"milestone {bid} reviewer approval is complete; "
-                                          "continue with the next planned milestone or finish"})
+                               "message": f"milestone {bid} reviewer approval is complete; {follow}"})
+            following = quick_next_task_event(d)
+            if following:
+                mapped.append({"key": following[0], "role": role,
+                               "workflow": workflow_of(d), "owner": following[3], "round": 1,
+                               "generation": 1, "revision": following[2],
+                               "message": following[1]})
             launch = launch_needed_event(d, "implementor", "reviewer")
             if launch:
                 mapped.append({"key": launch[0], "role": role,
@@ -476,6 +551,8 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
         if topology(d) == "combined":
             return []
         for key, message, revision in codex_budget_events(d):
+            emit(key, message, "", 0, revision)
+        for key, message, revision in handoff_stall_events(d):
             emit(key, message, "", 0, revision)
         if is_five_role(d):
             for key, message, owner, ernd, revision in escalation_events(d):

@@ -195,6 +195,11 @@ def evidence_artifact_problems(d: Path, artifacts: str) -> list[str]:
             resolved = root() / path_token
         if resolved is None or not resolved.exists():
             problems.append(f"unknown or missing evidence artifact: {token}")
+    if problems:
+        problems.append(
+            "an artifact is one of " + ", ".join(EVIDENCE_FROZEN_ARTIFACTS) + " or an existing "
+            f"file path (path:line allowed); save a real run's output under "
+            f".docket/runs/{d.name}/evidence/ and cite that file, and put prose in the gaps column")
     return problems
 
 

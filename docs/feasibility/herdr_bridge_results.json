@@ -1,0 +1,167 @@
+{
+  "version": "herdr 0.8.2",
+  "checks": {
+    "five_simultaneous_observers": true,
+    "observer_receives_controller_updates": true,
+    "question_and_answer": true,
+    "alternate_screen_arrow_and_enter": true,
+    "ctrl_c_interrupt": true,
+    "unicode_input": true,
+    "pty_size_read": {
+      "type": "pane_read",
+      "read": {
+        "pane_id": "w1:p1",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "source": "visible",
+        "format": "text",
+        "text": "$ python3 -c 'answer=input(\"STUDY_QUESTION proceed? \" ); print(\"STUDY_ANSWER:\"+answer)'\nSTUDY_QUESTION proceed? yes\nSTUDY_ANSWER:yes\n$ python3 /tmp/docket-herdr-lab-a_y8e6rb/menu.py\nSTUDY_MENU_RESULT:1b5b420d\n$ python3 -c 'import time; print(\"STUDY_WAITING\", flush=True); time.sleep(60)'\nSTUDY_WAITING\n^CTraceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nKeyboardInterrupt\n\n$ python3 -c 'answer=input(); print(\"STUDY_UNICODE:\"+answer)'\n\u0928\u092e\u0938\u094d\u0924\u0947 caf\u00e9\nSTUDY_UNICODE:\u0928\u092e\u0938\u094d\u0924\u0947 caf\u00e9\n$ printf 'STUDY_SIZE:'; stty size\nSTUDY_SIZE:28 110\n$\n",
+        "revision": 0,
+        "truncated": false
+      }
+    },
+    "resize_reaches_real_pty": true,
+    "history_read": true,
+    "scroll": {
+      "offset_from_bottom": 15,
+      "max_offset_from_bottom": 140,
+      "viewport_rows": 28
+    },
+    "second_controller_refused": {
+      "reason": "terminal attach failed: terminal term_65d3a770497661 already has an attached client; retry with --takeover",
+      "type": "terminal.closed"
+    },
+    "explicit_takeover": {
+      "reason": "terminal attach taken over",
+      "type": "terminal.closed"
+    },
+    "structured_mouse_command": [
+      "herdr: terminal session control input ignored: invalid json command: unknown variant `terminal.mouse`, expected one of `terminal.input`, `terminal.resize`, `terminal.scroll`, `terminal.release` at line 1 column 25"
+    ],
+    "release": {
+      "reason": "detached",
+      "type": "terminal.closed"
+    },
+    "reconnect_full_frame": true,
+    "same_shell_pid_after_reconnect": true,
+    "switch_to_another_existing_terminal": true
+  },
+  "frames": {
+    "observer": [
+      {
+        "encoding": "ansi",
+        "full": true,
+        "height": 24,
+        "seq": 1,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 2,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 3,
+        "type": "terminal.frame",
+        "width": 100
+      }
+    ],
+    "controller": [
+      {
+        "encoding": "ansi",
+        "full": true,
+        "height": 24,
+        "seq": 1,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 2,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 3,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 4,
+        "type": "terminal.frame",
+        "width": 100
+      },
+      {
+        "encoding": "ansi",
+        "full": false,
+        "height": 24,
+        "seq": 5,
+        "type": "terminal.frame",
+        "width": 100
+      }
+    ]
+  },
+  "schema": {
+    "agent_fields": [
+      "agent",
+      "agent_session",
+      "agent_status",
+      "cwd",
+      "display_agent",
+      "focused",
+      "foreground_cwd",
+      "interactive_ready",
+      "launch_pending",
+      "name",
+      "pane_id",
+      "revision",
+      "screen_detection_skipped",
+      "state_change_seq",
+      "state_labels",
+      "tab_id",
+      "terminal_id",
+      "terminal_title",
+      "terminal_title_stripped",
+      "title",
+      "tokens",
+      "workspace_id"
+    ],
+    "question_or_approval_methods": [],
+    "relevant_methods": [
+      "agent.explain",
+      "agent.focus",
+      "agent.get",
+      "agent.list",
+      "agent.prompt",
+      "agent.read",
+      "agent.rename",
+      "agent.send_keys",
+      "agent.start",
+      "agent.view.clear",
+      "agent.view.set",
+      "agent.wait",
+      "events.subscribe",
+      "events.wait",
+      "pane.read",
+      "pane.send_input",
+      "pane.send_keys",
+      "pane.send_text",
+      "session.snapshot"
+    ]
+  }
+}

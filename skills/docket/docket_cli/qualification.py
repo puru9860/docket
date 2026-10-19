@@ -22,7 +22,7 @@ from .paths import root
 from .publication import fault, publish, publish_json
 from .policy import need_run, require_preset_role
 from .evidence import git_argv, git_env, state_prefix
-from .bundles import check_frozen_digest, freeze_record, source_tree
+from .bundles import check_frozen_digest, freeze_record
 from .liveness import live_dispatches, read_registration
 from .events import derive_events
 from .verification import write_checkpoint

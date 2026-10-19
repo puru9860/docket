@@ -7,31 +7,28 @@ import contextlib
 import fcntl
 import hashlib
 import json
-import subprocess
 import sys
 from pathlib import Path
 
-from .common import COVERAGE_AVAILABLE, COVERAGE_UNAVAILABLE, MODE_QUICK, die, stamp
+from .common import MODE_QUICK, die, stamp
 from .frontmatter import parse, render
-from .paths import _ordered, dispatch_path, next_numbered, read_dispatch, root
-from .publication import fault, perturb, publish, publish_bytes, publish_exclusive, publish_json
+from .paths import dispatch_path, read_dispatch, root
+from .publication import fault, perturb, publish, publish_bytes, publish_json
 from .policy import (is_quick_milestone, max_concurrency_of, mode_of, model_policy, need_run,
                       next_role_fallback, allowed_models_for_role, plan_flag, provider_concurrency_of,
-                      provider_of, role_effort, role_model)
-from .baselines import assignment_evidence, require_baseline, snapshot_path, task_scope_hint
-from .bundles import digest_of
+                      provider_of, role_model)
+from .baselines import require_baseline, snapshot_path, task_scope_hint
 from .locks import owner_lock
 from .state import (
     derive_stage, normalized_scope, resumable_checkpoint, scope_collisions,
     seed_report_acceptance, state_of, task_depends_on,
 )
 from .dependencies import pin_final_dependencies
-from .freeze import current_bundle
 from .feedback import machine_feedback
 from .liveness import TERMINAL_REPORT_STATES, dispatch_dependencies_unmet, live_dispatches
-from .delivery import check_registration, ensure_session_registration
+from .delivery import check_registration, ensure_session_registration, proven_native_identity
 from .gate import task_intent_problems
-from .prompts import compose_prompt, prompts_dir, rendering_problem
+from .prompts import compose_prompt, prompts_dir, rendering_problem, round_handoff_lines
 from .sessions import codex_limit_exhausted, codex_rate_limits, collect_run_usage
 from .verification import write_checkpoint
 from .batches import quick_milestone_implementation_problem, quick_milestone_plan_problems
@@ -220,7 +217,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
         guard_provider_concurrency(d, a.owner, candidate, active)
         guard_review_reserve(d, candidate)
     if a.register:
-        ensure_session_registration(a.run, a.session, role, a.agent or a.session)
+        ensure_session_registration(a.run, a.session, role, a.agent or a.session,
+                                    proven_native_identity(a, role))
     reg = check_registration(d, a.session, a.run, role)
     with owner_lock(d, a.owner):
         existing = read_dispatch(d, a.owner)
@@ -259,7 +257,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                                      "prompt rebound: the task or plan changed after dispatch")
                     print(f"rebound {a.owner} round {rnd}: its prompt changed since it was "
                           f"bound (was {existing_digest}, now {fresh_digest})")
-                    print(f"prompt: {prompt_file.relative_to(root())} - send these exact "
+                    print("\n".join(round_handoff_lines(d, a.run, a.owner, role, prompt_file))
+                          or f"prompt: {prompt_file.relative_to(root())} - send these exact "
                           "bytes to the worker; the earlier prompt no longer describes the task")
                     return
                 if existing_digest:
@@ -268,7 +267,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                           "no prompt delivered, nothing observed")
                 if prompt and fresh_digest:
                     prompt_file = write_prompt_file(d, a.owner, role, rnd, prompt, fresh_digest)
-                    print(f"prompt: {prompt_file.relative_to(root())}")
+                    print("\n".join(round_handoff_lines(d, a.run, a.owner, role, prompt_file))
+                          or f"prompt: {prompt_file.relative_to(root())}")
                 return
             die(f"{a.owner} round {rnd} was dispatched to session {a.session!r} "
                 f"(generation {old_gen}), but session {a.session!r} is now generation "
@@ -377,7 +377,9 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             print(f"recorded binding {a.owner} round {rnd} for model {model or 'unobserved'} "
                   f"(prompt digest {prompt_digest}); no model launched, no prompt delivered, "
                   "nothing observed")
-            if prompt_file is not None:
+            handoff = (round_handoff_lines(d, a.run, a.owner, role, prompt_file)
+                       if prompt_file is not None else [])
+            if prompt_file is not None and not handoff:
                 print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
                       "the worker")
             if policy_state == "absent":
@@ -385,6 +387,10 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             if not model:
                 print("model telemetry unavailable: model is unknown until `docket set-model` "
                       "verifies the live harness")
+            # The delegation is the action that matters next, so it is printed last,
+            # where a cheap coordinator reads it as its instruction.
+            if handoff:
+                print("\n".join(handoff))
 
 
 def write_prompt_file(d: Path, owner: str, role: str, rnd: int, prompt: str,
@@ -505,7 +511,9 @@ def cmd_resume(a: argparse.Namespace) -> None:
         if a.register:
             ensure_session_registration(a.run, a.session,
                                         str(dispatch.get("role", "implementor")),
-                                        a.agent or a.session)
+                                        a.agent or a.session,
+                                        proven_native_identity(
+                                            a, str(dispatch.get("role", "implementor"))))
         reg = check_registration(d, a.session, a.run, dispatch.get("role", "implementor"))
         with capacity_lock(d):
             if bound_round != rnd:
@@ -527,6 +535,13 @@ def cmd_resume(a: argparse.Namespace) -> None:
                 die(f"{a.owner} cannot resume: provider concurrency {len(active)}/{cap} "
                     "exhausted; wait for a dispatched task to finish")
             guard_provider_concurrency(d, a.owner, model, active)
+            # A resume that takes a correction round over from a superseded dispatch is
+            # that round's first dispatch, so it owes the round's baseline just as
+            # dispatch would, before the checkpoint measures any work against it.
+            if a.owner != "orch" and not snapshot_path(d, a.owner).is_file():
+                require_baseline(d, a.owner, task_scope_hint(d, a.owner))
+                print(f"captured {a.owner}'s fresh pre-correction baseline for round {rnd}; "
+                      "prior baselines and bundles stay intact")
             checkpoint = write_checkpoint(d, a.owner)
             if a.on_limit:
                 task_meta["harness"] = a.harness
@@ -598,7 +613,8 @@ def cmd_resume(a: argparse.Namespace) -> None:
                 print(f"checkpoint {checkpoint.name} is mechanical (semantic_handoff: no); "
                       "the replacement discovers from the task, scope, and diff")
             if prompt_file is not None:
-                print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
+                print("\n".join(round_handoff_lines(d, a.run, a.owner, role, prompt_file))
+                      or f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
                       "the replacement")
 
 

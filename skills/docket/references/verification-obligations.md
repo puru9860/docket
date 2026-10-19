@@ -8,11 +8,18 @@ parts remain in `docket submit`.
 
 ## honest-acceptance
 
+Build a criterion-to-observation map, inspect changed tests for false positives, and run one or two decisive negative controls for the highest-risk claims in an isolated copy.
+Budget 2-3 minutes of model work plus declared check runtime, and record `uncertain` for missing material evidence rather than a rushed pass.
+Do not rerun an identical captured suite or require a mutation for every branch.
 Prove each acceptance claim honestly from observable behavior. Keep actual-output
 provenance separate from independently derived expectations, exercise materially
 different inputs when the behavior depends on input, and state any unverified
 condition explicitly. A check that fails when the behavior is removed in an
 isolated copy is the minimum evidence that the check observes the claimed behavior.
+For a failure or concurrency criterion, confirm a test injects that failure into
+the component the criterion names, such as killing the writing process rather
+than a bystander, and that every case starts from the state it claims rather
+than from what an earlier case left behind.
 Look for sibling sites that share the defect, including another caller, mode, or
 path through the same behavior; either test them or explain why they differ.
 Prove existing behavior still works where the change could disturb it, with a

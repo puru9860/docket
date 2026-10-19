@@ -69,6 +69,8 @@ def drifted_inputs(d: Path, owner: str, rep: Path, verified: dict[str, str]) -> 
 def cmd_submit(a: argparse.Namespace) -> None:
     """The gate. A report becomes visible to the reviewer only if it passes here."""
     d = need_run(a.run)
+    if a.check:
+        return check_submission(a, d)
     if a.background:
         return background_submit(a, d)
     if not a.background_worker and background_submit_busy(d, a.owner):
@@ -86,6 +88,28 @@ def cmd_submit(a: argparse.Namespace) -> None:
     # leave a published report pointing at a bundle the ledger no longer retains.
     with owner_lock(d, a.owner):
         submit_locked(a, d)
+
+
+def check_submission(a: argparse.Namespace, d: Path) -> None:
+    """Run the gate's structural checks on the current report and print what they refuse.
+
+    A worker that cannot see why a report would be refused reads the gate's source
+    instead, which costs more than the report. This runs no verify command, freezes
+    nothing, and writes nothing.
+    """
+    rep = latest(reports(d, a.owner))
+    if not rep:
+        die(f"no report for {a.owner} in {a.run}")
+    meta, body = parse(rep.read_text())
+    blocked = a.blocked or meta.get("status", "") == "blocked"
+    problems = gate_problems(d, a.run, a.owner, rep, meta, body, blocked)
+    if problems:
+        print(f"{rep.name} would be refused:")
+        for problem in problems:
+            print(f"  - {problem}")
+        raise SystemExit(1)
+    print(f"{rep.name} passes the gate's report checks; `docket submit` runs the registered "
+          "verify command next and freezes the round")
 
 
 def background_submit_lock(d: Path, owner: str) -> Path:

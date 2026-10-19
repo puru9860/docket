@@ -616,6 +616,24 @@ A contract field nobody stated is left out rather than rendered as `none`; `hard
 Reference prose is hard-wrapped for human editors, and `unwrap_markdown` joins it so each paragraph and list item is one line in prompts and in `docket help`, while fences, tables, and headings keep their bytes.
 Guidance-card triggers match at the start of a word, so a stem like `concurren` still selects while `input` no longer pulls in harness guidance and `lock` no longer fires on `block`.
 The quick checker receives the verification obligations whenever its round still awaits verification, since it performs the verifier duty.
+Implementor steps put a self-review before the report, built from the reasons first rounds actually came back: behavior the task did not ask for, an "every" criterion with sites missed, a changed branch with no assertion that fails without it, timing-dependent tests, a real tool or screen proven only against a fake, an unviewed screenshot, stale docs, and a report claiming more than its artifacts show. A correction's first step reproduces what each required change names before fixing it and reruns the same check after.
+Implementor self-review includes a decisive negative control in an isolated copy, proving the key test fails when its guard is removed and that claimed failures are actually injected into the named component.
+Verifier prompts map criteria to independent observations, inspect changed tests for false positives, and run one or two decisive negative controls.
+The guidance budgets 2-3 minutes of model work plus declared check runtime, recording material gaps as uncertainty rather than a rushed pass and avoiding duplicate runs of an identical captured suite.
+Planner guidance defines a milestone as one demonstrable capability, normally 2-4 tasks, and sizes each task by a checkable behavior with meaningful tests that fits one context.
+Shared discovery and invariants justify merging; independent acceptance or context overflow justify splitting.
+Acceptance states the failure model and explicitly excluded failure classes before implementation.
+`docket submit --check` runs the same structural checks a submission would and prints what they refuse, with no verify run, freeze, or write; live implementors otherwise read the gate's own source to learn the report rules. An unknown Evidence artifact is refused with the list of what an artifact can be and where to save a real run's output (`.docket/runs/<run>/evidence/`, outside every task diff).
+
+`round_context` in the plan scopes working context to a unit of work.
+Under `fresh`, the default for new runs, the quick implementor coordinates one subagent per task on its own model, and the worker prompt omits the milestone loop.
+`docket dispatch` hands the bound prompt to that subagent on round 1 and instructs the parent to continue it for every correction.
+Claude Code continues with SendMessage to the agent id; OpenCode uses the task tool with its task_id.
+Only a missing subagent calls for a replacement, whose prompt carries the running checklist of all earlier applied required changes, including continuation lines.
+A reviewer keeps one subagent per milestone across corrections and re-reviews; verifiers and checkers keep one per task.
+The first unit starts from its objective and contract, while corrections retain what it learned and start from the numbered decision and changed evidence.
+New tasks and milestones get new contexts, avoiding both repeated correction discovery and history accumulated across unrelated units.
+Codex roles keep working in their session, and runs without the field retain shared context.
 Every draft report round, at assignment, at dispatch, and when a correction opens, is seeded with the task's acceptance criteria as unchecked boxes when it still holds the template placeholder, because retyping them exactly is the commonest way a worker fails the gate; nothing a worker wrote is ever replaced.
 
 Feedback is embedded in every run so bottlenecks surface as docket is used.
@@ -628,7 +646,11 @@ Per-model learning closes the loop from rejected work to the next prompt for the
 Every rejection of an executor's work appends an outcome case to the user-level log, tagged with the model that executed the round (observed by `set-model`, else the task's recorded model) and the model profile revision its prompt carried: a refused submit, a failed verification, requested changes with their numbered required changes, a blocked round, and an escalation, plus every verdict as the denominator.
 `docket models` scores each model across runs and projects, and `docket models --review MODEL` prints an evidence packet of the reject cases since that model's profile was last reviewed, ending with the profile format and the rule that a line needs cases from at least two tasks.
 A strong session drafts the profile from the packet and `docket models --adopt FILE` validates it (a `model-<slug>` name that cannot shadow a task card, exact model ids, a `reviewed_through` watermark, a body well inside the guidance budget, a rising version) and installs it in the user's profile tree, keeping the previous version under `history/`.
+A correction round's review packet tells the reviewer to judge it against the previous decision's required changes and for regressions; a new defect outside them requests changes only when it breaks an acceptance criterion as written, and stronger hardening goes under Notes.
+On 2026-10-10 a fresh Opus reviewer returned the same storage task four times, each round for a rarer edge (a failed write, then a failed rollback, then an interrupt between fsync and bookkeeping, then signal-raised interrupts inside commit), so the correction budget measured reviewer curiosity rather than defects.
 User profiles are read before the skill's own, so a skill update never erases them, and exact model matching keeps a profile to the model it was learned from.
+A task left on OpenCode's default model is matched against the model a new OpenCode session starts on, the config's `model` or else the first entry of its recent-models state, so round 1 carries the profile too.
+Before that, a 2026-10-10 run showed every first round rendered without guidance and only corrections receiving it, after the implementor recorded its actual model.
 Raw cases never enter prompts; only reviewed rules do, which is the same rule that removed one-run model defaults.
 
 Each role's harness session is noted too, so its token usage and full conversation can be reviewed later without asking the agent for anything.
@@ -638,7 +660,9 @@ OpenCode names only its process (`OPENCODE_PID`), so its session is the one whos
 Variables inherited from an unrelated session are never trusted: the harness process must be an ancestor of the docket process (`CLAUDE_PID`, `OPENCODE_PID`, or a `codex` process).
 A session is noted for one role per run, the first it speaks for.
 A supervisor routinely runs commands on another role's behalf, arming the verifier or handing off a stuck implementor's task, and noting those would attribute its tokens to roles it never played; a command whose role differs from the session's `DOCKET_ROLE` is not noted either.
-`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) and prints tokens from the time the role first joined this run. Codex's cumulative counters subtract the last count before that boundary. `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the run-window usage there, and the final aggregate verdict archives automatically.
+A command names its role by its own `--as`/`--role`, so a planner's `assign --as planner` is noted as the planner rather than falling into the new quick default of implementor.
+An explicit transport registration (`arm --session`, `session --register`, `dispatch --register`) made from the session noted for that same role also records the session's native and process identity (`native_harness`, `native_process`) in the registration, which is what lets the companion prove its terminal; a registration for another role, or one that already holds an identity, is never given the caller's.
+`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) as one record per model call and counts the calls inside the session's run window. The window opens when the role first joined this run and closes at the earlier of the run's end (its last decision plus a wrap-up allowance that also covers the run's own closing feedback) and the moment the same session was first noted by another run, so a TUI kept open or reused after `/clear` never inflates a closed run. Codex's cumulative counter becomes per-call deltas over every shard of the thread, the resumed `rollout-<time>-<sid>_<shard>.jsonl` continuation included once its own session_meta names the thread; a repeated reading is not another call. Each session also splits its totals by model call by call, so one OpenCode session that moved between three models no longer counts its whole total under each of them, and model scorecards use that split. A transcript with no call inside the window reports `telemetry: empty`, a gap rather than zero tokens. A command an OpenCode subagent runs is credited to its root session, whose usage already sums its subagents. `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the run-window usage there, and the final aggregate verdict archives automatically.
 When a worker records its actual model from inside its harness, the live
 dispatch also records that proven harness process identity. If a draft round
 still holds the dispatch 60 seconds after that process exits, `docket health`
@@ -660,7 +684,13 @@ link incidents, benefit, change, and evaluation, and adoption links the change
 revision and trial result. Promotion never edits instructions, gates, or
 policy by itself - adoption records the change, and a project-local finding
 stays local until explicitly promoted. `docket retrospective` summarizes a run
-mechanically with no model calls and reports premium-token use as unknown.
+mechanically with no model calls. Its correction count comes from the same durable
+decisions and findings as `docket metrics`, since the active budget record is cleared
+on approval. Premium-token use is the per-call model split over configured
+`premium_models`, and unknown unless every role was measured. Stall incidents count only
+what somebody flagged, so both reports also list missed handoffs: a wake re-announced
+after its lease lapsed with nothing taking it, read from the delivery logs. A second
+watcher announcing the same wake seconds later is not a miss.
 
 Legacy runs migrate only through `docket migrate --to five-role-v1`, which
 records the old and new workflow versions, preserves every artifact
@@ -803,23 +833,24 @@ scopes the same packet to exactly that batch's reviewable members and no other
 owner. Every referenced task and aggregate
 bundle is validated with the full integrity checks before rendering; a missing,
 damaged, stale, or unbound bundle refuses the packet with a specific error
-rather than rendering reviewable-looking evidence. A `--correction` packet and
-a `--final` packet keep their current selection and behavior exactly. Evidence bodies shrink first
+rather than rendering reviewable-looking evidence. A `--correction` packet remains scoped to one task, and a `--final` packet keeps its frozen-release behavior. Evidence bodies shrink first
 toward roughly 1,000-2,000 estimated tokens. The substantive Findings body of
 every named verifier artifact, each complete waiver reason including its final
 qualification, every outstanding numbered required change, and every report's
 actual Decisions needed text and complete acceptance wording are mandatory and
 are never shortened. Full frozen contract, report, and patch paths remain
-available when excerpts shrink. Reviewers read the complete relevant patches
-and changed tests and independently check material expectations; the packet is
+available when excerpts shrink. Initial milestone reviews read the complete relevant patches and changed tests and independently check material expectations; the packet is
 an index to that evidence. A late
 finding is rendered in the same order as the earlier findings, not discarded
 by a summary. When mandatory material alone exceeds the target, the packet
 states the overage and adds an explicit required-reading manifest naming the
-artifacts the reviewer must open. Every pointer resolves into an immutable bundle. A
-`--correction` packet for one task adds old and new bundle digests, the
-correction delta, refreshed verification, expanded scope, and the addressed
-findings. An approval binds the revisions named here, never a verifier pass
+artifacts the reviewer must open. Every patch pointer resolves into an immutable bundle.
+For corrected members, including in a milestone packet, correction review leads after the objective with frozen criteria and the failure model, previous numbered changes, exact prior/current digests, the correction delta, refreshed verification and evidence pointers, and changed frozen dependency identities.
+The prior digest comes from the previous decision rather than ledger adjacency, and missing or damaged prior evidence refuses the packet.
+Full historical patches stay accessible by pointer and are retrieved when changes cross interfaces, dependencies, shared invariants, or unrelated code, or the delta is unavailable.
+A re-review whose delta starts after the decision's reviewed bundle cannot omit intervening changes: it explicitly requires retrieval of both full patches.
+Initial findings are consolidated into one numbered list per member, each naming its criterion and a reproducer or causal argument.
+Corrections check the required changes and regressions; stronger requirements go to the planner through a proposed amendment, while follow-up hardening stays under Notes. An approval binds the revisions named here, never a verifier pass
 alone. The aggregate carries its own integration verification: the orch report
 declares an integration `verify:` command at assignment, the submit gate runs
 it, and the frozen bundle keeps the command, timing, exit status, outputs, and
@@ -1147,6 +1178,14 @@ Under `evidence_mode: documents-only`, a round still freezes - contract, baselin
 reference, report body, and captured verification - and records patch coverage as
 `unavailable` with its reason. It is never recorded as an empty patch.
 
+New plans record the versioned flat field `milestone_dependencies: approval-v1`.
+Runs without it preserve their prior dependency behavior, and an unknown or empty value refuses rather than weakening the barrier.
+Within one closed milestone, tiered-settled work may satisfy dependencies and be pinned before approval.
+Across milestones, dispatch and `docket depend --on` require the producer milestone's intact approval bound to its current member bundles and historical full-suite pass, even when provisional integration is allowed.
+The shared `milestone_dependency_problem` check is used by dispatch readiness and consumption, so dispatch-ready events cannot wake the orchestrator for a dependency the plan forbids consuming.
+Historical suite validation permits later milestones to edit the checkout without invalidating earlier approval, while moved member evidence still closes the barrier.
+Ungrouped tasks retain their recorded integration policy; planners put approval-dependent tasks in separate milestones or merge them to avoid deadlock.
+
 ### Provisional dependencies
 
 A task may consume another task's frozen evidence with
@@ -1263,6 +1302,9 @@ A standard run on 2026-09-26 spent a Codex 5-hour window in 93 minutes on waitin
 Three mechanical guards came out of it.
 Inside a harness, `docket watch` refuses a `--timeout` under 590 seconds, OpenCode's longest useful window, because anything shorter only re-enters the model to start the same wait; the hook is exempt.
 Under Codex the watcher says whether the installed Stop hook serves the session or is inert because the session's own `DOCKET_ROLE` is missing, which is how that orchestrator lost its zero-cost wait: the playbook created its tab without the variable.
+A 2026-10-10 five-role run showed the same waste in the planner the user starts by hand: it has no `DOCKET_ROLE`, so its hook stayed inert and it polled `docket watch` one model turn about every 33 seconds, about a quarter of the run's tokens.
+`wake.sh` now falls back to `docket hook-role`, which names the one role whose native registration (written by `docket arm` in that session) matches the harness session id.
+The session id is the identity there: Codex runs commands under a shared app-server whose pid proves nothing, so an unknown process on either side never reads as a restarted session generation.
 And `docket status` tells a session that re-reads an unchanged status how many times it has, keyed by harness session under `.status-seen/`, which is not delivery state.
 When a Codex session plays or is assigned a role, `docket status` also shows the account's Codex usage windows, taking the highest use per current window across the newest local rollouts because one session can log a stale snapshot after newer ones.
 The launcher itself is a playbook rule, not a mechanism: when the user wants the planner on another harness, the session they spoke to starts it and ends its turn.
@@ -1384,6 +1426,11 @@ delivery attempt revalidates the recipient registration, so a renamed agent,
 reused pane, or restarted session cannot inherit an old delivery. A normal
 receipt and an actual duplicate are logged separately, so metrics never count
 every receipt as a duplicate.
+
+A wake hook watches only the runs its `DOCKET_RUN` selects, and a reused TUI keeps the environment it was started with, `/clear` included. `docket arm` therefore refuses, inside the role's own session, a run that `DOCKET_RUN` does not name: the hook would fail on every Stop and the role would never wake, which is how a reused reviewer stalled a whole milestone.
+A wake that was announced and then re-announced across two lapsed leases with no receipt or claim is a handoff that did not land: the role's session is busy elsewhere, gone, or not delivering wakes. The planner, the session the user talks to, receives one `handoff-stalled:<role>:<key>` event naming the recovery, it retires once the wake is taken, and `docket status` prints the same line. One lapsed lease is not enough, since a busy role takes its wake at its next stop.
+A recipient that took a wake keeps a receipt for that exact identity (key, revision, round, generation) under `.delivery/<role>/received/`, which retiring the pending record does not remove. Readiness that depends on the live checkout flaps whenever anyone runs tests in it, a reviewer included, and each flap used to retire and re-derive the same event and wake the reviewer again for work it already had; an identical re-derivation now stays quiet, a changed identity still wakes, and `events --retry` clears the receipt.
+The quick implementor's contract ends a round at submission, and a coordinator that takes that literally stops between tasks with nothing pending to wake it, which a live Haiku run did. While nothing is dispatched and a closed milestone that may proceed still holds an undispatched first round without dependency gates, the implementor derives one `<task>:1:next-task` event naming the exact dispatch command; it retires on dispatch.
 
 ## Invariants
 
@@ -1575,7 +1622,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `locks` | `owner_lock`, `owner_lock_held`, `run_lock` |
 | `state` | `state_of`, `handoff_state`, `scope_state`, `scope_collisions`, `read_transition`, `unfinished_decision`, `decide_as`, `reopen_epoch`, `armed`, `list_batches`, `list_incidents`, `latest_verification`, `derive_stage`, `task_depends_on`, `list_amendments` |
 | `profiles` | `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `normalized_model`, `model_aliases` |
-| `dependencies` | `provisional_policy`, `parse_deps`, `deps_record_bytes`, `read_deps`, `write_deps`, `dependency_problems`, `refreshed_inputs`, `withdrawn_readiness`, `provisional_dependencies`, `consumable_problems`, `pin_final_dependencies` |
+| `dependencies` | `provisional_policy`, `parse_deps`, `deps_record_bytes`, `read_deps`, `write_deps`, `dependency_problems`, `refreshed_inputs`, `withdrawn_readiness`, `provisional_dependencies`, `consumable_problems`, `pin_final_dependencies`, `packet_staleness` |
 | `freeze` | `frozen_baseline_root`, `freeze_task_bundle`, `current_bundle` |
 | `aggregates` | `aggregate_bundle_problems`, `current_aggregate`, `require_aggregate`, `freeze_aggregate_bundle`, `stale_aggregate` |
 | `verification` | `task_env`, `parse_framework_counts`, `run_verification`, `execute_verify`, verify slots, `latest_reusable_verification`, `matching_verifications`, `current_round_digest` |
@@ -1585,9 +1632,9 @@ Tests that read the CLI's constants or source read every package module through 
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
 | `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |
 | `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
+| `batches` | `milestone_dependency_problem`, `verification_fragment`, `batch_ready`, `frontier_ready`, `cmd_batch` |
 | `liveness` | session registrations, `dispatch_liveness`, `round_dispatched`, `live_dispatches`, `reconcile_dispatches`, `dispatch_dependencies_unmet` |
 | `five_role` | `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `blocked_route`, `route_blocked`, `cmd_route`, `cmd_escalate_mode` |
-| `batches` | `verification_fragment`, `batch_ready`, `frontier_ready`, `cmd_batch` |
 | `events` | `derive_events`, `reviewer_verifier_events`, `review_scope_states`, `review_readiness_events` |
 | `delivery` | `delivery_lock`, `delivery_log`, `check_registration`, `event_actionable`, `retire_event`, `ensure_pending`, `sweep_role`, `announce_delivered`, `paused_flag`, `claim_event`, `cmd_reconcile`, `cmd_inbox`, `cmd_session`, `inbox_ack`, `inbox_retry` |
 | `signalling` | `ledger_for`, `delivered_keys`, `cmd_arm`, `cmd_disarm`, `cmd_watch`, `cmd_events`, `cmd_pickup` |
@@ -1604,8 +1651,8 @@ Tests that read the CLI's constants or source read every package module through 
 | `improvements` | `cmd_improvements`, `advance_finding`, `finding_incidents`, `cmd_retrospective` |
 | `suite` | `parse_suite_summary`, `parse_suite_streams`, `cmd_suite`, `resolve_suite_artifact`, `suite_problems` |
 | `metrics` | `cmd_metrics`, `run_artifact_span` |
-| `release` | `packet_staleness`, `integration_verification_problems`, `validate_frozen_release`, `frozen_bundle_view`, `cmd_release` |
-| `packets` | `task_coverage_row`, `packet_tokens`, `render_bounded_packet`, `render_final_packet`, `cmd_review_packet` |
+| `release` | `integration_verification_problems`, `validate_frozen_release`, `frozen_bundle_view`, `cmd_release` |
+| `packets` | `task_coverage_row`, `packet_tokens`, `render_bounded_packet`, `render_final_packet`, `correction_basis`, `correction_review_lines`, `cmd_review_packet` |
 | `dispatch` | `capacity_lock`, `dispatch_ownership_problems`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
 | `commands` | task validation, discovery scope, handoff, set-model, status, diff, bundle, depend, roots, preflight, and migrate |
 | `cli` | the argument parser and `main` |

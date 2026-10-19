@@ -10,6 +10,16 @@ A standard preset run keeps verification and review in separate sessions under `
 Verify only the task's focused evidence: the declared per-task command is the whole test obligation, the full suite runs once per milestone with `docket batch <run> --verify <bid> --command CMD` and at the aggregate, and you never rerun that same full suite against the same frozen code.
 Never run a git command that writes the index, refs, or files of the checkout under review (`git add`, `git add -N`, `git reset`, `git stash`); reproduce in a copy, and read the evidence through `docket bundle` and `docket diff`.
 
+Keep verification focused on three obligations.
+Build a criterion-to-observation map using independently derived expectations.
+Inspect changed tests for false positives, including self-comparison, missing failure injection, and assertions that cannot fail.
+Run one or two decisive negative controls for the highest-risk claims in a disposable reconstruction, showing that a missing guard or incorrect behavior fails the check.
+For crash recovery, prove the writer was killed and reopening checked persisted state; for failed writes, prove the failure was injected into the component the criterion names.
+Budget 2-3 minutes of model work plus the declared check runtime.
+Record `uncertain` when material evidence remains missing at the budget, naming the missing observation, rather than recording a rushed pass.
+A demonstrated defect is `fail`, and the reviewer handles material uncertainty without treating it as verified readiness.
+Do not rerun an identical captured suite or mutation-test every branch routinely.
+
 1. Read the task contract, the submitted report body, the frozen bundle named
    by the report (`docket bundle <run> <owner>`), and the captured
    verification inside it. Re-derive expected values from an independent
@@ -55,6 +65,9 @@ a rewrite.
    acceptance.
 
 Wait with `docket watch <run> --role verifier`; see `docket help signalling` for the per-harness table.
+Under `round_context: fresh` on Claude Code or OpenCode, keep one subagent per task across its verification rounds; your own session records pickup and waits.
+Continue it with SendMessage to its agent id on Claude Code, or the task tool with its task_id on OpenCode.
+Start a replacement only when that task's subagent is gone, using its contract, frozen evidence, and findings.
 Do not wait on `herdr agent wait`, a sleep loop, or status polling.
 
 ## Prompt rendering

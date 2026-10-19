@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Docket - local workspace</title>
+  <link rel="stylesheet" href="/vendor/xterm.css"><link rel="stylesheet" href="/style.css">
+  <script src="/vendor/xterm.js" defer></script><script src="/vendor/fit.js" defer></script><script src="/markdown.js" defer></script><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span>d.</span>docket</div>
+    <div class="breadcrumb" role="group" aria-label="Where you are">
+      <label class="sr-only" for="project-select">Project</label><select id="project-select" aria-describedby="project-path"></select>
+      <details class="menu" id="project-menu"><summary aria-label="Project menu">&#8943;</summary>
+        <div class="menu-body"><div id="project-path" class="project-path"></div>
+          <button id="add-project" type="button">Add project</button><button id="remove-project" type="button" disabled>Remove from list</button></div></details>
+      <span class="sep" aria-hidden="true">/</span>
+      <label class="sr-only" for="run-select">Run</label><select id="run-select" aria-label="Select run"></select>
+      <span class="sep" aria-hidden="true">/</span>
+      <strong id="crumb-role">Select a role</strong>
+    </div>
+    <div class="top-status"><span id="run-status" class="badge">Waiting</span><span class="health"><span class="dot" id="server-dot"></span><span id="server-state">Checking Herdr</span></span></div>
+    <div class="top-actions"><button id="refresh" aria-label="Refresh workspace">Refresh</button><button id="toggle-docs" aria-pressed="false" aria-controls="documents">Docs</button></div>
+  </header>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <div class="app">
+    <aside class="sidebar" aria-label="Roles in this run">
+      <div class="sidebar-heading"><span class="eyebrow">ROLES</span><span id="role-count">0</span></div>
+      <nav id="roles" aria-label="Role conversations"></nav>
+      <div class="run-progress"><div><span id="task-summary"></span></div><div class="tasks" id="tasks"></div><small id="run-policy"></small></div>
+    </aside>
+    <main>
+      <div class="workspace">
+        <section class="conversation-panel" aria-label="Selected role conversation">
+          <div class="conversation-heading"><div class="role-avatar" id="role-avatar">D</div><div class="heading-copy"><h1 id="terminal-title">Select a role</h1><div id="session-subtitle">Your agents, one workspace.</div></div><span id="history-state" class="badge">Not connected</span></div>
+          <details class="details" id="session-details"><summary>Details</summary>
+            <dl id="details-list"></dl>
+            <div class="history-link-bar" id="history-link-bar"><label for="history-select">Change conversation</label><select id="history-select" aria-label="Choose saved conversation"><option value="">Use recorded role session</option></select><label class="check"><input type="checkbox" id="history-scope"> Show all project sessions</label><button id="link-history" disabled>View history</button></div>
+          </details>
+          <div id="connection" class="connection" role="status" hidden><span class="state-chip" id="connection-state"></span><span id="connection-reason"></span><button id="connection-action" type="button"></button></div>
+          <div id="replaced-note" class="notice" role="status" hidden></div>
+          <div class="view-tabs" role="tablist" aria-label="Session view"><button data-view="conversation" role="tab" aria-selected="true">Conversation</button><button data-view="activity" role="tab" aria-selected="false">Activity</button><button data-view="terminal" role="tab" aria-selected="false">Live terminal</button></div>
+          <div class="history-view" id="history-view"><div id="history-note" class="history-note">Select a role to read its saved conversation.</div><div class="scroller"><div id="history-pager" class="history-pager" role="group" aria-label="Conversation pages" hidden><button id="history-older" type="button">Load earlier</button><button id="history-newer" type="button">Newer</button></div><div id="conversation" class="conversation-scroll" role="log" aria-label="Saved session history" tabindex="0"></div><button id="history-latest" class="jump" type="button" hidden>Jump to latest</button></div></div>
+          <section class="terminal-card" id="terminal-view" aria-label="Selected role terminal" hidden>
+            <div class="panel-title"><strong>Existing terminal</strong><span class="badge" id="stream-mode">Disconnected</span><button id="reconnect" disabled>Reconnect</button></div>
+            <div class="binding-bar"><label for="terminal-select">Terminal</label><select id="terminal-select" aria-label="Bind existing terminal"><option value="">Choose an existing terminal...</option></select><button id="bind" disabled>Bind</button></div>
+            <div class="control-bar"><span id="binding-label">Choose a role, then bind its existing terminal.</span><div><button id="control" disabled>Take control</button><button id="takeover" class="warning" hidden>Take over</button></div></div>
+            <div id="projection-note" class="projection-note">Read-only view follows the existing pane size. Take control to fit the TUI to this panel.</div>
+            <div class="terminal-area"><div id="terminal"></div><div id="terminal-empty" class="terminal-empty"><h2>Connect this role's terminal</h2><p>Select its existing pane above. It opens read-only.</p></div></div>
+            <footer class="terminal-footer"><span id="terminal-size">Live terminal</span><div><button data-key="\u001b" title="Escape" disabled>Esc</button><button data-key="\u0003" title="Interrupt" disabled>Ctrl+C</button><button id="scroll-up" disabled>↑ History</button><button id="scroll-down" disabled>↓ Latest</button><button id="paste" disabled>Paste text</button></div></footer>
+          </section>
+          <section id="requests" class="requests" aria-label="Pending questions and permissions" aria-live="polite" hidden></section>
+          <form id="composer" class="composer"><label id="composer-label" for="message">Draft for selected session</label><textarea id="message" rows="2" placeholder="Message the selected session." aria-describedby="recipient-hint" disabled></textarea><div id="delivery" class="delivery" role="status" hidden></div><div class="composer-footer"><span id="recipient-hint">Answer questions and permissions in the live terminal.</span><button id="send" class="primary" type="submit" disabled>Send</button><button id="stop" type="button" disabled hidden>Stop</button><button id="open-terminal" type="button" class="quiet">Open terminal</button></div></form>
+          <div id="readonly-note" class="readonly-note" hidden>Earlier session. Read-only history; it takes no input.</div>
+          <footer class="feedback"><span id="session-source">No session selected</span><span id="history-range" role="status" aria-live="polite"></span><span id="updated"></span></footer>
+        </section>
+        <aside class="documents" id="documents" aria-label="Run context">
+          <div class="panel-title"><strong>Run context</strong><span class="read-only">Read only</span><button id="doc-reading" type="button" aria-pressed="false" title="Expand the document for reading (Esc returns)">Reading mode</button><button id="doc-close" type="button" aria-label="Close documents">Close</button></div>
+          <div class="run-heading"><strong id="run-title">No run selected</strong></div>
+          <div class="doc-tabs" role="tablist"><button id="files-tab" role="tab" aria-selected="true">Run documents</button><button id="discussions-tab" role="tab" aria-selected="false">Discussions</button></div>
+          <select id="document-select" aria-label="Select document"></select>
+          <div class="document-heading"><strong id="document-name">plan.mdx</strong><span id="document-path">Select a document</span></div>
+          <div class="doc-view" role="group" aria-label="Document view"><button id="doc-rendered" type="button" aria-pressed="true">Rendered</button><button id="doc-source" type="button" aria-pressed="false">Source</button></div>
+          <div id="document-rendered" class="document-rendered" tabindex="0" aria-label="Rendered document"></div>
+          <pre id="document-body" tabindex="0" aria-label="Document source" hidden>Docket's durable documents will appear here.</pre>
+          <div class="document-footer">Conversation and task approval are separate. The Docket paper trail remains the source of truth.</div>
+        </aside>
+      </div>
+    </main>
+  </div>
+  <dialog id="project-dialog" aria-labelledby="project-dialog-title"><form id="project-form" method="dialog"><span class="eyebrow">PROJECT LIST</span><h2 id="project-dialog-title">Add a project</h2><p>Enter the absolute path of a directory that holds <code>.docket/</code>. Adding it only lists its runs: it creates no run and starts no agent.</p><label for="project-path-input">Project directory</label><input id="project-path-input" type="text" autocomplete="off" spellcheck="false" placeholder="/home/you/Documents/Projects/test"><p id="project-error" class="dialog-error" role="alert" hidden></p><div class="dialog-actions"><button id="project-cancel" type="button">Cancel</button><button id="project-submit" type="submit" class="primary">Add project</button></div></form></dialog>
+  <dialog id="paste-dialog"><form method="dialog"><span class="eyebrow">TERMINAL PASTE</span><h2>Review text before sending</h2><p>Line breaks can submit commands or answers in the selected terminal.</p><textarea id="paste-text" rows="8" aria-label="Text to paste"></textarea><div class="dialog-actions"><button value="cancel">Cancel</button><button id="send-paste" value="send" class="primary">Send to terminal</button></div></form></dialog>
+  <dialog id="link-dialog" aria-labelledby="link-dialog-title"><form id="link-form" method="dialog"><span class="eyebrow" id="link-eyebrow">LINK A SAVED SESSION</span><h2 id="link-dialog-title">Link a session to this role</h2><p id="link-intro"></p><label for="link-select" id="link-select-label">Saved session</label><select id="link-select" aria-describedby="link-detail"></select><p id="link-detail" class="link-detail"></p><label class="check"><input type="checkbox" id="link-confirm"> <span id="link-confirm-text">I confirm this saved session is this role's live terminal.</span></label><p id="link-error" class="dialog-error" role="alert" hidden></p><div class="dialog-actions"><button id="link-cancel" type="button">Cancel</button><button id="link-submit" type="submit" class="primary" disabled>Link as this role</button></div></form></dialog>
+</body>
+</html>

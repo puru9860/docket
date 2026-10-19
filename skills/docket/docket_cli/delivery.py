@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import re
+import select
+import sys
 from pathlib import Path
 
 from .common import (
@@ -23,6 +25,7 @@ from .liveness import (
 )
 from .events import derive_events
 from .sessions import harness_process_ref, harness_session
+from .state import armed
 
 
 def delivery_dir(d: Path, role: str) -> Path:
@@ -104,6 +107,41 @@ def mark_announce_delivered(d: Path, role: str, key: str) -> None:
         return
     record["delivered_at"] = now_s()
     publish_json(announce_path(d, role, key), record)
+    remember_receipt(d, role, key, record)
+
+
+IDENTITY_FIELDS = ("revision", "round", "generation", "workflow")
+
+
+def received_path(d: Path, role: str, key: str) -> Path:
+    return delivery_dir(d, role) / "received" / f"{delivery_slug(key)}.json"
+
+
+def remember_receipt(d: Path, role: str, key: str, announcement: dict) -> None:
+    """Keep what a recipient took, past the retirement of its pending record.
+
+    Readiness that depends on the live checkout flaps while anyone runs tests in it,
+    and every flap retires and re-derives the same event; without this record each
+    re-derivation woke the recipient again for work it already had.
+    """
+    publish_json(received_path(d, role, key), {
+        "key": key, **{field: announcement.get(field) for field in IDENTITY_FIELDS},
+        "session": announcement.get("session", ""),
+        "session_generation": announcement.get("session_generation", ""),
+        "received_at": now_s()})
+
+
+def received_before(d: Path, role: str, key: str, pending: dict,
+                    recipient: dict | None = None) -> bool:
+    """Whether this recipient already took this exact event identity."""
+    try:
+        record = json.loads(received_path(d, role, key).read_text())
+    except (OSError, ValueError):
+        return False
+    if any(str(record.get(field)) != str(pending.get(field)) for field in IDENTITY_FIELDS):
+        return False
+    return recipient is None or (record.get("session") == recipient.get("session")
+                                 and record.get("session_generation") == recipient.get("generation"))
 
 
 def record_native_receipt(d: Path, role: str, key: str, pending: dict, reg: dict) -> None:
@@ -115,6 +153,7 @@ def record_native_receipt(d: Path, role: str, key: str, pending: dict, reg: dict
         if not announcement.get("received_at"):
             announcement["received_at"] = now_s()
             publish_json(announce_path(d, role, key), announcement)
+        remember_receipt(d, role, key, announcement)
 
 
 @contextlib.contextmanager
@@ -365,16 +404,33 @@ def cmd_session(a: argparse.Namespace) -> None:
     }
     if previous:
         record["previous_name"] = previous.get("name", "")
+    record.update(proven_native_identity(a, a.role))
     publish(sessions_dir() / f"{sid}.json",
             json.dumps(record, indent=2, sort_keys=True) + "\n")
     print(f"registered session {sid} for {a.run} {a.role} (generation {generation})")
 
 
-def ensure_session_registration(run: str, sid: str, role: str, name: str) -> dict:
+def proven_native_identity(a: argparse.Namespace, role: str) -> dict:
+    """The caller's native identity, only when it was noted for `role` itself.
+
+    A supervisor arming or registering another role is not that role's session.
+    """
+    ref = getattr(a, "harness_session_ref", None)
+    if not ref or getattr(a, "harness_session_role", "") != role:
+        return {}
+    process = harness_process_ref()
+    return {"native_harness": ref,
+            "native_process": {k: process.get(k, "") for k in ("harness", "pid", "start")}
+            if process else {}}
+
+
+def ensure_session_registration(run: str, sid: str, role: str, name: str,
+                                native: dict | None = None) -> dict:
     """Register a worker session for dispatch unless it is already registered here.
 
     Unlike `docket session --register`, an existing matching registration is
     reused rather than advanced, so a retried dispatch stays the same writer.
+    `native` fills a missing identity only and never replaces a recorded one.
     """
     check_session_id(sid)
     reg = read_registration(sid)
@@ -388,10 +444,13 @@ def ensure_session_registration(run: str, sid: str, role: str, name: str) -> dic
             die(f"session {sid!r} is registered for workspace {reg.get('workspace')!r}; "
                 f"re-register it here with `docket session {run} --register --session {sid} "
                 f"--name NAME --role {role}`")
+        if native and not reg.get("native_harness"):
+            reg = {**reg, **native}
+            publish_json(session_path(sid), reg)
         return reg
     record: dict[str, object] = {
         "session": sid, "run": run, "role": role, "workspace": workspace,
-        "generation": 1, "name": name or sid, "registered_at": stamp(),
+        "generation": 1, "name": name or sid, "registered_at": stamp(), **(native or {}),
     }
     publish(session_path(sid), json.dumps(record, indent=2, sort_keys=True) + "\n")
     print(f"registered session {sid} for {run} {role} (generation 1)")
@@ -399,7 +458,7 @@ def ensure_session_registration(run: str, sid: str, role: str, name: str) -> dic
 
 
 def native_session_registration(run: str, role: str, *, create: bool = False,
-                                session: str = "") -> dict:
+                                session: str = "", native: dict | None = None) -> dict:
     """Bind a hook to a run, role, and harness process generation.
 
     Explicit transport IDs use the ordinary session registry. Automatically
@@ -411,7 +470,7 @@ def native_session_registration(run: str, role: str, *, create: bool = False,
     explicit = session or os.environ.get("DOCKET_SESSION", "").strip()
     if explicit:
         if create:
-            ensure_session_registration(run, explicit, role, explicit)
+            ensure_session_registration(run, explicit, role, explicit, native)
         return check_registration(Path(), explicit, run, role)
     ref = harness_session([])
     identity = f"{ref['harness']}:{ref['session_id']}" if ref else "console"
@@ -420,7 +479,10 @@ def native_session_registration(run: str, role: str, *, create: bool = False,
     changed = not reg
     process = harness_process_ref() if ref else {}
     process_identity = {k: process.get(k, "") for k in ("harness", "pid", "start")} if process else {}
-    if reg and reg.get("native_process", {}) != process_identity:
+    # Codex runs commands under a shared app-server whose pid proves nothing, so an
+    # unknown process on either side never reads as a restarted session.
+    recorded = reg.get("native_process", {}) if reg else {}
+    if reg and recorded and process_identity and recorded != process_identity:
         if not create:
             return {}
         reg = {**reg, "generation": int(reg["generation"]) + 1}
@@ -474,6 +536,61 @@ def native_bound_runs(role: str) -> list[str]:
             if native_session_registration(run, role):
                 found.append(run)
     return found
+
+
+def native_bound_roles(ref: dict | None = None) -> list[str]:
+    """Armed roles this harness session holds a current native registration for."""
+    ref = ref or harness_session([])
+    if not ref or not ref.get("session_id"):
+        return []
+    keys = [k for k in ("harness", "session_id") if ref.get(k)]
+    roles = []
+    for path in sorted(sessions_dir().glob("*.json")):
+        reg = read_registration(path.stem)
+        native = reg.get("native_harness", {})
+        if not isinstance(native, dict) or not all(native.get(k) == ref.get(k) for k in keys):
+            continue
+        # The harness session id is the identity; the process differs between a
+        # command run under Codex's shared app-server and the hook its TUI runs.
+        run, role = str(reg.get("run", "")), str(reg.get("role", ""))
+        if (run, role) in armed() and reg.get("workspace") == str(root().resolve()) \
+                and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def hook_input_ref() -> dict[str, str]:
+    """The session named by a Stop hook's JSON on stdin, or {} without one.
+
+    Codex runs its Stop hook without CODEX_THREAD_ID, so the payload's
+    `session_id` is the only identity the hook has.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.isatty() \
+                or not select.select([sys.stdin], [], [], 2)[0]:
+            return {}
+        payload = json.loads(sys.stdin.read(1 << 20) or "{}")
+    except (OSError, ValueError):
+        return {}
+    sid = str(payload.get("session_id", "")) if isinstance(payload, dict) else ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid):
+        return {}
+    transcript = str(payload.get("transcript_path", ""))
+    harness = ("codex" if "/.codex/" in transcript else
+               "claude" if "/.claude/" in transcript else "")
+    return {"session_id": sid, **({"harness": harness} if harness else {})}
+
+
+def cmd_hook_role(_a: argparse.Namespace) -> None:
+    """Print the one role the wake hook should serve for this session, or nothing.
+
+    A session the user started by hand, typically the planner, has no DOCKET_ROLE,
+    but `docket arm` inside it registered its native identity. Without this the
+    hook stayed inert and the session polled `docket watch` one model turn at a time.
+    """
+    roles = native_bound_roles(harness_session([]) or hook_input_ref())
+    if len(roles) == 1:
+        print(roles[0])
 
 
 def inbox_ack(a: argparse.Namespace, d: Path) -> None:
@@ -548,6 +665,7 @@ def inbox_retry(a: argparse.Namespace, d: Path) -> None:
             die(f"{a.retry} is stale and was retired: {why}")
         lease_path(d, a.role, a.retry).unlink(missing_ok=True)
         announce_path(d, a.role, a.retry).unlink(missing_ok=True)
+        received_path(d, a.role, a.retry).unlink(missing_ok=True)
         delivery_log(d, a.role, {"kind": "retry", "key": a.retry, "reason": reason})
         fault("delivery:retry")
         print(f"{a.retry} will be attempted again: {reason}")

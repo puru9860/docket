@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .common import STATE_DIR, die, stamp
 from .frontmatter import parse, render, sections
-from .paths import _ordered, latest, owners, read_dispatch, root
+from .paths import _ordered, owners, read_dispatch, root
 from .publication import publish, publish_exclusive
 from .policy import need_run, task_executor
 from .locks import run_lock
@@ -153,6 +153,20 @@ def is_reject(record: dict) -> bool:
     return (record.get("kind"), record.get("result")) in REJECT_CASES
 
 
+def usage_tokens_for_model(record: dict, model: str) -> int:
+    """One usage record's tokens spent on `model`, split call by call.
+
+    An older record without a per-model split counts only when its session used
+    that model alone; a mixed session cannot be divided after the fact.
+    """
+    split = record.get("by_model")
+    if isinstance(split, dict):
+        return sum(int((counts or {}).get("total") or 0) for name, counts in split.items()
+                   if normalized_model(str(name)) == model)
+    models = [normalized_model(str(m)) for m in record.get("models") or []]
+    return int(record.get("total") or 0) if models == [model] else 0
+
+
 def model_scorecard(records: list[dict], model: str) -> dict[str, object]:
     """Tasks, first-pass rate, rounds to accept, reject counts, and tokens for one model."""
     tasks: dict[tuple, dict] = {}
@@ -172,8 +186,7 @@ def model_scorecard(records: list[dict], model: str) -> dict[str, object]:
                     str(r.get("round", "")).isdigit() else 1
                 task["profile"] = str(r.get("model_profile", "-"))
     decided = [t for t in tasks.values() if t["accepted"]]
-    tokens = sum(int(r.get("total") or 0) for r in records
-                 if r.get("origin") == "usage" and model in (r.get("models") or []))
+    tokens = sum(usage_tokens_for_model(r, model) for r in records if r.get("origin") == "usage")
     by_profile: dict[str, list[dict]] = {}
     for t in decided:
         by_profile.setdefault(t["profile"] or "-", []).append(t)

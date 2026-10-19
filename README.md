@@ -70,6 +70,11 @@ Three things make it hold up on real work:
   refused until that body passes the whole gate again and is re-verified, and an
   edited blocked report stays waivable because its re-review skips completion
   verification exactly as its submission did.
+- **Each unit of work keeps one context.** Under `round_context: fresh`, the default for new runs, the quick implementor coordinates one subagent per task on its own model.
+  Every correction continues that task's subagent; reviewers similarly keep one subagent per milestone through corrections and re-reviews.
+  Claude Code continues through SendMessage to the agent id, and OpenCode through the task tool with its task_id.
+  A new task or milestone gets a new context; a replacement starts only when the original is gone.
+  Codex roles keep working in their session.
 - **Signalling costs nothing while idle.** A supervisor finishes its turn and goes idle.
   A watcher sleeps in the background and re-enters the session only when something is
   actionable, using the harness's own wake mechanism rather than a polling loop that
@@ -467,9 +472,14 @@ docket retrospective R01               # mechanical run summary
 Docket also notes each role's harness session (Claude Code, Codex, or OpenCode) whenever the role runs its own docket commands, so token usage per role and the full conversation behind any report can be reviewed later:
 
 ```bash
-docket usage R01              # tokens since each role joined the run, read from harness transcripts
+docket usage R01              # tokens per role and per model inside the run's window, read from harness transcripts
 docket usage R01 --archive    # also keep a copy of every transcript and log its usage
+docket metrics R01            # corrections, first-round approvals, missed handoffs, tokens by role and model
 ```
+
+A role's window opens when it joins the run and closes when the run ends or when the same session joins another run, so a reused TUI never inflates a finished run.
+Subagents are counted under the session that started them, and a mixed-model session is split call by call.
+A transcript with no call in the window is reported as a gap, never as zero.
 
 The standard run's final aggregate verdict archives automatically. In new quick
 runs the planner runs `docket usage R01 --archive` after the final milestone.
@@ -513,6 +523,31 @@ Any multiplexer works, since the protocol is just files. If you use
 [herdr](https://github.com/kunchenguid), the orchestrator playbook has ready-made
 `pane split` / `agent start` / `agent prompt` commands, plus the split-direction and
 zoom guidance for keeping 2-3 agent panes readable.
+
+## Browser companion
+
+The [chat UI design](docs/frontend-chat-design.md) keeps agents in their normal
+interactive TUI/CLI and gives each actual session its own conversation. Run
+`cd ui` and `npm run design`, then open <http://127.0.0.1:4320/frontend-design/>
+to try its sample interactions. This design preview does not connect to live agents.
+
+The optional [browser companion](ui/README.md) implements that layout for real runs.
+It shows saved provider messages and tool activity, collapsed earlier implementor tasks, the run's documents, and a live Herdr terminal for each role.
+Its project list holds the directories you add, and selecting one only lists its runs.
+Each role connects automatically when a native session or process identity proves its terminal, and otherwise says exactly why and offers one recovery step, such as linking one of the run's saved sessions after you confirm it.
+Send delivers to a ready interactive agent whose session is proven, and it reports sent, failed or uncertain truthfully.
+Question and permission cards appear only where a provider exposes a verified endpoint, and everything else stays in the live terminal.
+See [its README](ui/README.md) for what each harness supports today.
+It lives in `ui/` with separate npm dependencies and is not installed with the stdlib-only skill.
+
+```bash
+cd ui
+npm ci
+npm start
+```
+
+Open the private local URL printed at startup, add a project directory that holds `.docket/`, select a role, and its existing terminal connects when its identity is proven or when you bind it explicitly.
+Terminals open read-only, and control and takeover are separate actions.
 
 ## Contributing / modifying docket
 

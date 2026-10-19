@@ -15,7 +15,7 @@ from pathlib import Path
 from .common import DELIVERY_LEASE_SECONDS, STATE_DIR, die, now_s, stamp
 from .paths import root, run_dir
 from .publication import fault, perturb, publish, publish_json
-from .policy import need_run, require_preset_role
+from .policy import fresh_context_resume, fresh_context_tool, need_run, plan_flag, require_preset_role
 from .baselines import evidence_mode
 from .state import armed
 from .sessions import (
@@ -29,7 +29,10 @@ from .delivery import (
     announce_active, announce_delivered, announce_dir, announce_path, delivery_lock,
     delivery_log, event_actionable, inbox_ack, inbox_retry, mark_announce_delivered,
     paused_flag, read_pending, sweep_role,
-    claim_event, event_is_owned, native_bound_runs, native_session_registration, read_announce,
+    claim_event, event_is_owned, native_bound_roles, native_bound_runs, native_session_registration,
+    proven_native_identity,
+    received_before,
+    read_announce,
 )
 
 
@@ -157,9 +160,19 @@ def watch_conf_lock():
 def cmd_arm(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     require_preset_role(d, a.role)
+    declared_role = os.environ.get("DOCKET_ROLE", "").strip()
+    selector = [r for r in os.environ.get("DOCKET_RUN", "").strip().split(",") if r]
+    # A reused TUI keeps the environment it was started with, /clear included, and
+    # its wake hook watches only DOCKET_RUN: arming another run there never wakes.
+    if selector and a.run not in selector and declared_role in ("", a.role):
+        die(f"this session was started with DOCKET_RUN={','.join(selector)}, so its wake hook "
+            f"watches only that and would never wake {a.role} for {a.run}. Start {a.role} in "
+            f"a fresh pane with DOCKET_RUN unset (or DOCKET_RUN={a.run}); /clear keeps the "
+            "old process environment")
     session = getattr(a, "session", "")
     if session or getattr(a, "harness_session_ref", None):
-        native_session_registration(a.run, a.role, create=True, session=session)
+        native_session_registration(a.run, a.role, create=True, session=session,
+                                    native=proven_native_identity(a, a.role))
     conf = root() / STATE_DIR / "watch.conf"
     with watch_conf_lock():
         pairs = armed()
@@ -212,13 +225,17 @@ def codex_hook_hint(role: str) -> str:
         return ""
     hooks = ", ".join(map(str, codex_hook_configuration(codex_home())["locations"]))
     declared = os.environ.get("DOCKET_ROLE", "").strip()
-    if declared == role:
-        return (f"The docket Stop hook in {hooks} serves this session (DOCKET_ROLE={role}). "
+    if declared == role or (not declared and native_bound_roles() == [role]):
+        return (f"The docket Stop hook in {hooks} serves this session ({role}). "
                 "Local configuration is enabled; effective overrides and trust are unknown. "
                 "If /hooks confirms it is trusted and a real wake works, stop this watcher and end your turn instead: "
                 "the hook waits at no model cost and hands you the wake as your next prompt.")
+    if not declared:
+        return (f"The docket Stop hook in {hooks} does not serve this session yet. Run "
+                f"`docket arm <run> --role {role}` here once; the hook then serves {role} "
+                "without DOCKET_ROLE, so stop this watcher and end your turn instead.")
     return (f"The docket Stop hook in {hooks} is inert here: this session's environment has "
-            f"DOCKET_ROLE={declared or 'unset'}, not {role}, and prefixing one command does not "
+            f"DOCKET_ROLE={declared}, not {role}, and prefixing one command does not "
             f"change that. Wait on this watcher; start the next {role} session in a pane "
             f"created with --env DOCKET_ROLE={role} so the hook can serve it.")
 
@@ -317,6 +334,33 @@ def refuse_watching_from_a_session_noted_for_another_role(
             f"{', '.join(noted)} in {run}; run `docket watch {run} "
             f"--role {noted[0]}` instead, or watch from a terminal "
             "with no registered harness session")
+
+
+# Reviewing sessions retain one subagent per unit while their own context waits.
+FRESH_REVIEW_ROLES = ("reviewer", "verifier", "checker")
+
+
+def fresh_review_note(role: str, items: list[tuple[str, str]]) -> str:
+    """Reuse one review context per milestone, or one verification context per task."""
+    if role not in FRESH_REVIEW_ROLES or not items:
+        return ""
+    run = items[0][0]
+    d = run_dir(run)
+    harness = plan_flag(d, f"{role}_harness", "") or calling_harness()
+    tool = fresh_context_tool(d, harness)
+    if not tool:
+        return ""
+    unit = "milestone" if role == "reviewer" else "task"
+    work = "; ".join(f"{message} (run {item_run})" for item_run, message in items)
+    return (f"\nRound context is fresh: after pickup, do not review here. Use one subagent per "
+            f"{unit}, on your own model (no model override). For a {unit} you already reviewed "
+            f"(a correction or re-review), continue that subagent with "
+            f"{fresh_context_resume(harness)} so it checks only what changed against what it "
+            f"asked for and for regressions. Start a replacement only if it is gone. "
+            f"Otherwise start one with {tool} and keep its id. Group items by run and {unit}; "
+            f"give each subagent only its unit's items. Give it: \"You are the "
+            f"{role} for docket run {run}. Run `docket help {role}`, then act on: {work}. Reply "
+            "with one line per item: the verdict you recorded.\" Then wait again.")
 
 
 def cmd_watch(a: argparse.Namespace) -> None:
@@ -461,7 +505,8 @@ def cmd_watch(a: argparse.Namespace) -> None:
                             # to prevent. A moved identity retires the record
                             # in sweep_role, so a changed event still wakes.
                             if not announce_active(d, role, k, recipient) \
-                                    and not announce_delivered(d, role, k, recipient):
+                                    and not announce_delivered(d, role, k, recipient) \
+                                    and not received_before(d, role, k, pending, recipient):
                                 claimed.append((k, m))
                         for k, _m in claimed:
                             pending = read_pending(d, role, k)
@@ -518,6 +563,7 @@ def cmd_watch(a: argparse.Namespace) -> None:
                 + "\n\nRun `docket status <run>` for the run named above, then review it."
                 + f"\nThis watcher is scoped only to the {a.role} role."
                 + pickup
+                + fresh_review_note(a.role, [(item[0], item[4]) for item in fresh])
                 + "\nProcess normal review batches silently: do not send lifecycle or per-task"
                 + " progress to the user. Speak only for a blocker requiring user authority,"
                 + " final completion, or an explicit status request.",

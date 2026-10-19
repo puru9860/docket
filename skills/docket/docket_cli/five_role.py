@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 
 from .common import MODE_QUICK, MODE_STANDARD, die, stamp
-from .frontmatter import render
-from .paths import _ordered, decisions, next_numbered, planned_tasks, root
+from .frontmatter import parse, render
+from .paths import _ordered, next_numbered, planned_tasks, root
 from .publication import publish_exclusive, publish_json
 from .policy import (
     artifact_policy_fields, correction_limit_of, is_five_role, is_quick_milestone, mode_of, need_run,
@@ -31,6 +31,51 @@ def correction_attempts(record: dict) -> int:
         except (TypeError, ValueError):
             continue
     return total
+
+
+def correction_counts(d: Path) -> dict[str, int]:
+    """Charged returns to the implementor per owner, read from durable artifacts.
+
+    Applied decisions and verification findings survive approval, while the
+    active .corrections budget record is deliberately cleared. Count each
+    charged return from those durable artifacts and use the active record
+    only when a return has been charged before its decision was published.
+    """
+    corrections_by_owner: dict[str, int] = {}
+    verifier_decisions: set[str] = set()
+    for decision in d.glob("*-decision-*.mdx"):
+        try:
+            meta = parse(decision.read_text())[0]
+        except (OSError, ValueError):
+            continue
+        if meta.get("verdict") != "changes-requested" or meta.get("applied") != "yes" \
+                or meta.get("requirement_amendment"):
+            continue
+        owner = str(meta.get("owner", ""))
+        if owner and owner != "orch":
+            corrections_by_owner[owner] = corrections_by_owner.get(owner, 0) + 1
+        if meta.get("verification"):
+            verifier_decisions.add(str(meta["verification"]))
+    for verification in d.glob("*-verification-*.mdx"):
+        try:
+            meta = parse(verification.read_text())[0]
+        except (OSError, ValueError):
+            continue
+        owner = str(meta.get("owner", ""))
+        if owner and verification.name not in verifier_decisions \
+                and meta.get("opened_correction") in ("requested", "yes", "escalated"):
+            corrections_by_owner[owner] = corrections_by_owner.get(owner, 0) + 1
+    if (d / ".corrections").is_dir():
+        for path in (d / ".corrections").glob("*.json"):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict):
+                owner = str(record.get("owner", path.stem))
+                corrections_by_owner[owner] = max(corrections_by_owner.get(owner, 0),
+                                                  correction_attempts(record))
+    return corrections_by_owner
 
 
 def note_correction(d: Path, owner: str, kind: str, token: str = "") -> dict:

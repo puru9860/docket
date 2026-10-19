@@ -15,8 +15,10 @@ from .common import die, stamp
 from .frontmatter import sections
 from .paths import owners, planned_tasks
 from .publication import publish_bytes, publish_json
-from .policy import is_five_role, is_quick_milestone, is_tiered, need_run
+from .policy import MILESTONE_DEPENDENCIES, is_five_role, is_quick_milestone, is_tiered, need_run, plan_flag
 from .locks import owner_lock
+from .bundles import FINAL_STATES, bundle_problems, latest_bundle, load_bundle
+from .dependencies import packet_staleness, withdrawn_readiness
 from .state import (
     _cycle_for_new_edges, batch_path, list_batches, quick_submitted_pass, read_batch,
     state_of, task_depends_on,
@@ -373,6 +375,44 @@ def batch_verification_historical_valid(d: Path, batch: dict) -> bool:
     return (isinstance(verification, dict)
             and str(verification.get("status", "")) == "passed"
             and batch_verification_matches(d, batch, historical=True))
+
+
+def milestone_dependency_problem(d: Path, owner: str, other: str) -> str:
+    """Require historical milestone approval for inputs outside a shared milestone."""
+    if plan_flag(d, "milestone_dependencies") != MILESTONE_DEPENDENCIES:
+        return ""
+    milestones = [batch for batch in list_batches(d) if batch.get("milestone")]
+    consumer = {str(batch.get("batch")) for batch in milestones
+                if owner in batch.get("members", [])}
+    producer = [batch for batch in milestones if other in batch.get("members", [])]
+    # Ungrouped tasks retain their recorded integration policy.
+    if not producer:
+        return ""
+    for batch in producer:
+        bid = str(batch.get("batch"))
+        if bid in consumer and batch.get("state") == "closed":
+            continue
+        decision = batch.get("milestone_decision") or {}
+        verification = batch.get("verification") or {}
+        members_intact = True
+        for member in batch.get("members", []):
+            rnd, st = state_of(d, str(member))
+            entry = latest_bundle(d, str(member), rnd)
+            if (st not in FINAL_STATES or not entry or bundle_problems(d, str(member), entry)
+                    or packet_staleness(d, str(member), rnd, load_bundle(d, str(member), entry))
+                    or withdrawn_readiness(d, str(member))):
+                members_intact = False
+                break
+        if (batch.get("state") == "closed" and isinstance(decision, dict)
+                and isinstance(verification, dict) and decision.get("verdict") == "approved"
+                and members_intact
+                and decision.get("member_bundles") == current_member_bundles(d, batch)
+                and decision.get("batch_verification") == verification.get("digest")
+                and batch_verification_historical_valid(d, batch)):
+            continue
+        return (f"{other} requires milestone {bid} approval before {owner} may dispatch "
+                "or consume its evidence; verify and approve that milestone first")
+    return ""
 
 
 def batch_verify_failed(d: Path, batch: dict) -> bool:

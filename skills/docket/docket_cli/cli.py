@@ -15,7 +15,7 @@ from .sessions import cmd_usage, note_command_session
 from .discussions import DISCUSSION_PARTICIPANTS, cmd_discuss
 from .models import cmd_feedback, cmd_models
 from .five_role import ROUTE_TABLE, cmd_escalate_mode, cmd_escalation, cmd_route
-from .delivery import cmd_inbox, cmd_reconcile, cmd_session
+from .delivery import cmd_hook_role, cmd_inbox, cmd_reconcile, cmd_session
 from .signalling import cmd_arm, cmd_disarm, cmd_events, cmd_instruct, cmd_pickup, cmd_watch
 from .health import cmd_health
 from .submission import cmd_submit
@@ -200,6 +200,9 @@ def main() -> None:
     q.add_argument("owner", type=owner_argument)
     q.add_argument("--actual", required=True, help="exact active model label or provider/model id")
     q.add_argument("--effort", default="", help="verified active effort when exposed by the harness")
+    q.add_argument("--harness", default="", choices=("", "claude", "codex", "opencode"),
+                   help="the worker's harness, when it changed since dispatch; the worker's own "
+                        "session records it without this flag")
     q.set_defaults(fn=cmd_set_model)
 
     q = sub.add_parser(
@@ -213,6 +216,9 @@ def main() -> None:
     q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
     q.add_argument("--background", action="store_true",
                    help="run the full submit transition detached from a short harness shell call")
+    q.add_argument("--check", action="store_true",
+                   help="list what the gate would refuse in the current report; runs nothing, "
+                        "freezes nothing, and changes nothing")
     q.add_argument("--background-worker", action="store_true", help=argparse.SUPPRESS)
     q.add_argument("--as", dest="as_role", default="",
                    choices=("", *ACTING_ROLES),
@@ -546,6 +552,9 @@ def main() -> None:
     q.add_argument("--interval", type=int, default=5)
     q.add_argument("--timeout", type=int, default=28800)
     q.set_defaults(fn=cmd_watch)
+
+    q = sub.add_parser("hook-role", help="print the role the wake hook serves for this harness session")
+    q.set_defaults(fn=cmd_hook_role)
 
     q = sub.add_parser("events", help="inspect a role's pending events without consuming them")
     q.add_argument("run")

@@ -8,14 +8,11 @@ standardized aggregate report.
 
 New runs start on the quick preset; the standard preset (`--mode standard`)
 keeps separate planner, orchestrator, implementor, verifier, and reviewer
-sessions. Quick merges
-planning and orchestration into one coordinator and verification and review
-into one checker. A coordinator performs exactly these duties plus plan
-ownership; a checker performs verification then review as two recorded duties
-under `combined-checker`. The merge never uses `--skip-verify`, a blanket
-`verifier_exempt`, or a legacy completion shortcut. Every artifact records the
-merge, and a run that outgrows quick records an escalation request without
-migrating or recapturing any baseline.
+sessions.
+New quick runs give coordination to the implementor, with a separate planner and milestone reviewer and no verifier session.
+Existing `combined-checker` quick runs keep their coordinator and checker, with verification then review recorded as separate duties.
+Neither policy uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut.
+A run that outgrows quick records an escalation request without migrating or recapturing any baseline.
 
 ## Standard preset window layout
 
@@ -119,7 +116,10 @@ docket batch <run> --close B1
 ```
 
 In a tiered standard run, a verifier pass frees the slot and scope for the
-next dependent; a failure can open a local correction. Once members settle,
+next dependent in the same closed milestone; a failure can open a local correction.
+With `milestone_dependencies: approval-v1`, a dependency from another milestone waits for that milestone's intact approval, so dispatch-ready wakes and `docket depend --on` cannot offer it early.
+Runs without the field keep their previous settlement rules.
+Once members settle,
 `batch:B1:verify-ready` wakes you to run
 `docket batch <run> --verify B1 --command 'tests/test.sh'`. This event retires
 while verification holds the batch lock and when a current result exists.

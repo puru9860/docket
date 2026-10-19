@@ -10,12 +10,13 @@ from pathlib import Path
 
 from .common import STATE_DIR, die, stamp
 from .frontmatter import parse, render
-from .paths import decisions, next_numbered, root
+from .paths import next_numbered, root
 from .publication import publish, publish_exclusive
 from .policy import need_run, plan_flag
 from .state import list_incidents
 from .feedback import feedback_dir
-from .five_role import correction_attempts
+from .liveness import handoff_outcome, missed_wakes
+from .five_role import correction_counts
 from .sessions import collect_run_usage
 
 
@@ -211,24 +212,18 @@ def advance_finding(a: argparse.Namespace) -> None:
 def cmd_retrospective(a: argparse.Namespace) -> None:
     """Summarize a run mechanically: corrections, delivery, stalls, and use.
 
-    No model is called. Measured run tokens come from noted harness sessions;
-    a mixed-model session cannot attribute its total to premium models.
-    Raw observations are never quoted into prompts here.
+    No model is called. Corrections are counted from the same durable artifacts
+    as `docket metrics`, and tokens are split by model call by call. A stall
+    nobody flagged still shows as a missed handoff in the delivery logs.
     """
     d = need_run(a.run)
-    corrections = 0
-    if (d / ".corrections").is_dir():
-        for path in (d / ".corrections").glob("*.json"):
-            try:
-                record = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            corrections += correction_attempts(record if isinstance(record, dict) else {})
+    by_owner = correction_counts(d)
     decisions = len(list(d.glob("*-decision-*.mdx")))
     verifications = len(list(d.glob("*-verification-*.mdx")))
     escalations = sorted(p.name for p in (d / ".escalations").glob("*.json")) \
         if (d / ".escalations").is_dir() else []
     incidents = list_incidents(d)
+    missed = missed_wakes(d)
     kinds: dict[str, int] = {}
     for log in sorted((d / ".delivery").glob("*/log.jsonl")) if (d / ".delivery").is_dir() else []:
         try:
@@ -237,38 +232,45 @@ def cmd_retrospective(a: argparse.Namespace) -> None:
             continue
         for line in lines:
             try:
-                kinds[json.loads(line).get("kind", "?")] = \
-                    kinds.get(json.loads(line).get("kind", "?"), 0) + 1
+                kind = json.loads(line).get("kind", "?")
             except ValueError:
                 continue
+            kinds[kind] = kinds.get(kind, 0) + 1
     feedback = len(list(feedback_dir(d).glob("*.mdx"))) if feedback_dir(d).is_dir() else 0
     usage = collect_run_usage(d, False)
-    measured = bool(usage) and all(row.get("found") for row in usage)
+    measured = bool(usage) and all(row.get("telemetry") == "measured" for row in usage)
     premium_models = {item.strip() for item in plan_flag(d, "premium_models", "").split(",")
                       if item.strip()}
     print(f"retrospective for run {a.run} (mechanical summary, no model calls)")
-    print(f"  correction attempts: {corrections}")
+    print(f"  correction attempts: {sum(by_owner.values())}"
+          + (f" ({', '.join(f'{o} {n}' for o, n in sorted(by_owner.items()) if n)})"
+             if any(by_owner.values()) else ""))
     print(f"  decisions recorded: {decisions}")
     print(f"  verifier findings: {verifications}")
     print(f"  open escalations: {', '.join(escalations) or 'none'}")
-    print(f"  stall incidents: {len(incidents)} "
+    print(f"  stall incidents flagged: {len(incidents)} "
           f"({sum(1 for i in incidents if i.get('state') == 'open')} open)")
-    print(f"  delivery transport records: "
+    print(f"  missed handoffs: {len(missed)} (wakes re-announced after a lapsed lease; "
+          "a stall nobody flagged still shows here)")
+    for wake in missed:
+        print(f"    {wake['role']} {wake['key']}: first announced {wake['first']}, "
+              + handoff_outcome(wake))
+    print("  delivery transport records: "
           + (", ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "none"))
     print(f"  feedback observations: {feedback}")
     if measured:
         print(f"  run tokens: {sum(int(row.get('total', 0) or 0) for row in usage)} "
-              "(since each role joined this run)")
+              "(each role from joining this run to the run's end)")
     else:
-        print("  run tokens: unknown (no complete harness usage)")
-    attributable = measured and bool(premium_models) and all(
-        row.get("models") and (set(row["models"]).issubset(premium_models)
-                               or set(row["models"]).isdisjoint(premium_models))
-        for row in usage)
-    if attributable:
-        premium = sum(int(row.get("total", 0) or 0) for row in usage
-                      if set(row["models"]).issubset(premium_models))
-        print(f"  premium tokens: {premium} (configured premium_models; session totals)")
+        gaps = [f"{'+'.join(row.get('roles') or []) or 'unknown'} {row.get('telemetry')}"
+                for row in usage if row.get("telemetry") != "measured"]
+        print("  run tokens: unknown ("
+              + (", ".join(gaps) if gaps else "no harness session noted") + ")")
+    if measured and premium_models:
+        premium = sum(int(counts.get("total") or 0) for row in usage
+                      for model, counts in (row.get("by_model") or {}).items()
+                      if model in premium_models)
+        print(f"  premium tokens: {premium} (configured premium_models; per call)")
     else:
         print("  premium tokens: unknown (invocation counts are a proxy, not spend; "
-              "mixed or unclassified sessions cannot be split)")
+              "set premium_models and measure every role)")

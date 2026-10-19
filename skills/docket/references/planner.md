@@ -52,8 +52,14 @@ change afterwards.
 
 ## Choose the integration policy
 
-`plan.mdx` carries `provisional_integration: forbidden` by default: a task may only
-consume another task's evidence once that task is approved. Declare
+New plans record `milestone_dependencies: approval-v1`.
+Tasks inside one closed milestone may consume verified tiered-settled inputs; a dependency from another milestone requires that milestone's intact approval.
+Dispatch, `docket depend --on`, and dispatch-ready wakes enforce the same rule, even when `provisional_integration: allowed` is recorded.
+Runs without the field keep their previous behavior; ungrouped tasks keep their recorded integration policy.
+Put approval-dependent tasks in different milestones, or merge tasks that cannot be implemented independently, so end-of-milestone review cannot deadlock implementation.
+
+`plan.mdx` carries `provisional_integration: forbidden` by default: outside tiered settlement, a task may only consume another task's evidence once it is approved.
+Declare
 `provisional_integration: allowed` when the plan genuinely needs one task to build on
 another's verified but unapproved work. Read that word literally: the policy admits only
 a round whose frozen verification passed, so a blocked or skipped task is never a
@@ -89,14 +95,25 @@ non-premium fallbacks remain available. A missing transcript makes the guard
 refuse the premium launch because it cannot measure the remaining allowance.
 An account-wide Codex usage warning wakes the planner once per limit window;
 review the reserve and model policy before authorizing another premium launch.
-Prefer fewer, larger tasks that each deliver a checkable outcome. Avoid a chain
-of tiny tasks that touch the same file: every task adds a dispatch, verifier
-finding, and review boundary. Split work when the outcomes have independent
-acceptance criteria, can proceed separately, or need a different owner.
+Prefer fewer, larger tasks when shared discovery or invariants make separate tasks wasteful.
+Each milestone delivers one demonstrable capability, normally with 2-4 tasks.
+Each task delivers one checkable behavior with its meaningful tests, fitting one working context without compaction-driven rediscovery.
+Merge tasks that share discovery or invariants or cannot be demonstrated separately; avoid repeated discovery for tiny edits to the same behavior.
+Split tasks when acceptance is independent, ownership differs, or the necessary working material will exceed one context.
+Shared discovery is a reason to merge, and a file count is only a hint rather than a task boundary.
+State the failure model and explicitly excluded failure classes in the acceptance criteria before implementation, including durability, interruption, and rollback guarantees where relevant.
+Exclusions must qualify the promised behavior rather than contradict it.
 Write at least one task-specific, checkable `--criterion` when assigning a
 task. A standard tiered run then adds criteria for sibling sites, existing behavior, and side
 effects. Use `--no-default-criteria` only when those three questions genuinely
 do not apply.
+When a criterion depends on something the unit tests only imitate, such as an
+installed tool, a live service, real data, or what a screen shows, say in the
+criterion how it is observed for real: the command, a fixture copied from real
+data, or the screen and its size. The reviewer checks the real thing, so a
+criterion a fake can satisfy costs a correction round.
+Put what you already know about that system, and the limits of that knowledge,
+in a `--decision`, so the implementor does not rediscover it.
 
 Assign focused per-task verification: each task's `verify:` covers only the area
 it touches, and that declared command is the implementor's whole test obligation.
@@ -132,7 +149,8 @@ For a new plan instruction that the orchestrator needs while it waits, record
 wakes immediately and the orchestrator resolves the instruction after handling
 it. Use this for decisions about intent, not routine task progress.
 
-Arm only the planner role and set `DOCKET_ROLE=planner` in its session:
+Arm only the planner role, from your own session.
+The wake hook then serves this session even when it was started by hand without `DOCKET_ROLE=planner`, so after the handover end your turn and let the hook wake you instead of polling `docket watch`:
 
 ```bash
 docket arm <run> --role planner

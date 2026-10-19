@@ -40,14 +40,22 @@ while [ ! -d "$ROOT/.docket" ] && [ "$ROOT" != / ]; do
   [ -n "$ROOT" ] || ROOT=/
 done
 CONF="$ROOT/.docket/watch.conf"
+DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
+
+# A session started by hand (usually the planner) has no DOCKET_ROLE; serve the
+# one role it armed natively in this session, so it never has to poll.
+role="${DOCKET_ROLE:-}"
+if [ -f "$CONF" ] && [ -z "$role" ]; then
+  role="$(cd "$ROOT" && python3 "$DOCKET" hook-role 2>/dev/null)" || role=""
+fi
 
 watch_args=(discuss --watch-joined)
 HOOK_RECIPIENT=discussion
-if [ -f "$CONF" ] && [ -n "${DOCKET_ROLE:-}" ]; then
-  case "$DOCKET_ROLE" in
+if [ -f "$CONF" ] && [ -n "$role" ]; then
+  case "$role" in
     planner|orchestrator|implementor|verifier|reviewer|coordinator|checker)
-      watch_args=(watch --armed --role "$DOCKET_ROLE")
-      HOOK_RECIPIENT="$DOCKET_ROLE" ;;
+      watch_args=(watch --armed --role "$role")
+      HOOK_RECIPIENT="$role" ;;
     *) exit 0 ;;
   esac
 elif [ ! -d "$ROOT/.docket/conversations" ]; then
@@ -55,7 +63,6 @@ elif [ ! -d "$ROOT/.docket/conversations" ]; then
 fi
 cd "$ROOT" || exit 0
 
-DOCKET="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/docket"
 FAILURE="$ROOT/.docket/hook-failure-$HOOK_RECIPIENT"
 
 # The CLI is stdlib-only; avoid uv cache and network state in the wake path.

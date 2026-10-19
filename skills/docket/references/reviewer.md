@@ -1,8 +1,9 @@
 # Reviewer
 
 Independently judge correctness, design, integration, and outcome. You are the
-only role that approves or waives, and you work from a fresh context: the
-objective and the approved contract, never the planner's conversation history.
+only role that approves or waives.
+Start each milestone from the objective and approved contract in its own context, keeping that context through corrections and re-reviews.
+Never inherit the planner's conversation history.
 Under `five-role-v1` submission is never terminal: tasks record `submitted`
 and become terminal only through your decision. Standard runs also review an
 aggregate; new quick runs complete after all milestone decisions.
@@ -34,10 +35,11 @@ docket review-packet <run> --role reviewer [--correction T03] [--batch B1] [--ou
    members; correction and final packets keep their current selection. Inspect relevant source and evidence yourself when
    the packet leaves doubt;
    protecting your context never prohibits the independent checks that catch
-   integration defects. Read every relevant frozen patch and its changed tests,
-   even when the packet shortens diff excerpts. Follow the bundle paths to the
-   complete patch; inspect surrounding code where the change needs context and
-   check material expected behavior independently. Routine evidence checks belong to the verifier.
+   integration defects.
+   On the first milestone review, read every relevant frozen patch and its changed tests, even when the packet shortens excerpts.
+   Follow the bundle paths to the complete patch, inspect surrounding code where needed, and check material expectations independently.
+   Consolidate every discovered acceptance failure into one numbered list per member, with each finding naming its criterion and a reproducer or causal argument.
+   Routine evidence checks belong to the verifier.
    Every named verifier artifact carries its complete Findings body, every
    waiver carries its complete waiver reason, every outstanding numbered
    required change is reproduced in full, and Decisions needed quotes each
@@ -97,8 +99,13 @@ for legacy runs. A frontier is a wake, never a combined verdict: approving one
    In a new quick run, a completed, full-suite-passing milestone wakes you directly.
    Old `combined-checker` quick runs wake the checker for verified work.
 3. Review corrections against the delta from the reviewed bundle with refreshed
-   evidence, keeping the full diff in reach; expand review when corrections
-   touch other work. Two local correction attempts after initial submission is
+   evidence, keeping the full diff in reach.
+   The correction packet leads with the objective, affected criteria and failure model, previous numbered changes, exact prior/current bundles, correction delta, refreshed evidence, and changed dependency identities.
+   Retrieve the full historical patch when the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or when the delta is unavailable.
+   Judge a correction against the previous decision's required
+   changes and for regressions: a new defect outside them requests changes only
+   when it breaks an acceptance criterion as written, and stronger hardening goes
+   under Notes as a follow-up, so rounds converge. Two local correction attempts after initial submission is
    the default budget; exhaustion opens one durable escalation, never an
    automatic approval or waiver. The escalation wakes the planner, who owns the
    budget as plan policy and may grant rounds with `docket escalation`; a grant
@@ -107,10 +114,17 @@ for legacy runs. A frontier is a wake, never a combined verdict: approving one
    fail is charged to the budget only when it opens the correction itself.
 4. A plan that cannot meet the objective goes back as a planner amendment with
    the objective and contract gap explained, not as an implementation defect.
+   Propose stronger requirements beyond the written criteria with `docket propose-amendment <run> <owner> --need TEXT --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT` for planner disposition.
+   Follow-up hardening belongs under Notes and does not become a new correction requirement.
    Proposed waivers and spending outside policy need explicit decision
    packets; spending needs the authorized budget owner.
 
 Wait with `docket watch <run> --role reviewer`; see `docket help signalling` for the per-harness table.
+Under `round_context: fresh` on Claude Code or OpenCode, use one subagent per milestone on your own model and keep its id.
+Your session records pickup and waits.
+For corrections and re-reviews, continue that milestone's subagent with SendMessage to its agent id on Claude Code, or the task tool with its task_id on OpenCode.
+A new milestone gets a new context; start a replacement for an existing milestone only if its subagent is gone.
+Give replacements the correction packet and retrieve historical source only as the packet requires.
 Do not wait on `herdr agent wait`, a sleep loop, or status polling.
 
 ## Prompt rendering

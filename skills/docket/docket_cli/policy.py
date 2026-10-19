@@ -15,6 +15,9 @@ from .frontmatter import parse
 from .paths import run_dir
 
 
+MILESTONE_DEPENDENCIES = "approval-v1"
+
+
 def need_run(run: str) -> Path:
     d = run_dir(run)
     if not d.is_dir():
@@ -63,6 +66,12 @@ def run_policy(d: Path) -> dict[str, str]:
         meta = parse(plan.read_text())[0]
     except (OSError, ValueError) as exc:
         die(f"malformed run policy in plan.mdx: {exc}")
+
+    if "milestone_dependencies" in meta:
+        value = meta["milestone_dependencies"].strip()
+        if value != MILESTONE_DEPENDENCIES:
+            die(f"unknown milestone_dependencies {value!r} in plan.mdx: use "
+                f"{MILESTONE_DEPENDENCIES}")
 
     if "workflow" not in meta:
         workflow = WORKFLOW_LEGACY_DECODE
@@ -210,6 +219,35 @@ def correction_limit_of(d: Path) -> int:
         return max(0, int(plan_flag(d, "correction_limit", "2")))
     except ValueError:
         return 2
+
+
+# The harness tool that runs one task in a context of its own. Codex has none a
+# role can rely on yet, so a Codex role keeps working in its session.
+FRESH_CONTEXT_TOOLS = {"claude": "the Agent tool (general-purpose)",
+                       "opencode": "the task tool (general agent)"}
+
+
+# How the same harness continues a subagent it started, keeping that context.
+FRESH_CONTEXT_RESUME = {"claude": "SendMessage to that agent's id",
+                        "opencode": "the task tool given that subagent's task_id"}
+
+
+def round_context_of(d: Path) -> str:
+    """Scope a context to each task or milestone; absent means shared."""
+    value = plan_flag(d, "round_context", "shared").strip()
+    if value not in ("fresh", "shared"):
+        die(f"unknown round_context {value!r} in plan.mdx: use fresh or shared")
+    return value
+
+
+def fresh_context_tool(d: Path, harness: str) -> str:
+    """The subagent tool for a unit of work, or '' to keep its session."""
+    return FRESH_CONTEXT_TOOLS.get(harness, "") if round_context_of(d) == "fresh" else ""
+
+
+def fresh_context_resume(harness: str) -> str:
+    """How a role on `harness` continues a subagent it started earlier."""
+    return FRESH_CONTEXT_RESUME.get(harness, "")
 
 
 def verifier_correction_allowed(d: Path) -> bool:

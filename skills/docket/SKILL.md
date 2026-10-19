@@ -55,7 +55,8 @@ the next task only once the work before it is done, so that work is its starting
 after dispatch, run the same `dispatch` again: it rebinds and prints the new prompt.
 Never delete `.docket` or run files to start over.
 The implementor's `dispatch` checks task intent and prints `prompt: <file>`.
-In standard, hand the worker that file (herdr shown); the quick implementor reads it in its existing session:
+In quick on Claude Code or OpenCode, the implementor keeps one subagent per task across corrections as dispatch instructs (`round_context: fresh`); on Codex it works the prompt in its session.
+In standard, hand the worker that file (herdr shown):
 
 ```bash
 herdr pane split --current --direction right --cwd "$PWD" --no-focus   # JSON: result.pane.pane_id

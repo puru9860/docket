@@ -157,6 +157,10 @@ class DocketCLI(unittest.TestCase):
         # Profiles the user adopted must never shape a test's prompts.
         self._profiles = os.environ.get("DOCKET_MODEL_PROFILES")
         os.environ["DOCKET_MODEL_PROFILES"] = str(Path(self._feedback_tmp.name) / "profiles")
+        # Nor may the user's OpenCode default model, read from these two homes.
+        self._xdg = {k: os.environ.get(k) for k in ("XDG_CONFIG_HOME", "XDG_STATE_HOME")}
+        for key in self._xdg:
+            os.environ[key] = str(Path(self._feedback_tmp.name) / key.lower())
 
     def tearDown(self) -> None:
         if self._fake_herdr_path is not None:
@@ -173,6 +177,11 @@ class DocketCLI(unittest.TestCase):
             os.environ.pop("DOCKET_MODEL_PROFILES", None)
         else:
             os.environ["DOCKET_MODEL_PROFILES"] = self._profiles
+        for key, value in self._xdg.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         if self._feedback_log is None:
             os.environ.pop("DOCKET_FEEDBACK_LOG", None)
         else:
@@ -418,13 +427,24 @@ class DocketCLI(unittest.TestCase):
 
     @staticmethod
     def fill_orch_report(path: Path) -> None:
+        # Every assigned task is planned, so the outcomes name each one and a waiver
+        # is explained, as a real aggregate report must.
+        owners = sorted({"T01", "T02"} | {task.name.split("-")[0]
+                                          for task in path.parent.glob("T*-task.mdx")})
+        waived = [owner for owner in owners
+                  if "status: waived" in "".join(p.read_text() for p in
+                                                 path.parent.glob(f"{owner}-report-*.mdx"))]
         replacements = {
             "<!-- TODO: summarize the delivered outcome for the planner. -->": "Delivered every planned task.",
-            "<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->": "| task | outcome | verification |\n| --- | --- | --- |\n| T01 | approved | passed |\n| T02 | approved | passed |",
+            "<!-- TODO: one row per planned task, including owner, terminal state, and verification. -->": "| task | outcome | verification |\n| --- | --- | --- |\n" + "\n".join(f"| {owner} | decided | recorded |" for owner in owners),
             "<!-- TODO: summarize the task-local changes the planner should review. -->": "Updated `src/a.py`.",
             "<!-- TODO: exact integrated command and real output. -->": "Command: `printf ok`\n\nOutput: `ok`",
         }
         text = path.read_text()
+        if waived:
+            text = text.replace("## Exceptions and waivers\n\nnone",
+                                "## Exceptions and waivers\n\n" + "\n".join(
+                                    f"- {owner} was waived by the reviewer." for owner in waived), 1)
         for old, new in replacements.items():
             text = text.replace(old, new)
         path.write_text(text)
@@ -748,7 +768,7 @@ class DocketCLI(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+            while time.monotonic() < deadline and (not metadata.is_file() or not self._pid_file_ready(shell_pid)):
                 if first.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -864,7 +884,8 @@ class DocketCLI(unittest.TestCase):
                 try:
                     deadline = time.monotonic() + 30
                     while time.monotonic() < deadline and (
-                        not metadata.is_file() or not shell_pid.is_file() or not child_pid.is_file()
+                        not metadata.is_file()
+                        or not self._pid_file_ready(shell_pid) or not self._pid_file_ready(child_pid)
                     ):
                         if proc.poll() is not None:
                             break
@@ -923,7 +944,8 @@ class DocketCLI(unittest.TestCase):
         try:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline and (
-                not metadata.is_file() or not shell_pid.is_file() or not child_pid.is_file()
+                not metadata.is_file()
+                or not self._pid_file_ready(shell_pid) or not self._pid_file_ready(child_pid)
             ):
                 if first.poll() is not None:
                     break
@@ -988,7 +1010,7 @@ class DocketCLI(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+            while time.monotonic() < deadline and (not metadata.is_file() or not self._pid_file_ready(shell_pid)):
                 if first.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -1041,7 +1063,7 @@ class DocketCLI(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+            while time.monotonic() < deadline and (not metadata.is_file() or not self._pid_file_ready(shell_pid)):
                 if first.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -1068,6 +1090,22 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(0, first.returncode, first_err)
         self.assertIn("frozen task-round bundle", first_out)
         self.assertEqual(0, self.cli("preflight", "demo", "T01").returncode)
+
+    @staticmethod
+    def _pid_file_ready(path: Path) -> bool:
+        """A pid file counts only once its digits are written; the shell creates it first."""
+        try:
+            return path.read_text().strip().isdigit()
+        except FileNotFoundError:
+            return False
+
+    def test_pid_file_ready_waits_for_the_digits(self):
+        path = self.root / "pid-file"
+        self.assertFalse(self._pid_file_ready(path))
+        path.write_text("")
+        self.assertFalse(self._pid_file_ready(path))
+        path.write_text("12")
+        self.assertTrue(self._pid_file_ready(path))
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -1128,7 +1166,7 @@ class DocketCLI(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and (not metadata.is_file() or not shell_pid.is_file()):
+            while time.monotonic() < deadline and (not metadata.is_file() or not self._pid_file_ready(shell_pid)):
                 if first.poll() is not None:
                     break
                 time.sleep(0.05)
@@ -1269,6 +1307,43 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(2, orchestrator.returncode)
         self.assertIn("review batch ready", orchestrator.stderr)
         self.assertIn("Process normal review batches silently", orchestrator.stderr)
+
+    def test_wake_hook_serves_a_hand_started_session_it_armed(self) -> None:
+        """A session started without DOCKET_ROLE is served for the role it armed natively."""
+        self.init()
+        run = self.assign()
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_task_report(run / "T01-report-01.mdx")
+        self.cli("submit", "demo", "T01")
+        wrapper = Path(self._feedback_tmp.name) / "bin" / "codex"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(sys.executable)
+
+        thread = "01a0cc39-0000-7471-b60c-92c1c2dd9522"
+        env = os.environ | {"CLAUDE_PROJECT_DIR": str(self.root), "DOCKET_WATCH_TIMEOUT": "0"}
+        # Codex runs the arm under its shared app-server, with CODEX_THREAD_ID set.
+        launch = ("import subprocess, sys; sys.exit(subprocess.run("
+                  f"{[sys.executable, str(DOCKET), 'arm', 'demo', '--role', 'orchestrator']!r}"
+                  ").returncode)")
+        armed = subprocess.run([str(wrapper), "-c", launch, "app-server"], cwd=self.root,
+                               env=env | {"CODEX_THREAD_ID": thread},
+                               capture_output=True, text=True)
+        self.assertEqual(0, armed.returncode, armed.stderr)
+
+        # Its Stop hook gets no CODEX_THREAD_ID; the session is named only on stdin.
+        def hook(session: str) -> subprocess.CompletedProcess:
+            payload = json.dumps({"session_id": session, "hook_event_name": "Stop",
+                                  "transcript_path": f"/home/u/.codex/sessions/rollout-{session}.jsonl"})
+            return subprocess.run([str(HOOK)], cwd=self.root, env=env, input=payload,
+                                  capture_output=True, text=True)
+        self.assertEqual(0, hook("01a0cc39-1111-7471-b60c-92c1c2dd9522").returncode)
+        woken = hook(thread)
+        self.assertEqual(2, woken.returncode, woken.stderr)
+        self.assertIn("review batch ready", woken.stderr)
+        # Without a payload the hook has no identity and stays inert.
+        silent = subprocess.run([str(HOOK)], cwd=self.root, env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True)
+        self.assertEqual(0, silent.returncode, silent.stderr)
 
     def test_test_environment_strips_role_and_wake_config(self) -> None:
         """Regression: no test inherits the caller's role or wake configuration.
@@ -3301,7 +3376,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_git_state_inherited_from_the_caller_never_redirects_evidence(self) -> None:
         """Regression: a leaked GIT_INDEX_FILE, as inside a git hook, read the wrong index."""
-        run = self.dirty_orchestrator_task()
+        self.dirty_orchestrator_task()
         clean = self.cli("diff", "demo", "T01").stdout
         leaked = self.cli_env({"GIT_INDEX_FILE": str(self.root / "elsewhere.index")},
                               "diff", "demo", "T01").stdout
@@ -4725,10 +4800,11 @@ class DocketCLI(unittest.TestCase):
                 "<!-- TODO: exact integrated command and real output. -->",
                 "Command: `printf ok`\n\nOutput: `ok`"
             )
+            .replace("## Exceptions and waivers\n\nnone",
+                     "## Exceptions and waivers\n\n- T03 is waived for an external outage.", 1)
         )
         self.cli("submit", "demo", "orch", "--skip-verify")
         first_agg, _ = self.aggregate()
-        first_digest = first_agg["digest"]
 
         # Now reopen T03 via --reopen.
         reopen_result = self.cli(
@@ -5580,6 +5656,26 @@ class DocketCLI(unittest.TestCase):
         refused = self.cli("submit", "demo", "T01", ok=False)
         self.assertIn("changed while the verification ran", refused.stderr)
 
+    def test_submit_check_lists_refusals_without_changing_anything(self) -> None:
+        """A worker learns what the gate wants from `--check`, not from docket's source."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign("T01")
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        report = run / "T01-report-01.mdx"
+        before = {p.name: p.read_bytes() for p in run.iterdir() if p.is_file()}
+        refused = self.cli("submit", "demo", "T01", "--check", ok=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("T01-report-01.mdx would be refused:", refused.stdout)
+        self.assertIn("unchecked acceptance", refused.stdout)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in run.iterdir() if p.is_file()})
+        self.assertFalse((run / ".bundles").exists())
+        self.fill_task_report(report)
+        passed = self.cli("submit", "demo", "T01", "--check")
+        self.assertIn("passes the gate's report checks", passed.stdout)
+        self.assertIn("status: draft", report.read_text())
+
     def test_m7_evidence_table_states_and_prose(self) -> None:
         """Stable IDs map to evidence; prose is never keyword-policed."""
         run = self.init("split", evidence_mode="documents-only")
@@ -5664,7 +5760,10 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("explicit gap attached to met criterion A2",
                       two_criteria("T13", cases["T06"]).stderr)
         self.assertIn("names no artifacts", two_criteria("T14", cases["T07"]).stderr)
-        self.assertIn("missing evidence artifact", two_criteria("T15", cases["T08"]).stderr)
+        missing = two_criteria("T15", cases["T08"]).stderr
+        self.assertIn("missing evidence artifact", missing)
+        # The refusal names what an artifact can be, so nobody reads the gate to find out.
+        self.assertIn("save a real run's output under .docket/runs/demo/evidence/", missing)
         # Prose counterexamples are not keyword-policed.
         prose = ("## Notes\n\nNo limitations.\n\nThe edge is not covered by this unit "
                  "test but covered by integration run nightly-42.\n")
@@ -6093,6 +6192,14 @@ class DocketCLI(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
+    def test_verifier_prompt_checks_each_test_exercises_its_criterion(self) -> None:
+        """A passing test that never injects the named failure, or starts from the wrong state, is a defect."""
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        text = self.prompt_text(run, "T01", "verifier")
+        self.assertIn("injects that failure into the component the criterion names", text)
+        self.assertIn("every case starts from the state it claims", text)
+
     def test_each_supervisor_prompt_names_one_wait_method(self) -> None:
         """Every supervising role prompt waits with one blocking watch, never a poll loop."""
         run = self.init5()
@@ -6140,6 +6247,30 @@ class DocketCLI(unittest.TestCase):
         out = self.cli("set-model", "demo", "T01", "--actual", "live-m")
         self.assertIn("launched unpinned", out.stdout)
         self.assertNotIn("WARNING: requested model", out.stdout)
+
+    def test_set_model_records_the_harness_only_the_worker_session_proves(self) -> None:
+        """A worker moved to another harness records it; a supervisor's own harness never does."""
+        run = self.init("split", evidence_mode="documents-only")
+        self.cli("assign", "demo", "T01", "--complexity", "high", "--executor", "implementor",
+                 "--harness", "opencode", "--file", "src/t01.py", "--verify", 'printf "ok\\n"')
+        self.fill_task(run / "T01-task.mdx")
+        self.fill_scope(run / "T01-scope.mdx")
+        self.cli("scope", "demo", "T01", "--submit")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "w1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        env, _ = self.fake_claude_session()
+        supervisor = self.cli_env({**env, "DOCKET_ROLE": "orchestrator"},
+                                  "set-model", "demo", "T01", "--actual", "live-m")
+        self.assertNotIn("harness switched", supervisor.stdout)
+        self.assertEqual("opencode", parse_meta(run / "T01-report-01.mdx")["harness"])
+        worker = self.cli_env({**env, "DOCKET_ROLE": "implementor"},
+                              "set-model", "demo", "T01", "--actual", "live-m")
+        self.assertIn("harness switched: opencode -> claude", worker.stdout)
+        for doc in ("T01-report-01.mdx", "T01-task.mdx"):
+            self.assertEqual("claude", parse_meta(run / doc)["harness"])
+        self.cli("set-model", "demo", "T01", "--actual", "live-m", "--harness", "codex")
+        self.assertEqual("codex", parse_meta(run / "T01-report-01.mdx")["harness"])
 
     def test_orchestrator_playbook_warns_continue_beats_model(self) -> None:
         """OpenCode resume keeps its model; the playbook says to verify, not trust the flag."""
@@ -6292,7 +6423,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_delivery_service_status_is_truthful(self) -> None:
         """Service status names no background job and the real delivery paths."""
-        run = self.init5()
+        self.init5()
         out = self.cli("delivery", "demo", "--role", "orchestrator",
                        "--service-status").stdout
         self.assertIn("supervised delivery service: none - by design", out)
@@ -7019,7 +7150,8 @@ class DocketCLI(unittest.TestCase):
         dest = into / "skill"
         shutil.copytree(skill, dest,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        env = {k: v for k, v in os.environ.items() if k != "PYTHONPYCACHEPREFIX"}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE")}
         env["XDG_CACHE_HOME"] = str(into / "cache")
         env["PYTHONPATH"] = str(dest) + os.pathsep + env.get("PYTHONPATH", "")
         launched = subprocess.run(
@@ -7132,7 +7264,7 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("0 operational", self.cli("feedback", "demo", "--import-ops").stdout)
 
     def test_feedback_promotes_one_project_observation_once(self) -> None:
-        run = self.init("split", evidence_mode="documents-only")
+        self.init("split", evidence_mode="documents-only")
         self.cli("feedback", "demo", "--add", "--role", "implementor", "--task", "T01",
                  "--category", "verification", "--body", "The oracle is unclear.")
         promoted = self.cli("improvements", "--from-feedback", "demo/F01",
@@ -7587,6 +7719,25 @@ class DocketCLI(unittest.TestCase):
                               "--role", "orchestrator", "--peek").stdout
         self.assertNotIn("worker process exited", future)
 
+    def test_shared_codex_app_server_is_never_recorded_as_the_worker_process(self) -> None:
+        run = self.init5()
+        self.assign_simple(run, "T01")
+        self.cli("session", "demo", "--register", "--session", "w1",
+                 "--name", "worker-1", "--role", "implementor")
+        self.cli("dispatch", "demo", "T01", "--session", "w1")
+        wrapper = Path(self._feedback_tmp.name) / "bin" / "codex"
+        wrapper.parent.mkdir()
+        wrapper.symlink_to(sys.executable)
+        env = {**os.environ, "CODEX_THREAD_ID": "worker-test-thread",
+               "DOCKET_ROLE": "implementor"}
+        launch = ("import subprocess, sys; sys.exit(subprocess.run([sys.executable, "
+                  f"{str(DOCKET)!r}, 'set-model', 'demo', 'T01', '--actual', 'worker-m']).returncode)")
+        subprocess.run([str(wrapper), "-c", launch, "app-server"], cwd=self.root, env=env,
+                       check=True, capture_output=True, text=True)
+        dispatch = json.loads((run / ".dispatch" / "T01.json").read_text())
+        self.assertEqual(dispatch["model_observed"], "worker-m")
+        self.assertNotIn("worker_process", dispatch)
+
     def test_pending_supervisor_work_requests_a_session_launch(self) -> None:
         run = self.init5()
         self.cli("arm", "demo", "--role", "orchestrator")
@@ -7684,6 +7835,9 @@ class DocketCLI(unittest.TestCase):
         self.assertFalse((run / ".corrections" / "T01.json").exists())
         metrics = self.cli("metrics", "demo").stdout
         self.assertIn("local correction attempts: 1", metrics)
+        # The retrospective reads the same durable artifacts, not the cleared budget.
+        retrospective = self.cli("retrospective", "demo").stdout
+        self.assertIn("correction attempts: 1 (T01 1)", retrospective)
 
     def test_diff_orch_uses_the_run_baseline(self) -> None:
         self.repo()
@@ -8058,6 +8212,7 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("T01-verification-01.mdx: pass", packet)
         self.assertIn("disk is full", packet)
         self.assertIn("Cache stampede", packet)
+        self.assertNotIn("correction round", packet)
         tokens = int(re.search(r"packet: (\d+) estimated tokens",
                                self.cli("review-packet", "demo",
                                         "--role", "reviewer").stderr).group(1))
@@ -8083,6 +8238,10 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("T03-verification-02.mdx: pass", correction)
         self.assertNotIn("- T01 round", correction)
         self.assertIn("T03-decision-01.mdx", correction)
+        # A correction is judged against the earlier required changes, so rounds converge.
+        self.assertIn("correction round 2: judge it against the required changes in "
+                      "T03-decision-01.mdx", correction)
+        self.assertIn("only when it breaks an acceptance criterion as written", correction)
 
     def test_packet_keeps_frozen_criterion_wording_under_budget_pressure(self) -> None:
         run = self.init5()
@@ -8762,7 +8921,6 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("A1", packet)
         self.assertLessEqual(self.packet_tokens(packet), 2000)
         # Damaged artifact blocks the packet with a specific error.
-        where = run / ".bundles" / "T01" / manifest["digest"].split(":")[1][:12]
         # Find the actual bundle dir via ledger instead of guessing the prefix.
         entries = json.loads((run / ".bundles" / "T01" / "rounds.json").read_text())["entries"]
         bdir = run / ".bundles" / "T01" / entries[-1]["dir"]
@@ -10819,6 +10977,30 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("mandatory_tokens", record)
         self.assertGreater(int(record["mandatory_tokens"]), 0)
         self.assertIn("guidance_tokens", record)
+
+    def test_opencode_default_model_selects_round_one_guidance(self) -> None:
+        """A task left on OpenCode's default model gets that model's profile before it is observed."""
+        overlay = Path(self._feedback_tmp.name) / "overlay"
+        overlay.mkdir()
+        for name in ("recentmodel", "configmodel"):
+            (overlay / f"{name}.md").write_text(
+                f"---\nprofile: {name}\nversion: 1\nmodels: zen/{name}\n---\n\n{name} guidance.\n")
+        run = self.init("split", evidence_mode="documents-only")
+        self.assign_simple(run, "T01")
+        state = Path(os.environ["XDG_STATE_HOME"]) / "opencode"
+        state.mkdir(parents=True)
+        (state / "model.json").write_text(json.dumps({"recent": [
+            {"providerID": "zen", "modelID": "recentmodel"}, {"providerID": "zen", "modelID": "other"}]}))
+        env = {"DOCKET_PROFILES_ROOT": str(overlay)}
+        last_used = self.cli_env(env, "prompt", "demo", "T01", "--role", "implementor").stdout
+        self.assertIn("[recentmodel]", last_used)
+        config = Path(os.environ["XDG_CONFIG_HOME"]) / "opencode"
+        config.mkdir(parents=True)
+        (config / "opencode.jsonc").write_text(
+            '{\n  // pinned\n  "model": "zen/configmodel", /* default */\n  "agent": {},\n}\n')
+        configured = self.cli_env(env, "prompt", "demo", "T01", "--role", "implementor").stdout
+        self.assertIn("[configmodel]", configured)
+        self.assertNotIn("[recentmodel]", configured)
 
     def test_t42_model_matching_is_exact(self) -> None:
         """A model name that merely contains another name never selects that profile."""
@@ -13290,7 +13472,7 @@ class DocketCLI(unittest.TestCase):
         self.assertTrue(self.derived_keys("rb", "coordinator")[0].startswith("all:decided:"))
 
     def test_t07_route_names_preset_role_and_armed_state(self) -> None:
-        quick = self.init5_in("routequick", mode="quick")
+        self.init5_in("routequick", mode="quick")
         for kind, role in (("plan-gap", "coordinator"), ("collision", "coordinator"),
                            ("dispute", "checker")):
             with self.subTest(kind=kind):
@@ -13303,7 +13485,7 @@ class DocketCLI(unittest.TestCase):
         self.cli("arm", "routequick", "--role", "coordinator")
         armed = self.cli("route", "routequick", "--kind", "plan-gap")
         self.assertNotIn("unarmed", armed.stdout)
-        standard = self.init5_in("routestd")
+        self.init5_in("routestd")
         named = self.cli("route", "routestd", "--kind", "plan-gap")
         self.assertIn("destination: planner", named.stdout)
         self.assertIn("planner is unarmed for routestd", named.stdout)
@@ -13573,6 +13755,10 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("`docket submit steps T01 --as implementor`", initial)
         self.assertIn("`docket submit steps T01 --blocked --as implementor`", initial)
         self.assertIn("`.docket/runs/steps/T01-report-01.mdx`", initial)
+        # The checks first rounds most often missed come before the report.
+        review = initial.index("check your work the way the reviewer will")
+        self.assertLess(review, initial.index("`.docket/runs/steps/T01-report-01.mdx`"))
+        self.assertIn("exercised the real thing", initial)
         self.fill_task_report(run / "T01-report-01.mdx",
                               files="- `src/t01.py:1` - implemented T01.")
         self.cli("submit", "steps", "T01", "--as", "implementor")
@@ -13586,6 +13772,8 @@ class DocketCLI(unittest.TestCase):
         correcting = self.prompt_text_in("steps", "T01", "implementor")
         self.assertIn("stage: correction", correcting)
         self.assertIn("Apply every required change listed above.", correcting)
+        self.assertIn("first reproduce what it names", correcting)
+        self.assertIn("check your work the way the reviewer will", correcting)
         self.assertIn("`.docket/runs/steps/T01-report-02.mdx`", correcting)
         self.assertIn("files changed (every path `docket diff steps T01` lists, earlier rounds "
                       "included)", correcting)
@@ -13869,6 +14057,96 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("orchestrator   1 session(s) in 1 run(s): 2.3k total", digest)
         self.assertIn("agent reports: 1 (1 said none)", digest)
 
+    def quick_identity_env(self) -> dict[str, str]:
+        """A proven Claude session that can run commands in a new quick run."""
+        return {"CLAUDE_CODE_SESSION_ID": "0c1d2e3f-aaaa-bbbb-cccc-0000000000aa",
+                "CLAUDE_PID": str(os.getpid())}
+
+    def ledger_roles(self, run: Path) -> list[str]:
+        path = run / ".harness-sessions.jsonl"
+        return [json.loads(line)["role"] for line in path.read_text().splitlines()] \
+            if path.exists() else []
+
+    def test_identity_capture_planner_assign_is_ledgered_as_planner(self) -> None:
+        """A planner's `assign --as planner` is its first command and must not note implementor."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        history = '{"at": "2026-01-01T00:00:00Z", "harness": "codex", "owner": "-", ' \
+                  '"role": "implementor", "session_id": "legacy-session"}\n'
+        (run / ".harness-sessions.jsonl").write_text(history)
+        self.cli_env({**self.quick_identity_env(), "DOCKET_ROLE": "planner"},
+                     "assign", "demo", "T01", "--as", "planner", "--complexity", "high",
+                     "--executor", "implementor", "--harness", "claude", "--file", "src/a.py",
+                     "--verify", "true")
+        self.assertEqual(["implementor", "planner"], self.ledger_roles(run))
+        self.assertTrue((run / ".harness-sessions.jsonl").read_text().startswith(history))
+        # The same planner without DOCKET_ROLE is still the planner on that command.
+        other = {"CLAUDE_CODE_SESSION_ID": "0c1d2e3f-aaaa-bbbb-cccc-0000000000bb",
+                 "CLAUDE_PID": str(os.getpid())}
+        self.cli_env(other, "assign", "demo", "T02", "--as", "planner", "--complexity", "high",
+                     "--executor", "implementor", "--harness", "claude", "--file", "src/b.py",
+                     "--verify", "true")
+        self.assertEqual(["implementor", "planner", "planner"], self.ledger_roles(run))
+        # A read-only listing names no role, so it cannot note the planner as the implementor default.
+        third = {"CLAUDE_CODE_SESSION_ID": "0c1d2e3f-aaaa-bbbb-cccc-0000000000cc",
+                 "CLAUDE_PID": str(os.getpid())}
+        self.cli_env(third, "batch", "demo", "--list")
+        self.assertEqual(["implementor", "planner", "planner"], self.ledger_roles(run))
+
+    def test_identity_capture_explicit_registration_keeps_its_own_native_identity(self) -> None:
+        """An explicit session armed from its own proven role session records that identity."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        env = {**self.quick_identity_env(), "DOCKET_ROLE": "planner"}
+        sessions = self.root / ".docket" / "sessions"
+        self.cli_env(env, "arm", "demo", "--role", "planner", "--session", "plan-1")
+        reg = json.loads((sessions / "plan-1.json").read_text())
+        self.assertEqual(("claude", env["CLAUDE_CODE_SESSION_ID"]),
+                         (reg["native_harness"]["harness"], reg["native_harness"]["session_id"]))
+        self.assertEqual(os.getpid(), reg["native_process"]["pid"])
+        self.assertTrue(reg["native_process"]["start"])
+        self.assertEqual(1, reg["generation"])
+        # A registration made explicitly through `docket session` captures it the same way.
+        self.cli_env(env, "session", "demo", "--register", "--session", "plan-2",
+                     "--name", "Planner", "--role", "planner")
+        again = json.loads((sessions / "plan-2.json").read_text())
+        self.assertEqual(reg["native_harness"]["session_id"], again["native_harness"]["session_id"])
+        self.assertEqual(["planner"], self.ledger_roles(run))
+
+    def test_identity_capture_supervisor_arming_another_role_is_never_attributed(self) -> None:
+        """A planner arming the reviewer or registering a worker leaves that role's identity empty."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        env = {**self.quick_identity_env(), "DOCKET_ROLE": "planner"}
+        sessions = self.root / ".docket" / "sessions"
+        self.cli_env(env, "arm", "demo", "--role", "planner")
+        self.cli_env(env, "arm", "demo", "--role", "reviewer", "--session", "rev-1")
+        self.cli_env(env, "session", "demo", "--register", "--session", "worker-1",
+                     "--name", "Worker", "--role", "implementor")
+        for name in ("rev-1", "worker-1"):
+            reg = json.loads((sessions / f"{name}.json").read_text())
+            self.assertNotIn("native_harness", reg, name)
+            self.assertNotIn("native_process", reg, name)
+        self.assertEqual(["planner"], self.ledger_roles(run))
+
+    def test_identity_capture_dispatch_register_records_the_implementor_session(self) -> None:
+        """`dispatch --register` from the implementor's own session captures native identity."""
+        self.cli("init", "demo", "--mode", "quick", "--evidence-mode", "documents-only")
+        run = self.root / ".docket" / "runs" / "demo"
+        self.cli("assign", "demo", "T01", "--as", "planner", "--complexity", "high",
+                 "--executor", "implementor", "--harness", "claude", "--file", "src/a.py",
+                 "--verify", "true")
+        self.fill_task(run / "T01-task.mdx")
+        self.cli("batch", "demo", "--create", "M1", "--members", "T01", "--milestone",
+                 "--command", "true", "--as", "planner")
+        self.cli("batch", "demo", "--close", "M1", "--as", "planner")
+        env = {**self.quick_identity_env(), "DOCKET_ROLE": "implementor"}
+        self.cli_env(env, "dispatch", "demo", "T01", "--session", "impl-1", "--register")
+        reg = json.loads((self.root / ".docket" / "sessions" / "impl-1.json").read_text())
+        self.assertEqual(env["CLAUDE_CODE_SESSION_ID"], reg["native_harness"]["session_id"])
+        self.assertEqual(os.getpid(), reg["native_process"]["pid"])
+        self.assertEqual(["implementor"], self.ledger_roles(run))
+
     def test_inherited_harness_variables_note_no_session(self) -> None:
         """Variables inherited from a harness that is not an ancestor are ignored."""
         run = self.init5()
@@ -14011,12 +14289,11 @@ class DocketCLI(unittest.TestCase):
         (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
             {"type": "command", "command": "/x/skills/docket/hooks/wake.sh"}]}]}}))
         served = watched({"DOCKET_ROLE": "orchestrator"})
-        self.assertIn("serves this session (DOCKET_ROLE=orchestrator)", served)
+        self.assertIn("serves this session (orchestrator)", served)
         self.assertIn("end your turn instead", served)
-        inert = watched({})
-        self.assertIn("is inert here", inert)
-        self.assertIn("DOCKET_ROLE=unset, not orchestrator", inert)
-        self.assertIn("--env DOCKET_ROLE=orchestrator", inert)
+        unarmed = watched({})
+        self.assertIn("does not serve this session yet", unarmed)
+        self.assertIn("docket arm <run> --role orchestrator", unarmed)
         # A session scoped to another role cannot consume this role's events.
         mismatched = subprocess.run(
             [str(wrapper), "-c", launch], cwd=self.root, capture_output=True, text=True,
@@ -14511,7 +14788,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_first_auto_archive_creates_missing_parents_with_0700(self) -> None:
         """The first archive on a fresh machine creates its state chain at 0700."""
-        run = self.init5()
+        self.init5()
         env, _transcript = self.fake_claude_session()
         self.cli_env(env, "arm", "demo", "--role", "orchestrator")
         fresh_log = Path(self._feedback_tmp.name) / "fresh" / "nested" / "feedback.jsonl"
@@ -14541,7 +14818,7 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("os.fsync", src)
         self.assertLess(src.find("fh.flush()"), src.find("LOCK_UN"))
         self.assertLess(src.find("os.fsync"), src.find("LOCK_UN"))
-        run = self.init5()
+        self.init5()
         self.cli("feedback", "demo", "--add", "--role", "implementor",
                  "--category", "other", "--body", "flush check log")
         self.assertIn("flush check log", Path(os.environ["DOCKET_FEEDBACK_LOG"]).read_text())
@@ -14574,7 +14851,7 @@ class DocketCLI(unittest.TestCase):
 
     def test_feedback_log_leaves_existing_parent_mode_alone(self) -> None:
         """An existing feedback log parent keeps its mode; only created dirs get 0700."""
-        run = self.init5()
+        self.init5()
         existing = Path(self._feedback_tmp.name) / "existing-parent"
         existing.mkdir()
         os.chmod(existing, 0o755)
@@ -15080,6 +15357,26 @@ class DocketCLI(unittest.TestCase):
         self.cli("verify", "tier3c", "T02", "--result", "pass", "--as", "verifier")
         again = json.loads((corr / ".bundles" / "T02" / "rounds.json").read_text())
         self.assertEqual(2, len(again["entries"]))
+
+    def test_resume_into_a_correction_round_captures_its_baseline(self) -> None:
+        """A replacement session resumed into a correction round can submit it normally."""
+        run = self.init_tiered("tier-resume")
+        self.assign_tiered(run, "tier-resume", "T01")
+        for sid in ("w1", "w2"):
+            self.cli("session", "tier-resume", "--register", "--session", sid,
+                     "--name", sid, "--role", "implementor")
+        self.cli("dispatch", "tier-resume", "T01", "--session", "w1")
+        self.submit_tiered(run, "tier-resume", "T01")
+        self.cli("verify", "tier-resume", "T01", "--result", "pass", "--as", "verifier")
+        self.cli("decide", "tier-resume", "T01", "--changes", "--as", "reviewer",
+                 "--change", "Handle the empty input.")
+        resumed = self.cli("resume", "tier-resume", "T01", "--session", "w2")
+        self.assertIn("resumed T01 round 2", resumed.stdout)
+        self.assertIn("fresh pre-correction baseline", resumed.stdout)
+        self.assertTrue((run / ".snapshots" / "T01-02.json").is_file())
+        self.fill_task_report(run / "T01-report-02.mdx",
+                              files="- `src/t01.py:1` - handled the empty input.")
+        self.cli("submit", "tier-resume", "T01", "--as", "implementor")
 
     def test_tiered_uncertain_verification_does_not_release_scope_or_capacity(self) -> None:
         """Only a checker pass settles work for sequencing."""

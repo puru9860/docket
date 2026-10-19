@@ -147,7 +147,6 @@ def freeze_aggregate_bundle(
     report body as submitted, and the captured verification. It carries no task
     contract because the orch has none; the plan stands in for the contract.
     """
-    owner = "orch"
     match = re.search(r"-report-(\d+)\.mdx$", rep.name)
     rnd = int(match.group(1)) if match else 1
     artifacts: dict[str, bytes] = {}

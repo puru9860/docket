@@ -26,9 +26,11 @@ planner_harness: {harness}
 progress_updates: quiet
 evidence_mode: {evidence_mode}
 provisional_integration: forbidden
+milestone_dependencies: approval-v1
 workflow: {workflow}
 correction_limit: 2
 verifier_correction: {verifier_correction}
+round_context: fresh
 ---
 
 # Plan: <title>
@@ -88,7 +90,8 @@ depends_on: {depends_on}
 
 ## Acceptance criteria
 
-<!-- Each line becomes a checkbox in the report. Make them mechanically checkable. -->
+<!-- Each line becomes a checkbox in the report. Make them mechanically checkable.
+     State the failure model and explicitly excluded failure classes here. -->
 
 - [ ] <!-- TODO -->
 

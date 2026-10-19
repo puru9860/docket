@@ -142,7 +142,7 @@ def cmd_doctor(a: argparse.Namespace) -> None:
 
     print("\nDelivery (leased events, explicit pickup, qualified notices)")
     boundary, mode, detail = probe_boundary()
-    print(f"  [note] supervised delivery service: none - never a model-launched background job")
+    print("  [note] supervised delivery service: none - never a model-launched background job")
     print(f"  [note] mode: {mode} (boundary: {boundary})")
     print(f"  [note] probe: {detail}")
     for r, ro in armed():

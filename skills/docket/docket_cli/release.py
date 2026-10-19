@@ -17,8 +17,8 @@ from .frontmatter import parse
 from .paths import _ordered, owners, root
 from .publication import fault, publish_bytes, publish_json
 from .policy import need_run
+from .dependencies import packet_staleness
 from .evidence import git_argv, git_env
-from .baselines import evidence_digest
 from .bundles import (
     BUNDLE_VERSION, baseline_roots, bundle_dir, bundle_objects, bundle_problems,
     bundles_for, check_frozen_digest, digest_of, freeze_record, latest_bundle, load_bundle,
@@ -26,58 +26,9 @@ from .bundles import (
 )
 from .state import list_amendments, list_incidents, state_of
 from .aggregates import aggregate_bundle_problems
-from .five_role import open_escalations
 from .qualification import qualification_problems, worktree_identity
 from .suite import parse_suite_streams, resolve_suite_artifact, suite_problems
 from .metrics import scan_content_tree, tree_revision
-
-
-def packet_staleness(d: Path, owner: str, rnd: int,
-                       manifest: dict[str, object] | None) -> list[str]:
-    """Why a frozen bundle no longer binds the live report, contract, or inputs."""
-    problems: list[str] = []
-    if manifest is None:
-        return ["bundle manifest is missing or unreadable"]
-    rep = d / f"{owner}-report-{rnd:02d}.mdx"
-    if rep.is_file():
-        try:
-            live_body = parse(rep.read_text())[1]
-            live_digest = evidence_digest(live_body)
-        except (OSError, ValueError):
-            live_digest = ""
-        frozen_digest = str((manifest.get("report") or {}).get("body_digest", "")
-                            if isinstance(manifest.get("report"), dict) else "")
-        if live_digest and frozen_digest and live_digest != frozen_digest:
-            problems.append(
-                f"{owner} round {rnd} report body changed since the bundle "
-                f"{manifest.get('digest')} was frozen; re-verify before review")
-    task = d / f"{owner}-task.mdx"
-    if task.is_file():
-        try:
-            live_contract = digest_of(task.read_bytes())
-        except OSError:
-            live_contract = ""
-        frozen_contract = str((manifest.get("contract") or {}).get("revision", "")
-                              if isinstance(manifest.get("contract"), dict) else "")
-        if live_contract and frozen_contract and live_contract != frozen_contract:
-            problems.append(
-                f"{owner} contract changed since bundle {manifest.get('digest')} "
-                "was frozen; the captured verification no longer binds it")
-    if owner == "orch":
-        plan = d / "plan.mdx"
-        if plan.is_file():
-            try:
-                live_plan = digest_of(plan.read_bytes())
-            except OSError:
-                live_plan = ""
-            frozen_plan = str((manifest.get("contract") or {}).get("revision", "")
-                              if isinstance(manifest.get("contract"), dict) else "")
-            if live_plan and frozen_plan and live_plan != frozen_plan:
-                problems.append(
-                    f"orch plan changed since bundle {manifest.get('digest')} "
-                    "was frozen; the captured integration verification no longer "
-                    "binds it")
-    return problems
 
 
 def aggregate_source_moved(d: Path, manifest: dict[str, object]) -> list[str]:

@@ -18,15 +18,15 @@ from pathlib import Path
 from .common import (
     COVERAGE_AVAILABLE, COVERAGE_UNAVAILABLE, DOCUMENTS_ONLY, MODE_CUSTOM,
     MODE_NEW_RUN_DEFAULT, MODE_QUICK, MODE_STANDARD, REQUIRED_HANDOFF_SECTIONS,
-    REQUIRED_SCOPE_SECTIONS, REVIEW_COMBINED_CHECKER, REVIEW_INDEPENDENT,
-    REVIEW_QUICK_MILESTONE, REVIEW_TIERED,
-    ROOTS_DECLARED, ROOTS_INVALID, STATE_DIR, SUPPORTED_HARNESSES, WORKFLOW_FIVE_ROLE,
-    WORKFLOW_LEGACY_DECODE, WORKFLOW_NEW_RUN_DEFAULT, die, now_s, stamp,
+    REQUIRED_SCOPE_SECTIONS, REVIEW_INDEPENDENT, REVIEW_QUICK_MILESTONE,
+    REVIEW_TIERED, ROOTS_DECLARED,
+    ROOTS_INVALID, STATE_DIR, SUPPORTED_HARNESSES, WORKFLOW_FIVE_ROLE, WORKFLOW_LEGACY_DECODE,
+    WORKFLOW_NEW_RUN_DEFAULT, die, now_s, stamp,
 )
 from .frontmatter import parse, render, set_section
 from .paths import (
-    decisions, dispatch_path, handoffs, latest, next_numbered, owners, planned_tasks,
-    read_dispatch, reports, root, scope_path,
+    dispatch_path, handoffs, latest, next_numbered, owners, planned_tasks, read_dispatch,
+    reports, root, scope_path,
 )
 from .publication import fault, publish, publish_exclusive, publish_json
 from .policy import (
@@ -64,7 +64,7 @@ from .sessions import (
     calling_harness, codex_limit_lines, codex_rate_limits, harness_process_ref, harness_session,
     run_harness_sessions,
 )
-from .liveness import dispatch_dependencies_unmet, dispatch_liveness, live_dispatches
+from .liveness import dispatch_dependencies_unmet, dispatch_liveness, live_dispatches, missed_wakes
 from .batches import batch_ready, cmd_batch as _batches_cmd_batch
 from .delivery import delivery_lock, sweep_role
 from .health import execution_health
@@ -207,6 +207,43 @@ DEFAULT_REVIEW_CRITERIA = (
 )
 
 
+def record_planned_task(d: Path, owner: str, title: str, complexity: str, executor: str) -> bool:
+    """Name an assigned task in the plan's Tasks table, which completion reads.
+
+    `init`, `assign`, and `batch` alone never open the plan, so without this a run
+    planned from the command line keeps the template's single T01 row, and a quick run
+    whose milestones cover more tasks never completes or wakes its planner. A row the
+    planner wrote is kept; only its own empty title is filled.
+    """
+    plan = d / "plan.mdx"
+    try:
+        meta, body = parse(plan.read_text())
+    except (OSError, ValueError):
+        return False
+    lines = body.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "## Tasks")
+    except StopIteration:
+        return False
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    rows = [i for i in range(start + 1, end) if lines[i].lstrip().startswith("|")]
+    if len(rows) < 2:
+        return False
+    row = f"| {owner} | {title} | {complexity} | {executor} |  |"
+    for i in rows[2:]:
+        cells = [cell.strip() for cell in lines[i].strip().strip("|").split("|")]
+        if cells and cells[0].strip("`") == owner:
+            if len(cells) > 1 and cells[1] or not title:
+                return False
+            cells[1] = title
+            lines[i] = "| " + " | ".join(cells) + " |"
+            break
+    else:
+        lines.insert(rows[-1] + 1, row)
+    publish(plan, render(meta, "\n".join(lines) + ("\n" if body.endswith("\n") else "")))
+    return True
+
+
 def cmd_assign(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     if is_quick_milestone(d) and a.as_role != "planner":
@@ -316,6 +353,9 @@ def cmd_assign(a: argparse.Namespace) -> None:
             text = render(meta, body)
         publish(task, text)
         print(f"created {task.relative_to(root())}")
+        if record_planned_task(d, a.owner, (a.title or "").strip().replace("|", "/"),
+                               a.complexity, a.executor):
+            print(f"listed {a.owner} in the plan's Tasks table")
         if deferred:
             print(f"{a.owner} depends on {', '.join(deferred)}, not approved yet: its baseline "
                   "is captured when it is dispatched, so that work is not counted as its own")
@@ -545,8 +585,11 @@ def cmd_handoff(a: argparse.Namespace) -> None:
     print(f"Fill it, then run `docket handoff {a.run} {a.owner} --submit` before replacement.")
 
 
-def record_actual_model(path: Path, actual: str, effort: str) -> tuple[str, str, str, str]:
+def record_actual_model(path: Path, actual: str, effort: str,
+                        harness: str = "") -> tuple[str, str, str, str]:
     meta, body = parse(path.read_text())
+    if harness:
+        meta["harness"] = harness
     requested = meta.get("requested_model", meta.get("model", ""))
     previous = meta.get("actual_model", "")
     history = [item.strip() for item in meta.get("model_history", "").split(" -> ") if item.strip()]
@@ -583,14 +626,22 @@ def cmd_set_model(a: argparse.Namespace) -> None:
         if rm.get("status") not in ("draft", "blocked"):
             die(f"{rep.name} is already {rm.get('status')}; actual model must be recorded before submission")
 
+        dispatch_record = read_dispatch(d, a.owner)
+        # Only the worker's own session proves its harness; a supervisor recording
+        # the model on its behalf runs in a different one.
+        own_session = bool(dispatch_record) and \
+            os.environ.get("DOCKET_ROLE", "").strip() == dispatch_record.get("role")
+        harness = a.harness or (calling_harness() if own_session else "")
+        recorded_harness = str(rm.get("harness", "") or "")
         requested, previous, requested_effort, previous_effort = record_actual_model(
-            rep, a.actual, a.effort
+            rep, a.actual, a.effort, harness
         )
         task = d / f"{a.owner}-task.mdx"
         if task.is_file():
-            record_actual_model(task, a.actual, a.effort)
+            record_actual_model(task, a.actual, a.effort, harness)
+        if harness and recorded_harness and harness != recorded_harness:
+            print(f"harness switched: {recorded_harness} -> {harness}")
 
-        dispatch_record = read_dispatch(d, a.owner)
         unpinned = bool(dispatch_record) and not str(dispatch_record.get("model_requested", "") or "")
         if previous and previous != a.actual:
             print(f"model switched in existing session: {previous} -> {a.actual}")
@@ -695,6 +746,11 @@ def cmd_status(a: argparse.Namespace) -> None:
         print_status(a, d)
     body = out.getvalue()
     sys.stdout.write(body)
+    for wake in missed_wakes(d):
+        if wake["open"]:
+            print(f"\nwake not taken: {wake['role']} has not taken '{wake['key']}' since "
+                  f"{wake['first']}; its session is busy, gone, or not delivering wakes "
+                  f"(recover in that session with `docket pickup {a.run} --role {wake['role']}`)")
     if calling_harness() == "codex" or run_uses_codex(d):
         limits = codex_rate_limits()
         if limits:
@@ -1021,6 +1077,10 @@ def cmd_depend(a: argparse.Namespace) -> None:
                 "round is frozen by `docket submit`"
             )
         state = state_of(d, a.on)[1]
+        from .batches import milestone_dependency_problem
+        barrier = milestone_dependency_problem(d, a.owner, a.on)
+        if barrier:
+            die(barrier)
         final = state in FINAL_STATES
         unusable = consumable_problems(d, a.on, latest, final)
         if unusable:

@@ -31,6 +31,7 @@ Inside a harness, `docket watch` refuses a `--timeout` under 590 seconds: a shor
 The hook is exempt, since its waits cost nothing.
 Under Codex the watcher also says whether the installed docket Stop hook serves this session or is inert because the session's own `DOCKET_ROLE` is missing or names another role.
 A session gets that variable only from the pane or tab that started it (`--env DOCKET_ROLE=<role>`), never from a prefix on one command.
+A session started by hand without it, usually the planner, is served once it runs `docket arm <run> --role <role>` itself: the hook asks `docket hook-role` for the one role that session armed, so after arming it ends its turn instead of polling.
 
 `docket status` names the same waste from the other side.
 When the calling session reads a status identical to the one it read last, the output says so and how many times it has been read unchanged.

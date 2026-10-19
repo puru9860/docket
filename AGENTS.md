@@ -187,3 +187,23 @@ diff -r --exclude='__pycache__' --exclude='*.pyc' ~/.agents/skills/docket ~/Docu
   handing off an implementor's task is not noted as that role, so its tokens stay its own.
 - `docket status` writes under `.status-seen/` when a harness session calls it. That is the
   unchanged-status nudge, not delivery state.
+- `docket arm` refuses a run that the session's `DOCKET_RUN` does not name, unless the
+  session is arming another role. Its wake hook would never watch that run; start the
+  role in a fresh pane instead.
+- The planner is woken once when another role leaves a wake untaken across two lapsed
+  leases. That is the missed-handoff watchdog, not a planner duty to relay progress.
+- Under `round_context: fresh` the quick implementor's own session does no task work:
+  it dispatches, hands the bound prompt to one subagent per task, and waits.
+  Corrections continue that task's subagent, and reviewer corrections continue the same milestone's subagent.
+  Claude Code uses SendMessage to the agent id; OpenCode uses the task tool with its task_id.
+  A replacement starts only if that subagent is gone.
+  A Codex role, or a run recorded without the field, keeps working in its session.
+- With `milestone_dependencies: approval-v1`, a verified predecessor in another milestone does not make a task dispatch-ready until that milestone has an intact approval.
+  The same barrier applies to `docket depend --on`, even with provisional integration allowed.
+  Verified work inside one closed milestone remains usable, and runs without the field keep their existing behavior.
+- A correction review packet initially shows the correction delta rather than the whole historical patch.
+  The reviewer retrieves full historical patches if the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or is unavailable.
+  Missing or damaged prior evidence refuses the packet rather than silently changing its basis.
+- `docket usage` stops counting a session when its run ends or another run notes the
+  same session. A transcript with no call inside that window is `telemetry: empty`,
+  reported as a gap, never as zero.

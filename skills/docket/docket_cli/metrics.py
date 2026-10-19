@@ -10,15 +10,16 @@ import stat
 from pathlib import Path
 
 from .frontmatter import parse
-from .paths import _ordered, latest, owners, read_dispatch, root
+from .paths import _ordered, owners, read_dispatch
 from .policy import need_run, run_policy
 from .bundles import digest_of
 from .state import state_of, verification_paths
-from .five_role import correction_attempts
+from .five_role import correction_counts
 from .qualification import _content_record, qualification_problems
 from .prompts import prompts_dir
 from .feedback import feedback_dir
 from .sessions import collect_run_usage, tokens_h
+from .liveness import handoff_outcome, missed_wakes
 
 
 def scan_content_tree(root: Path) -> tuple[list[dict[str, object]], list[str]]:
@@ -156,45 +157,7 @@ def cmd_metrics(a: argparse.Namespace) -> None:
                     first_round_approvals += 1
             except (OSError, ValueError):
                 pass
-    # Applied decisions and verification findings survive approval, while the
-    # active .corrections budget record is deliberately cleared. Count each
-    # charged return from those durable artifacts and use the active record
-    # only when a return has been charged before its decision was published.
-    corrections_by_owner: dict[str, int] = {}
-    verifier_decisions: set[str] = set()
-    for decision in d.glob("*-decision-*.mdx"):
-        try:
-            meta = parse(decision.read_text())[0]
-        except (OSError, ValueError):
-            continue
-        if meta.get("verdict") != "changes-requested" or meta.get("applied") != "yes" \
-                or meta.get("requirement_amendment"):
-            continue
-        owner = str(meta.get("owner", ""))
-        if owner and owner != "orch":
-            corrections_by_owner[owner] = corrections_by_owner.get(owner, 0) + 1
-        if meta.get("verification"):
-            verifier_decisions.add(str(meta["verification"]))
-    for verification in d.glob("*-verification-*.mdx"):
-        try:
-            meta = parse(verification.read_text())[0]
-        except (OSError, ValueError):
-            continue
-        owner = str(meta.get("owner", ""))
-        if owner and verification.name not in verifier_decisions \
-                and meta.get("opened_correction") in ("requested", "yes", "escalated"):
-            corrections_by_owner[owner] = corrections_by_owner.get(owner, 0) + 1
-    if (d / ".corrections").is_dir():
-        for path in (d / ".corrections").glob("*.json"):
-            try:
-                record = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            if isinstance(record, dict):
-                owner = str(record.get("owner", path.stem))
-                corrections_by_owner[owner] = max(corrections_by_owner.get(owner, 0),
-                                                  correction_attempts(record))
-    corrections = sum(corrections_by_owner.values())
+    corrections = sum(correction_counts(d).values())
     escaped = []
     for path in sorted(feedback_dir(d).glob("*.mdx")):
         try:
@@ -211,7 +174,8 @@ def cmd_metrics(a: argparse.Namespace) -> None:
             recoveries += sum(1 for entry in history
                               if isinstance(entry, dict) and entry.get("kind") == "resume")
     usage = collect_run_usage(d, archive=False)
-    observed = [row for row in usage if row.get("found")]
+    # A transcript with no call inside the run window is a gap, not a zero.
+    observed = [row for row in usage if row.get("found") and row.get("telemetry") != "empty"]
     expected_roles = set(run_policy(d)["role_sessions"].replace(" ", "").split(","))
     observed_roles = {role for row in observed for role in row.get("roles", [])}
     usage_complete = (bool(usage) and len(observed) == len(usage)
@@ -251,6 +215,16 @@ def cmd_metrics(a: argparse.Namespace) -> None:
                     prompt_by_role[role] = prompt_by_role.get(role, 0) + 1
             except (OSError, ValueError):
                 continue
+        # Dispatch keeps the exact bound bytes as <owner>-<role>-r<NN>-<digest>.txt.
+        for path in prompts_dir(d).glob("*-r[0-9][0-9]-*.txt"):
+            parts = path.stem.split("-")
+            prompt_renders += 1
+            try:
+                prompt_chars += len(path.read_text())
+            except OSError:
+                pass
+            if len(parts) >= 4:
+                prompt_by_role[parts[1]] = prompt_by_role.get(parts[1], 0) + 1
     delayed = duplicated = receipts = 0
     for log in sorted((d / ".delivery").glob("*/log.jsonl")) if (d / ".delivery").is_dir() else []:
         try:
@@ -307,6 +281,20 @@ def cmd_metrics(a: argparse.Namespace) -> None:
         print("  measured tokens by role: "
               + "; ".join(f"{role} {tokens_h(count)}"
                           for role, count in sorted(by_role.items())))
+        by_model: dict[str, int] = {}
+        for row in observed:
+            for model, counts in (row.get("by_model") or {}).items():
+                by_model[model] = by_model.get(model, 0) + int(counts.get("total") or 0)
+        if by_model:
+            print("  measured tokens by model: "
+                  + "; ".join(f"{model} {tokens_h(count)}"
+                              for model, count in sorted(by_model.items(), key=lambda i: -i[1])))
+
+    empty = [row for row in usage if row.get("found") and row.get("telemetry") == "empty"]
+    if empty:
+        print("  telemetry gaps: " + ", ".join(
+            f"{'+'.join(row.get('roles') or []) or 'unknown'} {row.get('harness')} transcript "
+            "holds no call inside the run window" for row in empty))
     if not usage_complete or not decided:
         print("  measured tokens per accepted outcome: unknown "
               "(missing role telemetry or no accepted tasks)")
@@ -317,6 +305,11 @@ def cmd_metrics(a: argparse.Namespace) -> None:
         print(f"    {role} prompt renders: {prompt_by_role[role]} "
               "(invocation proxy; not proven model calls)")
     print(f"  delayed or redelivered notifications: {delayed}")
+    missed = missed_wakes(d)
+    print(f"  missed handoffs: {len(missed)} (wakes re-announced after a lapsed lease)"
+          + "".join(f"\n    {w['role']} {w['key']}: first {w['first']}, "
+                    f"{handoff_outcome(w)}"
+                    for w in missed))
     print(f"  normal receipts: {receipts}")
     print(f"  duplicate notifications: {duplicated} (actual duplicates only)")
     if span is not None:

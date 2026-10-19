@@ -52,8 +52,8 @@ from . import (
     sessions,
     discussions,
     models,
-    liveness,
     batches,
+    liveness,
     five_role,
     events,
     delivery,
@@ -79,6 +79,8 @@ from . import (
 )
 from .cli import main
 
+__all__ = ["main", "MODULES"]  # bin/docket's entry point and the module order
+
 MODULES = (
     common,
     frontmatter,
@@ -102,8 +104,8 @@ MODULES = (
     sessions,
     discussions,
     models,
-    liveness,
     batches,
+    liveness,
     five_role,
     events,
     delivery,

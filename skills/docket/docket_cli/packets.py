@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from .common import COVERAGE_AVAILABLE, WORKFLOW_LEGACY_DECODE, die
-from .frontmatter import checkbox_items, parse, render, sections
+from .frontmatter import checkbox_items, parse, sections
 from .paths import _ordered, owners, planned_tasks
 from .publication import publish
 from .policy import is_quick_milestone, need_run, workflow_of
@@ -169,6 +169,91 @@ def packet_acceptance_lines(owner: str, contract: str, report: str,
     return out
 
 
+def correction_basis(d: Path, owner: str, rnd: int, manifest: dict) -> tuple[dict | None, dict]:
+    """Resolve the reviewed predecessor, never infer it from ledger adjacency."""
+    delta = manifest.get("delta") or {}
+    path = d / f"{owner}-decision-{rnd - 1:02d}.mdx"
+    meta = parse(path.read_text())[0] if path.is_file() else {}
+    digest = meta.get("bundle_digest") or delta.get("from", "")
+    if not digest:
+        return None, delta
+    prior_owner, prior = find_bundle_by_digest(d, str(digest))
+    if prior_owner != owner or prior is None:
+        die(f"{owner}: reviewed prior bundle {digest} is missing; refusing correction packet")
+    problems = bundle_problems(d, owner, prior)
+    if problems:
+        die(f"{owner}: reviewed prior bundle {digest} is damaged: " + "; ".join(problems))
+    if delta.get("from") != digest:
+        delta = {"coverage": "unavailable", "reason": "the frozen delta starts after the "
+                 "reviewed decision; retrieve both full patches to check all corrections", "roots": []}
+    return prior, delta
+
+
+def correction_review_lines(d: Path, owner: str, rnd: int, entry: dict,
+                            diff_blocks: list[tuple[str, list[str]]]) -> list[str]:
+    """Lead with the correction oracle, pinned evidence, and changed inputs."""
+    manifest = load_bundle(d, owner, entry) or {}
+    where = bundle_dir(d, owner, entry)
+    prior, delta = correction_basis(d, owner, rnd, manifest)
+    prior_manifest = load_bundle(d, owner, prior) if prior else {}
+    task = (where / "contract.mdx").read_text(errors="replace")
+    task_sections = sections(parse(task)[1])
+    report = (where / "report.mdx").read_text(errors="replace")
+    lines = ["", f"## Correction review: {owner}", "", "Affected criteria and refreshed evidence:"]
+    lines += packet_acceptance_lines(owner, task, report,
+                                     f"{where.relative_to(d)}/contract.mdx",
+                                     f"{where.relative_to(d)}/report.mdx")
+    lines += ["", "Failure model and excluded failure classes (frozen contract):",
+              task_sections.get("Failure model", "").strip()
+              or "The acceptance criteria above define the failure model; no separate model recorded.",
+              task_sections.get("Out of scope", "").strip() or "No separate exclusions recorded."]
+    decision = d / f"{owner}-decision-{rnd - 1:02d}.mdx"
+    if decision.is_file():
+        meta, body = parse(decision.read_text())
+        lines += ["", "Previous decision:", *packet_decision_lines(decision.name, meta, body)]
+    lines += ["", f"Prior bundle: {prior.get('digest') if prior else 'none recorded'}",
+              f"Current bundle: {entry.get('digest')}", "", "Correction delta:"]
+    if delta.get("coverage") == COVERAGE_AVAILABLE:
+        for row in delta.get("roots", []):
+            name = str(row.get("file", ""))
+            text = (where / name).read_text(errors="replace")
+            diff_blocks.append((f"  delta {row.get('alias')} ({len(text.splitlines())} lines; "
+                                f"first {{keep}} shown; full: {where.relative_to(d)}/{name})",
+                                text.splitlines()))
+            lines.append(f"@@diff:{len(diff_blocks) - 1}@@")
+    else:
+        lines.append(f"unavailable: {delta.get('reason', 'no frozen correction delta')}")
+    ver = manifest.get("verification") or {}
+    lines += ["", f"Refreshed verification: {ver.get('status', '?')} "
+              f"(exit {ver.get('returncode', '?')}, {ver.get('command', '?')})"]
+    for key in ("stdout", "stderr"):
+        ref = ver.get(key) or {}
+        if ref.get("file"):
+            lines.append(f"  {key}: {where.relative_to(d)}/{ref['file']} ({ref.get('sha256')})")
+    lines += ["", "Changed dependency identities (frozen inputs):"]
+    def inputs(bundle: dict) -> dict:
+        return {str(row.get("on")): row for row in
+                (bundle.get("dependencies") or {}).get("consumed", [])}
+    before, after = inputs(prior_manifest or {}), inputs(manifest)
+    for dependency in sorted(set(before) | set(after)):
+        old, new = before.get(dependency), after.get(dependency)
+        if old != new:
+            lines.append(f"- {dependency}: {json.dumps(old, sort_keys=True)} -> "
+                         f"{json.dumps(new, sort_keys=True)}")
+    if before == after:
+        lines.append("- none (frozen input records match)")
+    lines += ["", "Review the required changes, delta, refreshed evidence, and regressions first.",
+              "Retrieve the full historical patch when the delta crosses interfaces, dependencies, "
+              "shared invariants, or unrelated code, or the delta is unavailable."]
+    for frozen_entry in [prior, entry]:
+        if frozen_entry:
+            bundle = load_bundle(d, owner, frozen_entry) or {}
+            base = bundle_dir(d, owner, frozen_entry).relative_to(d)
+            for row in (bundle.get("patch") or {}).get("roots", []):
+                lines.append(f"Full historical patch ({frozen_entry.get('digest')}): {base}/{row['file']}")
+    return lines
+
+
 def render_final_packet(a: argparse.Namespace, d: Path) -> None:
     """Render a final packet purely from one validated frozen release.
 
@@ -196,7 +281,7 @@ def render_final_packet(a: argparse.Namespace, d: Path) -> None:
     required_reading: list[str] = []
     lines = [f"# Final review packet: {a.run}", "",
              f"workflow: {frozen_workflow}",
-             f"packet: final",
+             "packet: final",
              f"release: {digest} (frozen {manifest.get('frozen_at', '?')})", "",
              "## Objective (frozen plan)", "",
              (frozen_psecs.get("Objective", "").strip() or "(no objective recorded)"), ""]
@@ -536,9 +621,9 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
     orch_rnd = 0
     if not a.correction and not batch_scope:
         try:
-            orch_rnd, orch_st = state_of(d, "orch")
+            orch_rnd, _ = state_of(d, "orch")
         except (OSError, ValueError):
-            orch_rnd, orch_st = 0, ""
+            orch_rnd = 0
         if orch_rnd:
             orch_entries = bundles_for(d, "orch", orch_rnd)
             if orch_entries:
@@ -556,11 +641,23 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
     mandatory_blocks: list[str] = []
     required_reading: list[str] = []
     rendered_decisions: set[str] = set()
+    diff_blocks: list[tuple[str, list[str]]] = []
     lines = [title, "",
              f"workflow: {workflow_of(d)}",
-             "packet: standard", "",
+             "packet: correction" if a.correction else "packet: standard", "",
              "## Objective", "",
              (psecs.get("Objective", "").strip() or "(no objective recorded)"), ""]
+    corrected = set()
+    for owner in focus:
+        rnd, _ = state_of(d, owner)
+        if rnd > 1:
+            entry = latest_bundle(d, owner, rnd)
+            block = correction_review_lines(d, owner, rnd, entry, diff_blocks)
+            lines.extend(block)
+            mandatory_blocks.append("\n".join(line for line in block if not line.startswith("@@diff:")))
+            required_reading.append(f"{owner}-decision-{rnd - 1:02d}.mdx")
+            corrected.add(owner)
+            rendered_decisions.add(f"{owner}-decision-{rnd - 1:02d}.mdx")
     lines += ["## Acceptance coverage", ""]
     for owner in focus:
         row = task_coverage_row(d, owner)
@@ -575,7 +672,7 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
         frozen, _ = current_bundle(d, owner, rnd) if rnd else (None, [])
         _, frozen_entry = find_bundle_by_digest(d, str((frozen or {}).get("digest", "")))
         where = bundle_dir(d, owner, frozen_entry) if frozen_entry else None
-        if where:
+        if where and owner not in corrected:
             contract_ref = f"{where.relative_to(d)}/contract.mdx"
             report_ref = f"{where.relative_to(d)}/report.mdx"
             block = packet_acceptance_lines(
@@ -585,10 +682,18 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
             lines.extend(block)
             mandatory_blocks.append("\n".join(block))
             required_reading.extend((contract_ref, report_ref))
-        if a.correction:
+        if rnd and rnd > 1:
+            # Each fresh review used to find a new, rarer edge, so corrections never converged.
+            rule = (f"  correction round {rnd}: judge it against the required changes in "
+                    f"{owner}-decision-{rnd - 1:02d}.mdx and for regressions. A new defect outside "
+                    "them requests changes only when it breaks an acceptance criterion as "
+                    "written; list stronger hardening under Notes as a follow-up instead.")
+            lines.append(rule)
+            mandatory_blocks.append(rule)
+        if a.correction and owner not in corrected:
             entries = bundles_for(d, owner)
             if len(entries) >= 2:
-                lines.append(f"  correction history: "
+                lines.append("  correction history: "
                              + " -> ".join(str(e.get('digest')) for e in entries))
                 lines.append(f"  old bundle {entries[-2].get('digest')} -> "
                              f"new bundle {entries[-1].get('digest')}")
@@ -674,8 +779,9 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
         lines.append("- no aggregate bundle yet; this is a task/milestone packet, "
                      "not final qualification")
     lines += ["", "## Evidence deltas", ""]
-    diff_blocks: list[tuple[str, list[str]]] = []
     for owner in ([*focus, "orch"] if orch_entry is not None and not a.correction else focus):
+        if owner in corrected:
+            continue
         try:
             rnd, _ = state_of(d, owner)
         except (OSError, ValueError):
@@ -717,7 +823,7 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
                                 diff_text.splitlines()))
             required_reading.append(f"{where.relative_to(d)}/{name}")
             lines.append(f"@@diff:{len(diff_blocks) - 1}@@")
-    if a.correction:
+    if a.correction and a.correction not in corrected:
         owner = a.correction
         try:
             rnd, _ = state_of(d, owner)

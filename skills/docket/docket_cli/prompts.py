@@ -17,21 +17,24 @@ from .frontmatter import is_empty, parse, sections, stated, unwrap_markdown
 from .paths import _ordered, handoffs, latest, next_numbered, reports, root, scope_path
 from .publication import publish_exclusive
 from .policy import (
-    authority_for, high_risk_verifier_model, is_five_role, is_quick_milestone, is_tiered,
+    authority_for, fresh_context_resume, fresh_context_tool, high_risk_verifier_model,
+    is_five_role,
+    is_quick_milestone, is_tiered,
     mode_of, need_run,
     require_preset_role, role_effort, role_model, run_policy, submit_op_for,
     verifier_correction_allowed, workflow_of,
 )
 from .bundles import digest_of
 from .state import (
-    decide_as, derive_stage, group_numbered_items, latest_checkpoint, latest_verification,
-    list_batches, raw_checkbox_lines, ready_handoff, state_of,
+    derive_stage, group_numbered_items, latest_checkpoint, latest_verification, list_batches,
+    raw_checkbox_lines, ready_handoff, state_of,
 )
 from .profiles import (
     PROFILE_TOKEN_BUDGET, estimate_tokens, list_cards, match_model_profile,
     profile_revision, read_profile,
 )
 from .freeze import current_bundle
+from .sessions import opencode_default_model
 from .gate import task_intent_problems
 from .playbooks import cmd_help, contract_path, load_contract, read_contract
 
@@ -355,6 +358,21 @@ def decision_required_lines(d: Path, owner: str) -> tuple[Path | None, list[str]
     return decs[-1], group_numbered_items(lines)
 
 
+def correction_checklist(d: Path, owner: str) -> list[str]:
+    """Keep all applied correction requirements, including continuation lines."""
+    rnd = state_of(d, owner)[0]
+    out = ["Preserve earlier fixes; earlier items are regression checks, not new requirements."]
+    for path in _ordered(d.glob(f"{owner}-decision-*.mdx")):
+        meta, body = parse(path.read_text())
+        if (meta.get("verdict") != "changes-requested" or meta.get("applied") != "yes"
+                or int(meta.get("round", "0") or 0) >= rnd):
+            continue
+        numbered = group_numbered_items(sections(body).get("Required changes", "").splitlines())
+        out.append(f"{path.name}:")
+        out.extend(f"- [ ] {item}" for item in numbered)
+    return out
+
+
 def rendering_problem(d: Path, run: str, owner: str, role: str, stage: str,
                       model: str = "", profile: str = "") -> str:
     """One concrete diagnostic when a required input is missing, else empty.
@@ -579,6 +597,10 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
             tmeta, _ = parse((d / f"{owner}-task.mdx").read_text())
             if not model_source:
                 model_source = str(tmeta.get("actual_model", "") or tmeta.get("requested_model", ""))
+            # A task left on OpenCode's default model would render round 1 with no
+            # model guidance, though the model it starts on is already knowable.
+            if not model_source and tmeta.get("harness") == "opencode":
+                model_source = opencode_default_model()
         except (OSError, ValueError):
             pass
     chosen_profile = profile or match_model_profile(model_source)
@@ -643,6 +665,8 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
     ]
     if decision_lines:
         parts.append("# Latest decision\n\n" + "\n".join(decision_lines))
+    if eff_stage == "correction" and role == "implementor":
+        parts.append("# Running correction checklist\n\n" + "\n".join(correction_checklist(d, owner)))
     obligations_revision = ""
     report_revision = ""
     # The quick checker performs the verifier duty, so it carries the same
@@ -673,15 +697,10 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         parts.append(guidance_section)
     steps = prompt_steps(d, run, owner, role, eff_stage)
     if role == "implementor" and is_quick_milestone(d):
-        milestone = next((str(batch.get("batch")) for batch in list_batches(d)
-                          if batch.get("milestone") and owner in batch.get("members", [])), "")
-        steps.append(
-            f"After every task in milestone {milestone} has submitted, run "
-            f"`docket batch {run} --verify {milestone} --as implementor`. "
-            f"Arm once with `docket arm {run} --role implementor`, then wait with "
-            f"`docket watch {run} --role implementor` for the reviewer approval or a "
-            "correction. Start the next milestone only after its approval wake. "
-            "See `docket help signalling` for the per-harness wait method.")
+        # A round run in a subagent ends at submission; its parent session keeps
+        # the milestone loop, so the worker prompt must not carry it.
+        if not round_subagent_tool(d, owner):
+            steps.append(quick_coordination_step(d, run, owner))
     elif role in SUPERVISOR_WAIT_ROLES and not any("docket watch" in step for step in steps):
         steps.append(supervisor_wait_step(run, role))
     if steps:
@@ -760,6 +779,68 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
     return prompt, info
 
 
+def quick_coordination_step(d: Path, run: str, owner: str) -> str:
+    """The quick implementor's milestone loop after one of its tasks is submitted."""
+    milestone = next((str(batch.get("batch")) for batch in list_batches(d)
+                      if batch.get("milestone") and owner in batch.get("members", [])), "")
+    return (f"You coordinate the whole run, so a submitted round is not a stopping point: "
+            f"dispatch the next undispatched task of milestone {milestone} at once, without "
+            f"asking. After every task in milestone {milestone} has submitted, run "
+            f"`docket batch {run} --verify {milestone} --as implementor`. "
+            f"Arm once with `docket arm {run} --role implementor`, then wait with "
+            f"`docket watch {run} --role implementor` for the reviewer approval or a "
+            "correction. Start the next milestone only after its approval wake. "
+            "See `docket help signalling` for the per-harness wait method.")
+
+
+def round_subagent_harness(d: Path, owner: str) -> str:
+    """The harness whose subagent runs this task's rounds, or '' when its session does.
+
+    Only the quick implementor coordinates its own rounds; elsewhere a supervisor
+    hands each round to a worker session.
+    """
+    if not is_quick_milestone(d) or owner == "orch":
+        return ""
+    try:
+        harness = str(parse((d / f"{owner}-task.mdx").read_text())[0].get("harness", "") or "")
+    except (OSError, ValueError):
+        return ""
+    return harness if fresh_context_tool(d, harness) else ""
+
+
+def round_subagent_tool(d: Path, owner: str) -> str:
+    """The subagent tool that runs this task's rounds, or '' when its session does."""
+    harness = round_subagent_harness(d, owner)
+    return fresh_context_tool(d, harness) if harness else ""
+
+
+def round_handoff_lines(d: Path, run: str, owner: str, role: str, prompt_file: Path) -> list[str]:
+    """Hand the bound prompt to one task subagent, continuing it for corrections."""
+    rel = prompt_file.relative_to(root())
+    harness = round_subagent_harness(d, owner) if role == "implementor" else ""
+    if not harness:
+        return []
+    tool, resume = fresh_context_tool(d, harness), fresh_context_resume(harness)
+    ask = (f"\"Read {rel} and follow it exactly. When done, reply with one line: submitted, "
+           "blocked, or handed off.\"")
+    if state_of(d, owner)[0] > 1:
+        delegate = (f"NEXT, required: continue the subagent that ran {owner}'s earlier round, "
+                    f"with {resume}, so it keeps what it learned. Send it: {ask} Start a new one "
+                    f"with {tool} only if that subagent is gone. Do not read that file or work "
+                    "on the task in this session.")
+    else:
+        delegate = (f"NEXT, required: start one subagent now with {tool}, on your own model (no "
+                    f"model override). Its whole prompt is: {ask} Keep its id: a correction to "
+                    f"{owner} continues that same subagent. Do not read that file or work on the "
+                    "task in this session: the round runs in its own context (round_context: fresh).")
+    return [
+        f"prompt: {rel}",
+        delegate,
+        f"THEN, when it replies: confirm {owner} with `docket status {run}`. "
+        + quick_coordination_step(d, run, owner),
+    ]
+
+
 SUPERVISOR_WAIT_ROLES = ("planner", "orchestrator", "coordinator",
                            "verifier", "reviewer", "checker")
 
@@ -811,9 +892,18 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
                     f"{owner} --changes --as reviewer` or `docket decide {run} {owner} "
                     "--waive --reason TEXT --as reviewer`."]
         if milestone:
+            review_duty = ("For corrected members, lead with their correction packet and delta; "
+                           "retrieve the full historical patch when changes cross interfaces, "
+                           "dependencies, shared invariants, or unrelated code, or the delta is "
+                           "unavailable. Preserve regression checks against the criteria."
+                           if rnd > 1 else
+                           "Read the complete frozen patches and changed tests; check material "
+                           "expectations independently. Return one consolidated numbered list per "
+                           "member, each finding naming its criterion and a reproducer or causal "
+                           "argument. Put hardening under Notes; propose stronger requirements "
+                           "with `docket propose-amendment` for the planner.")
             return [f"Read `docket review-packet {run} --role reviewer --batch {milestone}` ",
-                    f"and the complete frozen patches and changed tests for milestone {milestone}; "
-                    "check material expectations independently.",
+                    review_duty,
                     f"Approve the milestone once with `docket batch {run} --approve "
                     f"{milestone} --as reviewer --reason TEXT`; request changes for an "
                     f"affected task with `docket decide {run} {owner} --changes --as reviewer`."]
@@ -847,14 +937,26 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
             if status == "blocked":
                 return [read, "The round is blocked: answer its Decisions needed question.",
                         *decide]
+            if rnd > 1 and owner != "orch":
+                return [f"Read `docket review-packet {run} --role reviewer --correction {owner}`; "
+                        "judge the required changes, correction delta, refreshed evidence, and "
+                        "regressions. Retrieve full historical patches if the delta crosses "
+                        "interfaces, dependencies, shared invariants, or unrelated code, or "
+                        "the delta is unavailable.", *decide]
             return [read, "Read the complete relevant frozen patch and changed tests; "
                     "judge correctness, design, and integration against independently "
-                    "checked material expectations.", *decide]
+                    "checked material expectations. Return one consolidated numbered list per "
+                    "member, each naming its criterion and a reproducer or causal argument. "
+                    "Put hardening under Notes; propose stronger requirements with "
+                    "`docket propose-amendment` for the planner.", *decide]
         verify_as = as_role("verify-record") + (" --verifier checker" if checker else "")
         steps = [
             read,
-            "Check every acceptance criterion against observable behavior, with expected "
-            "values you derive independently; apply the obligations above.",
+            "Build a criterion-to-observation map with independently derived expectations; "
+            "inspect changed tests for false positives; run one or two decisive negative "
+            "controls in a disposable copy. Budget 2-3 minutes of model work plus declared "
+            "check runtime; record uncertain for missing material evidence, never a rushed "
+            "pass. Do not rerun an identical captured suite. Apply the obligations above.",
             f"Record one verdict: `docket verify {run} {owner} --result pass|fail|uncertain"
             f"{verify_as} --detail \"1. numbered finding with its evidence\"`"
             + (" (add `--open-correction` to a fail to open the correction round)"
@@ -875,7 +977,9 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         "earlier rounds included), the acceptance boxes (criteria exactly as "
         "the task states them, each checked only when it genuinely passes), the registered "
         "verify command and any observed output (or say submit will capture it), and decisions needed.",
-        f"Submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
+        f"Run `docket submit {run} {owner} --check` until it passes: it lists exactly what the "
+        "gate would refuse and changes nothing, so never read docket's own source to learn the "
+        f"rules. Then submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
         f"write the question under Decisions needed and run `docket submit {run} {owner} "
         f"--blocked{submit_as}`. Never edit the report after submitting.",
     ]
@@ -910,25 +1014,51 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
              "checks for failures or concrete risks. Compare old and new behavior with "
              "the same method on both sides when that comparison "
              "is needed.")
+    review = (
+        "Before filling the report, check your work the way the reviewer will; the "
+        "reviewer reruns claims instead of trusting them:\n"
+        f"   - Every behavior `docket diff {run} {owner}` changes is one the task asks for, "
+        "and input the old code handled still works.\n"
+        "   - For a criterion that says every, all, or each, search for every site and "
+        "list each one with how it is covered.\n"
+        "   - Each changed branch, error and recovery paths included, has an assertion "
+        "that fails without your change; see it fail once against the old code. Tests "
+        "wait on files or events, never on fixed sleeps.\n"
+        "   - Run a decisive negative control in an isolated copy: show the key test "
+        "fails when the guarded behavior is removed; for failure claims, prove the "
+        "failure was actually injected into the named component and the test detects "
+        "incorrect behavior. Save the observed failing result.\n"
+        "   - A criterion about a real tool, service, data set, or screen is met only once "
+        "you exercised the real thing, isolated where it could harm anything; otherwise "
+        "mark it partial and name the gap.\n"
+        "   - Open every screenshot or output you produced and look for loading or empty "
+        "states, overlaps, 'undefined', and cut-off text.\n"
+        "   - Docs, help text, and comments that describe what you changed still match it.\n"
+        "   Claim only what an artifact shows, and say what you did not observe. Save the "
+        f"output of each real-system check under `{rel}/evidence/` and cite that file.")
     if stage == "correction":
         return [
-            "Apply every required change listed above.",
+            "Apply every required change listed above. For each, first reproduce what it "
+            "names (rerun the reviewer's command, input, or observation and see it fail), "
+            "then fix it and rerun that same check; cite the check per change in the report. "
+            "Keep what the earlier round got right and preserve earlier fixes from the "
+            "running checklist as regression checks.",
             f"If a change needs a file outside the accepted scope, amend `{rel}/{owner}-scope.mdx` "
             f"and rerun `docket scope {run} {owner} --submit` first.",
-            build, *finish, handoff,
+            build, review, *finish, handoff,
         ]
     if stage == "resume":
         return [
             f"Read the task, the accepted `{rel}/{owner}-scope.mdx`, the handoff or checkpoint "
             f"named below, and `docket diff {run} {owner}`; rediscover only what they leave open.",
-            build, *finish, handoff,
+            build, review, *finish, handoff,
         ]
     return [
         f"Read `{rel}/{owner}-task.mdx`, then discover the code it touches.",
         f"Fill `{rel}/{owner}-scope.mdx` (proposed files, the exact verify command, relevant "
         f"symbols, reasoning) and run `docket scope {run} {owner} --submit` before editing; on a "
         "collision, stop and report it.",
-        build, *finish, handoff,
+        build, review, *finish, handoff,
     ]
 
 

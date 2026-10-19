@@ -24,6 +24,15 @@ After the final milestone decision, the planner receives the completion event;
 new quick runs have no additional aggregate decision.
 There is no verifier in new quick runs. Existing `combined-checker` quick runs
 keep their coordinator and checker duties. An implementor never approves its own work.
+
+Under `round_context: fresh` (the default for new runs) in quick on Claude Code or OpenCode, your session only coordinates: it dispatches, starts one subagent per task, runs the milestone suite, and waits.
+`docket dispatch` prints the exact subagent instruction; do not read the prompt file yourself.
+Keep the subagent's id and continue that same context for every correction to its task.
+On Claude Code use SendMessage to that agent's id; on OpenCode use the task tool with that subagent's task_id.
+Start a replacement only if the original subagent is gone, using the bound prompt and running correction checklist for recovery.
+The worker stops at submission and the parent keeps the milestone loop.
+A standard worker also keeps one context per task across its corrections, with a new context for the next task.
+A Codex implementor, or a run recorded with `round_context: shared` or without the field, keeps working in its session.
 A run that outgrows quick records an escalation request; the implementor keeps working under the recorded preset until an authorized follow-up decides otherwise.
 
 1. Read the complete `Txx-task.mdx`. Own repository discovery: begin with project
@@ -72,9 +81,10 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    read; if the other task later freezes something different, your own submission is
    refused until you reverify against the new evidence and record it again, and so is
    any approval or waiver of your round while that input is stale. Consuming work that
-   is not yet approved is only possible when the run declares
-   `provisional_integration: allowed`, and only from a round whose frozen verification
-   passed: a blocked, skipped, failed, stale, or patchless bundle is refused. It is
+   is not yet approved is possible within a closed milestone once tiered verification settles it.
+   New plans record `milestone_dependencies: approval-v1`: consuming work from another milestone requires that milestone's intact approval, even when provisional integration is allowed.
+   Runs without that field keep their recorded settlement and integration rules, and ungrouped tasks keep their integration policy.
+   A blocked, skipped, failed, stale, or patchless bundle is refused. It is
    readiness, never approval. Record it while your round is still a draft: once you
    have submitted, `docket depend` is refused, because the pin is part of the evidence
    the reviewer is reading. If an input moves after you submitted, ask the reviewer for
@@ -106,7 +116,22 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    with independent expectations, separate actual provenance from oracle
    derivation, byte-sensitive fingerprints, zero/one/many boundaries,
    reviewed oracle changes, and controlled offline proof or an explicit gap.
-5. Fill the standard task report: summary, files changed, acceptance,
+5. Before the report, review your own patch the way the reviewer will, because
+   the reviewer reruns claims rather than trusting them. These are the reasons
+   most first rounds came back: a behavior changed that the task did not ask for;
+   an "every" criterion with sites left unconverted; a changed branch, often an
+   error or recovery path, with no assertion that fails without the change; tests
+   that pass by timing luck; a criterion about a real tool, service, data set, or
+   screen proven only against a fake; a screenshot nobody looked at; docs that
+   still describe the old behavior; and a report claiming more than its artifacts
+   show. A criterion you could only check against a fake is `partial`, with the
+   gap named. For a correction, first reproduce what each required change names,
+   then rerun that same check after the fix and cite it.
+   Run a decisive negative control in a disposable copy: show the key test fails when its guarded behavior is removed.
+   For failure claims, prove the failure was actually injected into the named component and the check detects an incorrect result.
+   Save the observed failing result; never mutate the measured checkout to run a negative control.
+   Correction prompts carry a running checklist of all earlier required changes; preserve earlier fixes as regression checks while addressing the latest decision.
+   Fill the standard task report: summary, files changed, acceptance,
    verification, and decisions needed. The acceptance criteria are already copied
    from the task as unchecked boxes; keep their text exactly and only change the
    checkbox state. Optionally map each criterion to evidence in
@@ -128,7 +153,10 @@ A run that outgrows quick records an escalation request; the implementor keeps w
    effect on acceptance and dependencies. Keep working on unaffected work; do
    not edit the task contract yourself. Use `--blocked` when execution truly
    cannot proceed while that decision is pending.
-6. Submit normally with `docket submit <run> <owner> --as implementor`, or submit
+6. Run `docket submit <run> <owner> --check` first: it lists exactly what the gate
+   would refuse in the current report and runs, freezes, and changes nothing, so the
+   rules never need to be read from docket's source.
+   Submit normally with `docket submit <run> <owner> --as implementor`, or submit
    a blocker with `docket submit <run> <owner> --blocked --as implementor`. Submitting freezes the whole round -
    the task revision, the task baseline, the full patch from that baseline, the
    resulting source revision, your report body, and the verification as it actually

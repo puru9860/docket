@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Docket - chat design</title>
+  <link rel="stylesheet" href="design.css"><script src="design.js" defer></script>
+</head>
+<body>
+  <div class="design-note"><span class="preview-dot"></span><strong>Interactive design preview</strong><span>Sample conversations. Actions stay in this preview.</span><a href="../frontend-chat-design.md">Design specification ↗</a></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span>d.</span>docket <small>WORKSPACE</small></div>
+      <label class="section-label" for="project-select">PROJECT</label>
+      <select id="project-select"><option value="test">test</option><option value="demo">demo-project</option></select>
+      <div class="project-path" id="project-path">~/Documents/Projects/test</div>
+      <label class="section-label" for="run-select">RUN</label>
+      <select id="run-select"><option>R01 · Chat UI & file viewer</option></select>
+      <div class="section-heading"><span class="section-label">ROLES</span><span id="session-count">5</span></div>
+      <nav id="sessions" aria-label="Role conversations"></nav>
+      <div class="run-progress"><div><span>Reviewer decisions</span><strong>1 / 3</strong></div><div class="progress"><span></span></div><small>Includes approvals and requested changes</small></div>
+      <div class="sidebar-foot"><span id="session-source">OpenCode · r01-planner</span></div>
+    </aside>
+    <main>
+      <header class="topbar"><div class="crumb">test <span>/</span> R01 <span>/</span> <strong id="crumb-role">Planner</strong></div><div class="header-actions"><button id="attention" class="attention-button">2 need you <span>↗</span></button><button id="context-toggle" aria-pressed="true">◫ Context</button></div></header>
+      <div class="workarea">
+        <section class="conversation-panel">
+          <div class="conversation-heading"><div class="role-avatar" id="role-avatar">P</div><div class="heading-copy"><h1 id="role-name">Planner</h1><div id="session-subtitle">OpenCode · r01-planner · Defines intent and constraints</div></div><div class="live-pill" id="connection-state"><span class="status-dot green"></span>Chat available</div></div>
+          <div class="view-tabs" role="tablist"><button data-view="conversation" role="tab" aria-selected="true">Conversation</button><button data-view="activity" role="tab" aria-selected="false">Activity</button><button data-view="terminal" role="tab" aria-selected="false">Terminal fallback ↗</button><span id="source-label">One native session</span></div>
+          <div class="conversation-scroll" id="conversation" aria-live="polite"></div>
+          <div id="state-explanation" class="state-explanation" hidden></div>
+          <form id="composer" class="composer"><label id="composer-label" for="message">Message Planner</label><textarea id="message" rows="2" placeholder="Give direction, ask a question, or refine the plan..."></textarea><div class="composer-footer"><span id="recipient-hint">To r01-planner only · Enter to send · Shift+Enter for a new line</span><button id="send" type="submit" class="primary">Send <span>↑</span></button></div></form>
+          <div id="feedback" class="feedback" role="status">Design preview: chat actions are simulated.</div>
+        </section>
+        <aside class="context-panel" id="context-panel" aria-label="Run context"><div class="context-heading"><strong>Run context</strong><span class="tiny-pill">Read only</span></div><div class="context-tabs"><button id="plan-tab" class="active">Plan</button><button id="task-tab">Task</button><button id="report-tab">Report</button></div><div class="document-info"><span class="file-icon">▤</span><div><strong id="document-title">plan.mdx</strong><small id="document-status">Live plan · draft</small></div></div><article id="document"></article><div class="evidence-note"><span>◇</span><p>Conversation status and task approval are separate. The Docket paper trail remains the source of truth.</p></div></aside>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

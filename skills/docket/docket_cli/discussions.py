@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .common import DELIVERY_LEASE_SECONDS, SKILL_DIR, STATE_DIR, die, stamp
+from .common import DELIVERY_LEASE_SECONDS, STATE_DIR, die, stamp
 from .frontmatter import parse, render, sections
 from .paths import root
 from .publication import publish, publish_json
