@@ -297,7 +297,7 @@ def harness_session(needles: list[str], *, require_unique: bool = False,
 
 def note_harness_session(d: Path, role: str, owner: str,
                          needles: list[str]) -> dict[str, str] | None:
-    """Append the calling session to the run's ledger once per role and task. Never raises."""
+    """Append session identity and newly measured reviewer models. Never raises."""
     ref = harness_session(needles)
     if not ref:
         return None
@@ -310,6 +310,7 @@ def note_harness_session(d: Path, role: str, owner: str,
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
                 fh.seek(0)
+                matching = []
                 for line in fh:
                     try:
                         seen = json.loads(line)
@@ -323,9 +324,20 @@ def note_harness_session(d: Path, role: str, owner: str,
                     # playing it, and noting it would attribute its tokens there.
                     if seen.get("role") != role:
                         return None
+                    matching.append(seen)
+                if role == "reviewer":
+                    first_seen = min((str(seen.get("at", "")) for seen in matching), default=stamp())
+                    observed_ref = {**ref, "first_seen": first_seen}
+                    observed_ref["until"] = session_until(d, observed_ref)
+                    models = observed_session_models(observed_ref)
+                    if models:
+                        entry["models_observed"] = models
+                for seen in matching:
                     same_process = all((seen.get("worker_process") or {}).get(k)
                                        == process.get(k) for k in ("pid", "start"))
-                    if all(seen.get(k) == entry[k] for k in identity) and same_process:
+                    same_models = (not entry.get("models_observed") or
+                                   seen.get("models_observed") == entry["models_observed"])
+                    if all(seen.get(k) == entry[k] for k in identity) and same_process and same_models:
                         return ref
                 fh.write(json.dumps({"at": stamp(), **entry}, sort_keys=True) + "\n")
                 fh.flush()
@@ -415,6 +427,8 @@ def run_harness_sessions(d: Path) -> list[dict[str, object]]:
                 ref[field].append(str(value))
         if isinstance(entry.get("worker_process"), dict):
             ref["worker_process"] = entry["worker_process"]
+        if isinstance(entry.get("models_observed"), list):
+            ref["models_observed"] = entry["models_observed"]
     return list(merged.values())
 
 
@@ -904,6 +918,33 @@ def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path]
     if not usage["found"]:
         usage["telemetry"] = "missing"
     return usage, [], rows
+
+
+def observed_session_models(ref: dict[str, object]) -> list[str]:
+    """Models measured in this session's window, excluding delegated Claude work."""
+    since, until = str(ref.get("first_seen", "")), str(ref.get("until", ""))
+    harness = ref.get("harness")
+    try:
+        if harness == "opencode":
+            calls, times, _ = opencode_calls(opencode_session_rows(str(ref.get("session_id", ""))))
+        else:
+            files = session_transcripts(ref)
+            calls, times, _ = (claude_calls(files[:1]) if harness == "claude" else codex_calls(files))
+        return summarize_calls(calls, times, since, until)["models"]
+    except (OSError, ValueError, TypeError, KeyError):
+        # Optional telemetry must never prevent a lifecycle command.
+        return []
+
+
+def reviewer_observed_models(d: Path) -> list[str]:
+    """Run-wide reviewer observations, never inferred from launch requests."""
+    models = set()
+    for ref in run_harness_sessions(d):
+        if "reviewer" not in ref.get("roles", []):
+            continue
+        models.update(ref.get("models_observed", []))
+        models.update(observed_session_models({**ref, "until": session_until(d, ref)}))
+    return sorted(models)
 
 
 # The planner reports the outcome, records feedback, and archives usage after the

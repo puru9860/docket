@@ -28,7 +28,7 @@ from .events import ensure_worker_exit_checkpoint, events
 from .delivery import (
     announce_active, announce_delivered, announce_dir, announce_path, delivery_lock,
     delivery_log, event_actionable, inbox_ack, inbox_retry, mark_announce_delivered,
-    paused_flag, read_pending, sweep_role,
+    paused_flag, pickup_conductor_receipts, read_pending, sweep_role,
     claim_event, event_is_owned, native_bound_roles, native_bound_runs, native_session_registration,
     proven_native_identity,
     received_before,
@@ -263,7 +263,8 @@ MIN_HARNESS_WATCH_SECONDS = 590
 def short_watch_refusal(harness: str, role: str, timeout: int) -> str:
     how = {
         "codex": "Drop --timeout (the default is 8 hours) and wait on this one command.",
-        "claude": "Drop --timeout (the default is 8 hours) and run it as one background command.",
+        "claude": "Use the Stop hook first; otherwise run one `docket watch` Bash call "
+                  "with run_in_background, without a short --timeout.",
         "opencode": f"Use --timeout {MIN_HARNESS_WATCH_SECONDS} only in a terminal or "
                     "adapter that allows at least 600 seconds; a shell cap below 590 seconds "
                     "cannot run this watch.",
@@ -271,7 +272,8 @@ def short_watch_refusal(harness: str, role: str, timeout: int) -> str:
     return (f"watch --timeout {timeout} inside {harness} is a polling loop: every "
             "return re-enters the model with its whole context to start the same wait again. "
             f"The shortest watch a harness session may run is {MIN_HARNESS_WATCH_SECONDS} s. "
-            f"{how} See `docket help signalling`.")
+            f"{how} Never use Codex background terminals, shell '&', or nohup for a watch, "
+            "and never background it inside a Stop hook. See `docket help signalling`.")
 
 
 # A wake is exit 2 for a person or agent running `docket watch`. Inside the wake
@@ -293,9 +295,9 @@ def cmd_pickup(a: argparse.Namespace) -> None:
         die(f"no recipient binding; run `docket arm {a.run} --role {a.role}` "
             "inside the role's session, or pass its registered --session")
     with delivery_lock(d, a.role):
+        received = pickup_conductor_receipts(d, a.role, reg)
         sweep_role(d, a.role)
         announcements = [read_announce(d, a.role, key) for key, _ in events(d, a.role)]
-    received = []
     for notice in announcements:
         if notice.get("transport") not in ("native-hook", "herdr") or notice.get("session") != reg["session"]:
             continue

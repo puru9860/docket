@@ -8,6 +8,9 @@ Worker Stop hooks stay silent even if armed; the planner retains its existing ho
 The implementor does not own `launch:reviewer` in these runs.
 Workers register themselves using the supplied transport session and run `docket pickup RUN --role ROLE --session SESSION` before acting.
 Reviewer `arm` is registration here, not a second delivery transport.
+Run the numbered startup steps in order: register with `arm` or `dispatch --register` first, then `pickup`, then read the role and task guidance.
+Conductor delivery records a receipt before pickup to prevent a second delivery.
+Pickup shows that session generation's delivered obligation without claiming it again; a superseded obligation is explicitly non-actionable receipt context.
 Herdr announcements use the existing role delivery lock, bounded announcement lease, and identity-bound receipt files.
 A successful Herdr prompt records delivery; a failed or interrupted send remains retryable after the announcement lease unless the recipient picked it up.
 Delivery retains the existing at-least-once crash contract; a successful send or receipt suppresses another delivery of that event identity, including after conductor restart.
@@ -34,9 +37,20 @@ One `docket watch <run> --role "$DOCKET_ROLE"` returns exactly when something is
 
 | Harness | How to wait |
 | --- | --- |
-| Claude Code | Best: the Stop hook with `asyncRewake` below, which waits at zero token cost. Otherwise run `docket watch` as one background command (`run_in_background`) without a short `--timeout`; the model is re-entered only when it exits. A foreground call is capped at 10 minutes by the tool. |
-| Codex | Best: the Stop hook in `hooks/codex-hooks.json.example`, merged into `~/.codex/hooks.json` and trusted once in `/hooks`. When your turn ends it waits at no model cost and hands you the wake as your next prompt, so end your turn instead of starting a watcher. Without it: start `docket watch` once and keep waiting on that same command: pass the `yield_time_ms` that `docket watch` prints when it starts to every `write_stdin` and `wait` poll. With `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` that is 3600000: one poll then idles for up to an hour at no model cost and returns the moment the wake lands. Codex re-enters the model on every return, and its first yields come back after about 30 seconds whatever you pass, so only the long window keeps a wait to a few turns. |
-| OpenCode | Run `docket watch <run> --role R --timeout 590` only in a terminal or adapter whose shell call can last at least 600 seconds. OpenCode `run` mode can cap a shell call at 120 seconds, which cannot host this foreground watch. Use a longer-lived terminal or delivery adapter for unattended supervision; a short retry loop burns a model turn on every return. |
+| Claude Code | Prefer the Stop hook with `asyncRewake`; otherwise use one Bash `run_in_background` call running `docket watch` without a short `--timeout`, so the model is re-entered only when it exits. |
+| Codex | Use the synchronous Stop hook in `hooks/codex-hooks.json.example`, or one foreground `docket watch` and keep waiting on that same command. |
+| OpenCode | Run `docket watch <run> --role R --timeout 590` only in a terminal or adapter whose shell call can last at least 600 seconds. |
+
+Never detach `docket watch` with shell `&` or `nohup` in any harness, and never use Codex background terminals.
+Never background a watcher inside a Stop hook; it must remain in that hook's foreground process tree.
+Claude Code's Bash `run_in_background` is a supported no-hook fallback: Claude stops these managed tasks when its session ends.
+With a working native hook, end your turn instead of starting a watcher.
+Claude Code foreground tool calls can be capped at 10 minutes; its managed background fallback avoids a model turn every time that cap expires.
+OpenCode `run` calls can be capped at 120 seconds; use a longer-lived terminal or delivery adapter when the call cannot host the watch.
+For a manual Codex watch, pass the `yield_time_ms` printed at startup to every `write_stdin` and `wait` poll of that same foreground command.
+Set `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` to allow one-hour polls; this setting controls the wait window and does not authorize backgrounding the watcher.
+Codex's first yields may return after about 30 seconds, but subsequent long waits return as soon as the event lands.
+A short retry loop burns a model turn on every return.
 
 A planner can wake an armed supervisor with `docket instruct <run> --role
 reviewer --message TEXT`. The role handles the instruction and closes it with
@@ -215,5 +229,6 @@ Waiting is silent. Do not repeatedly call `docket status`, `herdr agent get`, or
 `herdr agent read` to manufacture progress updates. Use one blocking `docket watch`,
 then inspect once when it returns. A healthy running state is not user-facing news.
 
-Never background `docket watch` from a Claude Code Stop hook. The watcher must
-remain in the hook's foreground process tree so session teardown stops it.
+Never background `docket watch` inside a Stop hook.
+Never use shell `&`, `nohup`, or Codex background terminals for the watcher.
+Claude Code's managed Bash `run_in_background` fallback remains available outside hooks.

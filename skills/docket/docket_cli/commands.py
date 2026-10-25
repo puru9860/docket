@@ -67,7 +67,7 @@ from .verification import (
 from .templates import template
 from .sessions import (
     calling_harness, codex_limit_lines, codex_rate_limits, harness_process_ref, harness_session,
-    run_harness_sessions,
+    reviewer_observed_models, run_harness_sessions,
 )
 from .liveness import dispatch_dependencies_unmet, dispatch_liveness, live_dispatches, missed_wakes
 from .batches import batch_ready, cmd_batch as _batches_cmd_batch
@@ -810,8 +810,9 @@ def checkpoint_age(d: Path, owner: str) -> str:
 def print_status(a: argparse.Namespace, d: Path) -> None:
     plan = d / "plan.mdx"
     pmeta = parse(plan.read_text())[0] if plan.is_file() else {}
+    plan_state = "" if is_quick_milestone(d) else f"plan: {pmeta.get('status', 'missing')}   "
     print(
-        f"run {a.run}   plan: {pmeta.get('status', 'missing')}   "
+        f"run {a.run}   {plan_state}"
         f"mode: {mode_of(d)}   "
         f"topology: {pmeta.get('topology', 'split')}   "
         f"updates: {pmeta.get('progress_updates', 'quiet')}   "
@@ -820,7 +821,7 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
     from .conductor import conductor_status
     for line in conductor_status(d):
         print(line)
-    if a.role == "planner":
+    if a.role == "planner" and not is_quick_milestone(d):
         rnd, st = state_of(d, "orch")
         if rnd:
             print(f"\norchestrator report: round {rnd}  {st}")
@@ -923,6 +924,8 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
         print("  that pinned them is stale and must be resubmitted")
     batches = list_batches(d)
     if batches:
+        reviewer_models = reviewer_observed_models(d)
+        print(f"\nactual reviewer={','.join(reviewer_models) or 'unobserved'} (run session telemetry)")
         print("\nreview batches (closed membership only; later tasks cannot join):")
         for batch in batches:
             ready, _ = batch_ready(d, batch) if batch.get("state") == "closed" else (False, "")
@@ -940,7 +943,7 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
                     observed.append(f"{member}:{actual or 'unobserved'}")
                 print(f"    requested: implementor={impl['harness']}/{impl['model'] or '(default)'} "
                       f"reviewer={review['harness']}/{review['model'] or '(default)'}; "
-                      f"actual: implementor={','.join(observed)} reviewer=unobserved; "
+                      f"actual: implementor={','.join(observed)}; "
                       f"reviewer_context={batch.get('reviewer_context', 'continue')}")
     open_incidents = [i for i in list_incidents(d) if i.get("state") == "open"]
     if open_incidents:

@@ -126,9 +126,47 @@ def remember_receipt(d: Path, role: str, key: str, announcement: dict) -> None:
     """
     publish_json(received_path(d, role, key), {
         "key": key, **{field: announcement.get(field) for field in IDENTITY_FIELDS},
+        "role": role, "transport": announcement.get("transport", ""),
+        "message": announcement.get("message", ""),
         "session": announcement.get("session", ""),
         "session_generation": announcement.get("session_generation", ""),
         "received_at": now_s()})
+
+
+def pickup_conductor_receipts(d: Path, role: str, reg: dict) -> list[tuple[str, str]]:
+    """Read delivered obligations without reclaiming them. Caller holds delivery_lock."""
+    found = []
+    for path in sorted((delivery_dir(d, role) / "received").glob("*.json")):
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if (not isinstance(receipt, dict) or receipt.get("picked_up_at")
+                or receipt.get("session") != reg["session"]
+                or receipt.get("session_generation") != reg["generation"]):
+            continue
+        key = str(receipt.get("key", ""))
+        notice = read_announce(d, role, key)
+        same_notice = announcement_matches_recipient(notice, reg) and all(
+            notice.get(field) == receipt.get(field) for field in IDENTITY_FIELDS)
+        if (receipt.get("transport") or (notice.get("transport") if same_notice else "")) != "herdr":
+            continue
+        pending = read_pending(d, role, key)
+        same_pending = pending and all(pending.get(field) == receipt.get(field)
+                                       for field in IDENTITY_FIELDS)
+        message = (receipt.get("message") or (notice.get("message") if same_notice else "")
+                   or (pending.get("message") if same_pending else "") or "delivered obligation")
+        current, _ = event_actionable(d, {**receipt, "role": role})
+        state = "already delivered" if current else "already delivered; no longer actionable; inspect current state"
+        found.append((key, f"{state}: {message}"))
+        # Dispatch can retire an implementor's startup event before pickup.
+        # Its receipt remains context, never authority to act on stale work.
+        receipt["picked_up_at"] = now_s()
+        publish_json(path, receipt)
+        if same_notice:
+            notice["received_at"] = now_s()
+            publish_json(announce_path(d, role, key), notice)
+    return found
 
 
 def received_before(d: Path, role: str, key: str, pending: dict,

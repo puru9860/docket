@@ -288,18 +288,21 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict) -> str:
     role, bid, sid = record['role'], str(batch['batch']), record['session']
     owner = str(event.get('owner') or '')
     header = (f"You are the {role} for Docket run {d.name}, milestone {bid}, in a conductor-managed "
-              f"session. Your transport session is {sid}. Read `docket help {role}`. "
+              f"session. Your transport session is {sid}. "
               "Worker wakes come only from the conductor. Never run docket watch or install a wake hook.\n")
     if role == 'reviewer':
-        header += f"Register yourself with `docket arm {d.name} --role reviewer --session {sid}`.\n"
+        register = f"docket arm {d.name} --role reviewer --session {sid}"
     elif owner and state_of(d, owner)[1] == 'draft':
         dispatch = read_dispatch(d, owner)
         command = 'resume' if dispatch and dispatch.get('session') != sid else 'dispatch'
-        header += (f"First register and bind your own round: `docket {command} {d.name} {owner} "
-                   f"--session {sid} --agent {record['agent_name']} --register`. Read its bound prompt.\n")
-    elif not read_registration(sid):
-        header += f"Register yourself with `docket arm {d.name} --role implementor --session {sid}`.\n"
-    header += f"Before acting, run `docket pickup {d.name} --role {role} --session {sid}`.\n"
+        register = (f"docket {command} {d.name} {owner} "
+                    f"--session {sid} --agent {record['agent_name']} --register")
+    else:
+        register = f"docket arm {d.name} --role implementor --session {sid}"
+    header += ("\nStartup, in this exact order:\n\n"
+               f"1. Register first: `{register}`.\n"
+               f"2. Then pick up the delivery: `docket pickup {d.name} --role {role} --session {sid}`.\n"
+               f"3. Read `docket help {role}` and any bound prompt from step 1, then handle the obligation below.\n\n")
     header += f"Obligation {event['key']}: {event['message']}\n"
     if str(event['key']).startswith('instruction:'):
         iid = str(event['key']).split(':')[1]
@@ -333,6 +336,7 @@ def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
             return
         reg = bind_worker_registration(d, record)
         notice = {'key': key, 'role': role, 'run': d.name, 'transport': 'herdr',
+                  'message': pending.get('message', ''),
                   **{f: pending.get(f) for f in IDENTITY_FIELDS},
                   'session': record['session'], 'session_generation': reg.get('generation', 1),
                   'announced_at': now_s(), 'lease_until': now_s() + DELIVERY_LEASE_SECONDS}

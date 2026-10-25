@@ -100,6 +100,8 @@ harness, act on each wake, and wait again.
 
 Arm each waiting role in its own session and follow [signalling.md](signalling.md) for the harness wait method.
 After a native wake, run `docket pickup R01 --role "$DOCKET_ROLE"`, read status once, act, and wait again.
+Prefer a working native hook; otherwise Claude Code uses one Bash `run_in_background` watch without a short `--timeout`.
+Never use Codex background terminals or shell `&` or `nohup` in any harness, and never background a watcher inside a Stop hook.
 Never use `herdr agent wait`, `--wait`, a short `--timeout`, or `sleep` to wait for Docket work.
 Arm the planner before handover with `docket arm R01 --role planner`, then end its turn when the native hook is available.
 Do not type another prompt into a waiting pane to advance a milestone; the approval wake is the handoff.

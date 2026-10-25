@@ -586,8 +586,12 @@ A fresh milestone is a continuation boundary, so a busy older reviewer is never 
 The conductor uses the existing role delivery lock, pending records, announcement lease, received identity, and append-only role ledger.
 It checks idle state immediately before `herdr agent prompt`; successful writes record delivery, while failed or interrupted sends remain retryable after the announcement lease unless picked up.
 The crash contract remains at-least-once; unchanged successfully delivered identities stay quiet across restart and native worker hooks do not provide a competing transport.
-Workers still register themselves through dispatch or arm, then pickup acknowledges the exact recipient generation.
+Workers follow a numbered startup sequence: register through dispatch or arm, then pickup, then read role and task guidance.
+Conductor delivery retains the obligation message in the recipient-generation receipt so pickup can show it without a second claim or delivery.
+A receipt whose event no longer matches current state is explicitly non-actionable context; it never supplies lifecycle authority.
 Launch records never supply an observed model or substitute for worker registration.
+Reviewer commands append models measured from their own session telemetry to the harness-session ledger, excluding delegated Claude transcripts and calls outside the run window.
+Status shows the run-wide observed reviewer models from that ledger and current telemetry; unavailable telemetry never substitutes the requested model.
 Only live user config can supply per-harness launch arguments, and the conductor appends the frozen milestone model flag.
 Project config accepts no launch arguments or permission bypass options.
 Without user launch arguments only the model flag is passed, leaving permission dialogs visible for human attention.
@@ -1337,7 +1341,9 @@ Re-announcing it every lease period re-entered the supervisor every five minutes
 An identity that moves is retired and re-derived by `sweep_role`, which removes the announcement, so a changed event still wakes.
 
 A harness re-entry replays the whole session context, so how a supervisor waits is the dominant token cost of a run.
-Claude Code waits for free through the Stop hook, or once per event through a background `docket watch`.
+Claude Code waits for free through the Stop hook, or once per event through one Bash `run_in_background` watch without a short `--timeout`.
+Claude owns those managed tasks and stops them when its session ends.
+Never use Codex background terminals, shell `&`, or `nohup`, and never background the watcher inside a Stop hook.
 Codex slices a blocking call into polls, each a full-context turn, capped per empty poll by `background_terminal_max_timeout`; its own awaiter agent sets that to an hour, and the signalling playbook tells supervisors to do the same.
 OpenCode blocks for the whole shell timeout and has no idle wake.
 A standard run on 2026-09-26 spent a Codex 5-hour window in 93 minutes on waiting alone: the orchestrator re-armed `docket watch --timeout 120` fifteen times, and the session the user launched the run from kept checking on it long after the handoff.

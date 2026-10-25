@@ -85,7 +85,9 @@ Dependency readiness never counts as final approval.
 
 ## Hand over the approved plan
 
-Approve the plan only after the human agrees to it.
+Obtain the human's approval before starting work.
+Quick runs have no plan-status transition: do not edit `plan.mdx` lifecycle frontmatter to record approval.
+`docket status` tracks task and milestone decisions instead of displaying the unused plan status.
 Follow [launch.md](launch.md) to run `docket conduct R01` as a plain foreground command in its own Herdr pane.
 The conductor owns visible worker launches, milestone handoff, and direct worker wakes; it never types into your pane.
 End your turn after starting it; the planner keeps its native hook for decisions, stalls, and completion.

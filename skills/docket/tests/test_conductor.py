@@ -232,6 +232,72 @@ class Conductor(unittest.TestCase):
         self.assertEqual(1, len(self.state()['prompts']))
         self.assertNotIn('launch:reviewer', self.cli('events', 'demo', '--role', 'implementor', '--peek').stdout)
 
+    def test_worker_startup_numbers_registration_before_pickup(self):
+        self.tick()
+        rec = self.record()
+        prompt = self.state()['prompts'][-1]['text']
+        self.assertRegex(prompt, r'(?m)^1\. .*docket dispatch demo T01 .*--register')
+        self.assertRegex(prompt, r'(?m)^2\. .*docket pickup demo --role implementor')
+        self.cli('dispatch', 'demo', 'T01', '--session', rec['session'], '--register')
+        self.submitted(); self.tick()
+        prompt = self.state()['prompts'][-1]['text']
+        self.assertRegex(prompt, r'(?m)^1\. .*docket arm demo --role reviewer')
+        self.assertRegex(prompt, r'(?m)^2\. .*docket pickup demo --role reviewer')
+
+    def test_implementor_pickup_reads_delivered_startup_after_dispatch_without_redelivery(self):
+        self.tick()
+        rec = self.record()
+        key = rec['last_delivery_key']
+        self.cli('dispatch', 'demo', 'T01', '--session', rec['session'], '--register')
+        output = self.cli('pickup', 'demo', '--role', 'implementor', '--session', rec['session']).stdout
+        self.assertIn(key, output)
+        self.assertIn('already delivered', output)
+        self.assertIn('no longer actionable', output)
+        self.assertNotIn('unknown or already retired', output)
+        count = len(self.state()['prompts'])
+        self.tick(); self.tick()
+        self.assertEqual(count, len(self.state()['prompts']))
+        duplicate = self.cli('pickup', 'demo', '--role', 'implementor', '--session', rec['session']).stdout
+        self.assertNotIn(key + ':', duplicate)
+
+    def test_continued_reviewer_pickup_reads_receipt_without_claiming_or_redelivering(self):
+        self.tick(); self.submitted(); self.tick()
+        rec = self.record(role='reviewer')
+        self.native(rec, 'continued-review-thread')
+        self.cli('pickup', 'demo', '--role', 'reviewer', '--session', rec['session'])
+        self.approve(); self.tick(); self.submitted(2); self.tick()
+        second = self.record('M2', 'reviewer')
+        self.assertEqual(rec['session'], second['session'])
+        output = self.cli('pickup', 'demo', '--role', 'reviewer', '--session', rec['session']).stdout
+        self.assertIn('batch:M2:ready:1', output)
+        self.assertIn('already delivered', output)
+        self.assertNotIn('unknown or already retired', output)
+        self.assertFalse(any((self.run / '.delivery/reviewer/leases').glob('*.json')))
+        count = len(self.state()['prompts'])
+        self.tick(); self.tick()
+        self.assertEqual(count, len(self.state()['prompts']))
+
+    def test_superseded_reviewer_delivery_is_only_non_actionable_receipt_context(self):
+        self.tick(); self.submitted(); self.tick()
+        rec = self.record(role='reviewer')
+        self.cli('arm', 'demo', '--role', 'reviewer', '--session', rec['session'])
+        self.approve()
+        output = self.cli('pickup', 'demo', '--role', 'reviewer', '--session', rec['session']).stdout
+        self.assertIn('batch:M1:ready:1', output)
+        self.assertIn('already delivered; no longer actionable', output)
+        self.assertFalse(any((self.run / '.delivery/reviewer/leases').glob('*.json')))
+
+    def test_delivered_receipt_is_not_replayed_to_a_new_session_generation(self):
+        self.tick(); self.submitted(); self.tick()
+        rec = self.record(role='reviewer')
+        self.cli('arm', 'demo', '--role', 'reviewer', '--session', rec['session'])
+        path = self.f.root / '.docket/sessions' / (rec['session'] + '.json')
+        reg = json.loads(path.read_text()); reg['generation'] += 1
+        path.write_text(json.dumps(reg))
+        out = self.cli('pickup', 'demo', '--role', 'reviewer', '--session', rec['session'], ok=False)
+        self.assertNotIn('already delivered', out.stdout)
+        self.assertNotIn('batch:M1:ready:1:', out.stdout)
+
     def test_user_launch_arguments_are_used_and_project_arguments_are_refused(self):
         self.user.write_text(json.dumps({'claude_launch_args': ['--dangerously-skip-permissions'],
                                          'implementor_model': 'later-config'}))

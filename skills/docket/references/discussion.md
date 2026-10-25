@@ -37,10 +37,15 @@ turns. With no multiplexer, open a separate terminal and paste the prompt there.
 Keep requested models separate from observed execution; model metadata is a
 request, not proof the harness used it.
 
-The peer prompt includes its exact join command. Run it in the peer's own
-session. Joining also binds native wake delivery to that harness process and
-session. The invoker and peer cannot share a session. A native binding requires
-a process start identity; outside a proven harness, use explicit session IDs.
+The peer prompt includes its exact join command.
+Run it in the peer's own session.
+Joining binds native wake delivery only when it proves that harness process and session.
+The invoker and peer cannot share a session.
+A native binding requires a process start identity; outside a proven harness, use explicit session IDs.
+The join command reports when it could not record a native wake binding and prints the exact `--watch` command to use with per-harness wait guidance.
+An explicit `--session` alone does not bind the Stop hook; native delivery also requires an installed, trusted hook.
+For Claude Code without a working hook, use one Bash `run_in_background` watch without a short `--timeout`.
+Never use Codex background terminals, shell `&`, or `nohup`, and never background the watcher inside a Stop hook.
 
 ## Converse
 

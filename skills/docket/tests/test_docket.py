@@ -14328,7 +14328,8 @@ class DocketCLI(unittest.TestCase):
                                "--timeout", "120", ok=False)
         self.assertEqual(1, refused.returncode)
         self.assertIn("--timeout 120 inside claude is a polling loop", refused.stderr)
-        self.assertIn("run it as one background command", refused.stderr)
+        self.assertIn("run_in_background", refused.stderr)
+        self.assertIn("never background it inside a Stop hook", refused.stderr)
         opencode = self.cli_env({"OPENCODE_PID": str(os.getpid())}, "watch", "demo", "--role",
                                 "orchestrator", "--timeout", "300", ok=False)
         self.assertEqual(1, opencode.returncode)

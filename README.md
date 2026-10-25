@@ -49,9 +49,9 @@ Three things make it hold up on real work:
 - **Tasks and corrections share context.** New quick runs record `round_context: shared`: the implementor works in one session without task subagents.
   Runs that recorded `fresh` retain their existing per-task and per-milestone context behavior; missing values still mean shared context.
 - **Signalling costs nothing while idle.** A supervisor finishes its turn and goes idle.
-  A watcher sleeps in the background and re-enters the session only when something is
-  actionable, using the harness's own wake mechanism rather than a polling loop that
-  burns a turn each time.
+  The native hook keeps its watcher in the hook's foreground process tree and re-enters the session only when something is actionable.
+  Claude Code without a working hook uses one Bash `run_in_background` watch without a short `--timeout`.
+  Never use Codex background terminals, shell `&`, or `nohup`, and never background a watcher inside a Stop hook.
 
 ## Requirements
 
@@ -326,7 +326,7 @@ docket disarm [<run>] [--role R]                      disarm
 docket doctor                                        what dispatch and wake options you have
 docket watch <run> --role planner|implementor|reviewer|orchestrator|verifier|coordinator|checker
                                                      block until something needs you
-docket help <role>                                   the playbooks
+docket help <role|command>                           a role playbook or command --help
 docket help <role> --run R01 --owner T01              compact guidance for that run's recorded policy and task
 ```
 

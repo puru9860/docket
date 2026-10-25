@@ -695,6 +695,15 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
     if guidance_blocks:
         guidance_section = "# Selected guidance\n\n" + "\n\n".join(guidance_blocks)
         parts.append(guidance_section)
+    if role == "implementor":
+        parts.append(
+            "# Evidence citations\n\n"
+            "If you include an Evidence table, use comma-separated bare artifact paths "
+            "in Artifacts; put explanations outside that cell.\n"
+            "Save actual output before citing it, for example:\n\n"
+            "| ID | State | Artifacts | Gaps |\n"
+            "| --- | --- | --- | --- |\n"
+            f"| A1 | met | `{run_rel}/evidence/x.out` | none |")
     steps = prompt_steps(d, run, owner, role, eff_stage)
     if role == "implementor" and is_quick_milestone(d):
         # A round run in a subagent ends at submission; its parent session keeps
@@ -799,6 +808,7 @@ def quick_coordination_step(d: Path, run: str, owner: str) -> str:
             f"Arm once with `docket arm {run} --role implementor`, then wait with "
             f"`docket watch {run} --role implementor` for the reviewer approval or a "
             "correction. Start the next milestone only after its approval wake. "
+            + manual_wait_note() +
             "See `docket help signalling` for the per-harness wait method.")
 
 
@@ -854,15 +864,21 @@ SUPERVISOR_WAIT_ROLES = ("planner", "orchestrator", "coordinator",
                            "verifier", "reviewer", "checker")
 
 
+def manual_wait_note() -> str:
+    return ("Prefer the native Stop hook. Without it, Claude Code uses one Bash "
+            "`run_in_background` watch without a short --timeout. "
+            "Never use Codex background terminals, shell '&', or nohup, and never "
+            "background a watcher inside a Stop hook. ")
+
+
 def supervisor_wait_step(run: str, role: str) -> str:
     """One clear wait method for a supervising role.
 
-    Every supervisor waits the same way: one blocking `docket watch` for its
-    own role. Harness differences live in `docket help signalling`, never as a
-    second wait method in the prompt.
+    Native hooks wait first; manual fallback follows the harness's task lifecycle.
     """
     return (f"Wait with `docket watch {run} --role {role}`; "
             "see `docket help signalling` for the per-harness table. "
+            + manual_wait_note() +
             "Do not wait on `herdr agent wait`, a sleep loop, or status polling.")
 
 

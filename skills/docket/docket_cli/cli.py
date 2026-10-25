@@ -726,13 +726,18 @@ def main() -> None:
     q = sub.add_parser("doctor", help="report available dispatch and wake options")
     q.set_defaults(fn=cmd_doctor)
 
-    q = sub.add_parser("help", help="print a role playbook")
-    q.add_argument("role", choices=HELP_TOPICS)
+    q = sub.add_parser("help", help="print a role playbook or command help")
+    q.add_argument("role", choices=sorted(set(HELP_TOPICS) | set(sub.choices)), metavar="NAME")
     q.add_argument("--run", default="", help="render guidance for this recorded run")
     q.add_argument("--owner", type=owner_argument, default=None,
                    help="task or orch for active run guidance")
     q.set_defaults(fn=cmd_role_help)
 
     a = p.parse_args()
+    if a.cmd == "help" and a.role not in HELP_TOPICS:
+        if a.run or a.owner:
+            p.error("command help does not take --run or --owner; use active guidance with a role name")
+        sub.choices[a.role].print_help()
+        return
     note_command_session(a)
     a.fn(a)
