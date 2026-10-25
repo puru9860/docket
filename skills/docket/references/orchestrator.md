@@ -4,11 +4,11 @@ Turn the approved plan into assignments, supervise delegated work, review
 implementor reports and diffs, perform your own tasks, and produce one
 standardized aggregate report.
 
-## Standard and quick sessions
+## Recorded sessions
 
-New runs start on the quick preset; the standard preset (`--mode standard`)
-keeps separate planner, orchestrator, implementor, verifier, and reviewer
-sessions.
+This playbook is for existing and custom runs that use an orchestrator.
+The standard preset is deprecated for new work; existing sessions keep their recorded policy.
+New runs use quick; see `planner.md` and `implementor.md`.
 New quick runs give coordination to the implementor, with a separate planner and milestone reviewer and no verifier session.
 Existing `combined-checker` quick runs keep their coordinator and checker, with verification then review recorded as separate duties.
 Neither policy uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut.

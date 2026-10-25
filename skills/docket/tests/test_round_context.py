@@ -19,18 +19,19 @@ class RoundContext(unittest.TestCase):
         os.chdir(self.previous_cwd)
         self.f.tearDown()
 
-    def quick(self, name, harness="claude", context=""):
+    def quick(self, name, harness="claude", context="fresh"):
         self.cli("init", name, "--mode", "quick", "--evidence-mode", "documents-only")
         run = self.f.root / ".docket/runs" / name
         if context:
             plan = run / "plan.mdx"
-            plan.write_text(plan.read_text().replace("round_context: fresh",
+            plan.write_text(plan.read_text().replace("round_context: shared",
                                                      f"round_context: {context}"))
         self.cli("assign", name, "T01", "--harness", harness, "--file", "src/t01.py",
                  "--verify", "true", "--as", "planner")
         self.f.fill_task(run / "T01-task.mdx")
         self.cli("batch", name, "--create", "M1", "--members", "T01", "--milestone",
-                 "--command", "true", "--as", "planner")
+                 "--command", "true", "--as", "planner", "--implementor-harness", harness,
+                 "--assignment-reason", "Exercise the recorded harness adapter.")
         self.cli("batch", name, "--close", "M1", "--as", "planner")
         return run
 
@@ -40,9 +41,9 @@ class RoundContext(unittest.TestCase):
         [prompt] = (self.f.root / ".docket/runs" / name / ".prompts").glob("T01-*.txt")
         return out, prompt.read_text()
 
-    def test_new_runs_record_a_fresh_round_context(self):
-        run = self.quick("recorded")
-        self.assertIn("round_context: fresh", (run / "plan.mdx").read_text())
+    def test_new_runs_record_a_shared_round_context(self):
+        run = self.quick("recorded", context="shared")
+        self.assertIn("round_context: shared", (run / "plan.mdx").read_text())
 
     def test_fresh_claude_round_runs_in_a_subagent_and_the_session_keeps_the_loop(self):
         self.quick("fresh")
@@ -91,7 +92,7 @@ class RoundContext(unittest.TestCase):
             run = self.quick(name)
             plan = run / "plan.mdx"
             plan.write_text(plan.read_text().replace(
-                "round_context: fresh", "round_context: fresh\n"
+                "reviewer_harness: codex",
                 f"reviewer_harness: {harness}\nverifier_harness: {harness}"))
             review = self.module_note("reviewer", name)
             self.assertIn("one subagent per milestone", review)
@@ -126,8 +127,7 @@ class RoundContext(unittest.TestCase):
     def test_a_fresh_reviewer_wake_says_to_decide_in_a_subagent(self):
         run = self.quick("review")
         plan = run / "plan.mdx"
-        plan.write_text(plan.read_text().replace("round_context: fresh",
-                                                 "round_context: fresh\nreviewer_harness: claude"))
+        plan.write_text(plan.read_text().replace("reviewer_harness: codex", "reviewer_harness: claude"))
         self.f.fill_scope(run / "T01-scope.mdx")
         self.cli("scope", "review", "T01", "--submit")
         self.f.fill_task_report(run / "T01-report-01.mdx")
@@ -151,7 +151,8 @@ class RoundContext(unittest.TestCase):
                      "--criterion", "The feature works.", "--no-default-criteria")
         for bid, members in (("M1", "T01,T02"), ("M2", "T03")):
             self.cli("batch", name, "--create", bid, "--members", members, "--milestone",
-                     "--command", "true", "--as", "planner")
+                     "--command", "true", "--as", "planner", "--implementor-harness", "codex",
+                     "--assignment-reason", "Exercise Codex coordination.")
             self.cli("batch", name, "--close", bid, "--as", "planner")
         module = fixtures.load_cli("docket_round_loop_tests")
 

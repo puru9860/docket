@@ -1,5 +1,25 @@
 # Signalling
 
+## Conductor-managed workers
+
+`docket conduct RUN` owns implementor and reviewer delivery once that run has a `.conductor/managed.json` record.
+It derives the same role events and sends prompts only to idle Herdr agents.
+Worker Stop hooks stay silent even if armed; the planner retains its existing hook and never receives typed conductor prompts.
+The implementor does not own `launch:reviewer` in these runs.
+Workers register themselves using the supplied transport session and run `docket pickup RUN --role ROLE --session SESSION` before acting.
+Reviewer `arm` is registration here, not a second delivery transport.
+Herdr announcements use the existing role delivery lock, bounded announcement lease, and identity-bound receipt files.
+A successful Herdr prompt records delivery; a failed or interrupted send remains retryable after the announcement lease unless the recipient picked it up.
+Delivery retains the existing at-least-once crash contract; a successful send or receipt suppresses another delivery of that event identity, including after conductor restart.
+Workers end their turns after submission, suite verification, or decisions, so waiting consumes no model tokens.
+The persistent managed record continues suppressing worker hooks while the conductor is stopped; restart `docket conduct RUN` to reconcile its panes.
+Conductor stalls use existing incident records with `recipient: planner`; ordinary health flags keep their existing routing.
+The planner hook derives one identity-bound recovery event for each open conductor incident, even if a sustained Herdr outage made the conductor stop.
+The conductor never delivers that incident to the affected worker or types into the planner pane.
+Reopen resumes a recorded native session with a new transport binding and releases prior announcements through the existing explicit retry path; the worker still registers and picks up its own obligations.
+
+## Manual and historical delivery
+
 Lifecycle state is never proof of task completion. Submitted reports are the
 review handoff; ready partial-work checkpoints are resumable context only.
 
@@ -105,7 +125,7 @@ keep their review relay through the orchestrator.
 In a new quick run the reviewer wakes once a whole milestone has its full-suite pass.
 The implementor then waits for a milestone approval event before dispatching the
 next milestone, or for a correction event that needs its action.
-The quick implementor alone owns `launch:reviewer`; standard keeps that launch
+In manual runs the quick implementor alone owns `launch:reviewer`; standard keeps that launch
 with the planner. Use the registered inbox claim before launching, so competing
 sessions of the same role cannot hold the launch lease together.
 Old `combined-checker` quick runs route ready work to the checker instead.

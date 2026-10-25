@@ -14,6 +14,8 @@ from .profiles import PROFILE_TOKEN_BUDGET
 from .sessions import cmd_usage, note_command_session
 from .discussions import DISCUSSION_PARTICIPANTS, cmd_discuss
 from .models import cmd_feedback, cmd_models
+from .assignments import cmd_config
+from .policy import ASSIGNMENT_ROLES
 from .five_role import ROUTE_TABLE, cmd_escalate_mode, cmd_escalation, cmd_route
 from .delivery import cmd_hook_role, cmd_inbox, cmd_reconcile, cmd_session
 from .signalling import cmd_arm, cmd_disarm, cmd_events, cmd_instruct, cmd_pickup, cmd_watch
@@ -32,6 +34,7 @@ from .metrics import cmd_metrics
 from .release import cmd_release
 from .packets import cmd_review_packet
 from .dispatch import cmd_dispatch, cmd_resume, cmd_switch_model
+from .conductor import cmd_conduct, cmd_reopen
 from .commands import (
     cmd_assign, cmd_batch_entry, cmd_bundle, cmd_depend, cmd_diff, cmd_handoff, cmd_init,
     cmd_migrate, cmd_preflight, cmd_roots, cmd_scope, cmd_set_model, cmd_status,
@@ -120,11 +123,30 @@ def main() -> None:
     q.add_argument("--interval", type=int, default=5)
     q.set_defaults(fn=cmd_discuss)
 
+    q = sub.add_parser("conduct", help="drive quick milestone workers in Herdr without model tokens")
+    q.add_argument("run")
+    q.add_argument("--once", action="store_true", help="reconcile and deliver once, then return")
+    q.add_argument("--interval", type=float, default=2, help="seconds between reconciliations")
+    q.add_argument("--stall-seconds", type=float, default=300, help="idle obligation stall threshold")
+    q.add_argument("--outage-seconds", type=float, default=180, help="sustained Herdr outage threshold")
+    q.set_defaults(fn=cmd_conduct)
+
+    q = sub.add_parser("reopen", help="resume a milestone worker's recorded native session in Herdr")
+    q.add_argument("run")
+    q.add_argument("--milestone", required=True)
+    q.add_argument("--role", choices=("implementor", "reviewer"), required=True)
+    q.set_defaults(fn=cmd_reopen)
+
+    q = sub.add_parser("config", help="show effective or recorded role and milestone assignments")
+    q.add_argument("run", nargs="?", default="", help="inspect frozen run policy instead of live config")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_config)
+
     q = sub.add_parser("init", help="scaffold a run and its plan")
     q.add_argument("run")
     q.add_argument("--harness", default="claude", choices=SUPPORTED_HARNESSES)
     q.add_argument("--mode", choices=MODES,
-                   help="tested run preset; bare init defaults to quick")
+                   help="run preset; defaults to quick; standard is deprecated for new runs")
     q.add_argument("--agents", type=int, default=0,
                    help="assert the preset's physical session count")
     q.add_argument("--topology", default="", choices=("", *TOPOLOGIES))
@@ -151,8 +173,10 @@ def main() -> None:
     q.add_argument("--executor", default="implementor", choices=["implementor", "orchestrator"])
     q.add_argument("--tier", choices=["small", "self"], help=argparse.SUPPRESS)
     q.add_argument("--harness", default="", choices=("", *SUPPORTED_HARNESSES),
-                   help="the worker's harness; opencode for a task, the supervisor's own "
+                   help="the worker's harness; recorded assignment or claude for a task, the supervisor's own "
                         "harness for the aggregate")
+    q.add_argument("--clear-assignment", action="store_true",
+                   help="clear an undispatched quick task's explicit harness/model choices and inherit its milestone")
     q.add_argument("--model", default="")
     q.add_argument("--effort", default="", help="requested reasoning effort when supported by the harness")
     q.add_argument("--file", action="append", default=[], help="allowed path; repeat for multiple paths")
@@ -632,6 +656,15 @@ def main() -> None:
                    help="reviewer recorded in the milestone decision (default: reviewer)")
     q.add_argument("--reason", default="",
                    help="reviewer-authored milestone decision reason, frozen before approval")
+    for role in ASSIGNMENT_ROLES:
+        label = role.replace("_", "-")
+        q.add_argument(f"--{label}-harness", dest=f"{role}_harness", default="", choices=SUPPORTED_HARNESSES,
+                       help=f"milestone {role} harness, within the recorded user policy")
+        q.add_argument(f"--{label}-model", dest=f"{role}_model", default="",
+                       help=f"milestone {role} model; requires --assignment-reason")
+    q.add_argument("--assignment-reason", default="", help="planner reason for milestone assignment overrides")
+    q.add_argument("--reviewer-context", choices=("continue", "fresh"), default=None)
+    q.add_argument("--continuity-reason", default="", help="reason for explicit reviewer context choice")
     q.add_argument("--as", dest="as_role", default="",
                    choices=("", *ACTING_ROLES),
                    help="acting role; milestone approval requires the reviewer")

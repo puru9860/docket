@@ -6470,7 +6470,7 @@ class DocketCLI(unittest.TestCase):
             "| T02 | second | low | implementor | |"))
         for owner in ("T01", "T02"):
             self.cli("assign", "demo", owner, "--complexity", "low", "--executor",
-                     "implementor", "--harness", "opencode", "--file", "src/a.py",
+                     "implementor", "--harness", "claude", "--file", "src/a.py",
                      "--verify", "true", "--as", "planner")
             self.fill_task(run / f"{owner}-task.mdx")
         self.fill_scope(run / "T01-scope.mdx")
@@ -6532,7 +6532,7 @@ class DocketCLI(unittest.TestCase):
         run = self.root / ".docket" / "runs" / "demo"
         refused = self.cli("assign", "demo", "T01", "--as", "implementor", ok=False)
         self.assertIn("--as planner", refused.stderr)
-        self.cli("assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+        self.cli("assign", "demo", "T01", "--harness", "claude", "--file", "src/a.py",
                  "--verify", "true", "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         refused = self.cli("batch", "demo", "--create", "M1", "--members", "T01",
@@ -6567,7 +6567,7 @@ class DocketCLI(unittest.TestCase):
             "| T02 | second | low | implementor | |\n"
             "| T03 | tenth | low | implementor | |"))
         for owner in ("T01", "T02", "T03"):
-            self.cli("assign", "demo", owner, "--harness", "opencode", "--file",
+            self.cli("assign", "demo", owner, "--harness", "claude", "--file",
                      f"src/{owner}.py", "--verify", "true", "--as", "planner")
             self.fill_task(run / f"{owner}-task.mdx")
             self.fill_scope(run / f"{owner}-scope.mdx")
@@ -6628,7 +6628,7 @@ class DocketCLI(unittest.TestCase):
             "| T01 | first | low | implementor | |\n"
             "| T02 | second | low | implementor | |"))
         for owner in ("T01", "T02"):
-            self.cli("assign", "demo", owner, "--harness", "opencode", "--file",
+            self.cli("assign", "demo", owner, "--harness", "claude", "--file",
                      "src/a.py" if owner == "T01" else "src/b.py", "--verify", "true",
                      "--as", "planner")
             self.fill_task(run / f"{owner}-task.mdx")
@@ -6673,7 +6673,7 @@ class DocketCLI(unittest.TestCase):
         plan.write_text(plan.read_text().replace(
             "| T01 |       | low        | implementor |             |",
             "| T01 | work | low | implementor | |"))
-        self.cli("assign", "demo", "T01", "--harness", "opencode", "--file",
+        self.cli("assign", "demo", "T01", "--harness", "claude", "--file",
                  "src/a.py", "--verify", "true", "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         suite = 'test "$(cat src/a.py)" = "allowed = 2"'
@@ -6741,7 +6741,7 @@ class DocketCLI(unittest.TestCase):
             "| T01 | blocked work | low | implementor | |\n"
             "| T02 | completed work | low | implementor | |"))
         for owner in ("T01", "T02"):
-            self.cli("assign", "demo", owner, "--harness", "opencode", "--file",
+            self.cli("assign", "demo", owner, "--harness", "claude", "--file",
                      f"src/{owner}.py", "--verify", "true", "--as", "planner")
             self.fill_task(run / f"{owner}-task.mdx")
         self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02",
@@ -6774,7 +6774,7 @@ class DocketCLI(unittest.TestCase):
         plan.write_text(plan.read_text().replace(
             "| T01 |       | low        | implementor |             |",
             "| T01 | blocked work | low | implementor | |"))
-        self.cli("assign", "demo", "T01", "--harness", "opencode", "--file",
+        self.cli("assign", "demo", "T01", "--harness", "claude", "--file",
                  "src/a.py", "--verify", "true", "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         self.cli("batch", "demo", "--create", "M1", "--members", "T01",
@@ -6870,7 +6870,7 @@ class DocketCLI(unittest.TestCase):
         plan.write_text(plan.read_text().replace(
             "| T01 |       | low        | implementor |             |",
             "| T01 | work | low | implementor | |"))
-        self.cli("assign", "demo", "T01", "--harness", "opencode", "--file",
+        self.cli("assign", "demo", "T01", "--harness", "claude", "--file",
                  "src/a.py", "--verify", "true", "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         self.cli("batch", "demo", "--create", "M1", "--members", "T01",
@@ -6923,7 +6923,7 @@ class DocketCLI(unittest.TestCase):
             "| T01 |       | low        | implementor |             |",
             "| T01 | blocked work | low | implementor | |"))
         self.cli("assign", "demo", "T01", "--executor", "implementor",
-                 "--harness", "opencode", "--file", "src/a.py", "--verify", "true",
+                 "--harness", "claude", "--file", "src/a.py", "--verify", "true",
                  "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         self.cli("batch", "demo", "--create", "M1", "--members", "T01",
@@ -6948,7 +6948,7 @@ class DocketCLI(unittest.TestCase):
             "| T01 | blocked work | low | implementor | |\n"
             "| T02 | peer work | low | implementor | |"))
         for owner in ("T01", "T02"):
-            self.cli("assign", "demo", owner, "--harness", "opencode", "--file",
+            self.cli("assign", "demo", owner, "--harness", "claude", "--file",
                      f"src/{owner}.py", "--verify", "true", "--as", "planner")
             self.fill_task(run / f"{owner}-task.mdx")
         self.cli("batch", "demo", "--create", "M1", "--members", "T01,T02",
@@ -6985,7 +6985,7 @@ class DocketCLI(unittest.TestCase):
                         extra = ["--depends-on", "T01"]
                     if kind == "transitive" and member == "T03":
                         extra = ["--depends-on", "T02"]
-                    self.cli("assign", run_id, member, "--harness", "opencode",
+                    self.cli("assign", run_id, member, "--harness", "claude",
                              "--file", f"src/{member}.py", "--verify", "true",
                              "--as", "planner", *extra)
                     self.fill_task(run / f"{member}-task.mdx")
@@ -7019,7 +7019,7 @@ class DocketCLI(unittest.TestCase):
         plan.write_text(plan.read_text().replace(
             "| T01 |       | low        | implementor |             |",
             "| T01 | work | low | implementor | |"))
-        self.cli("assign", "demo", "T01", "--harness", "opencode", "--file", "src/a.py",
+        self.cli("assign", "demo", "T01", "--harness", "claude", "--file", "src/a.py",
                  "--verify", "true", "--as", "planner")
         self.fill_task(run / "T01-task.mdx")
         refused = self.cli("batch", "demo", "--create", "B0", "--members", "T01",
@@ -10516,14 +10516,14 @@ class DocketCLI(unittest.TestCase):
         """The prompt carries the compact contract, never the playbook detail."""
         contracts = self._skill_root() / "references" / "contracts"
         maxima = {"implementor": 544, "orchestrator": 612, "verifier": 349,
-                  "reviewer": 359, "planner": 302}
+                  "reviewer": 1300, "planner": 302}
         run = self.init("split", evidence_mode="documents-only")
         self.assign_simple(run, "T01")
         for role, limit in maxima.items():
             body = (contracts / f"{role}.md").read_text().strip()
             self.assertTrue(body, f"empty contract {role}")
             self.assertLessEqual(len(body), limit,
-                                 f"{role} contract exceeds its historic compact size")
+                                 f"{role} contract exceeds its compact budget including review audit")
             out = self.prompt_text(run, "T01", role)
             self.assertIn(body.split()[0], out)
             self.assertIn(body.strip().splitlines()[0][:40], out)
@@ -10640,12 +10640,13 @@ class DocketCLI(unittest.TestCase):
                 self.assertTrue((self._skill_root() / match).is_file(),
                                 f"{path.name} names no such path: {match}")
 
-    def test_t41_readme_describes_five_roles_and_at_least_once(self) -> None:
-        """User-facing promises match the code: five roles, at-least-once delivery."""
+    def test_t41_readme_describes_quick_roles_and_at_least_once(self) -> None:
+        """User-facing promises teach the live quick flow and at-least-once delivery."""
         repo = Path(DOCKET).parents[3]
         readme = (repo / "README.md").read_text()
         self.assertNotIn("Three logical roles", readme)
-        self.assertIn("Five logical roles", readme)
+        self.assertIn("**planner / implementor / reviewer**", readme)
+        self.assertIn("historical-runs.md", readme)
         self.assertIn("at-least-once", readme)
         self.assertNotIn("exactly once", readme.lower())
         arch = (repo / "ARCHITECTURE.md").read_text()
@@ -10692,7 +10693,7 @@ class DocketCLI(unittest.TestCase):
         self.assertNotIn("cp -r ~/Documents/Projects/docket/skills/docket/.", agents)
 
     def test_the_docs_arm_every_role_the_default_preset_waits_on(self) -> None:
-        """The docs arm all three new quick roles and retain old quick guidance."""
+        """The conductor front door arms the planner; manual worker guidance stays available."""
         repo = Path(DOCKET).parents[3]
         signalling = (self._skill_root() / "references" / "signalling.md").read_text()
         readme = (repo / "README.md").read_text()
@@ -10704,7 +10705,11 @@ class DocketCLI(unittest.TestCase):
             self.assertIn(f"docket arm <run> --role {role}", signalling)
         self.assertNotIn("Combined topology uses only the\norchestrator role", signalling)
         skill = (self._skill_root() / "SKILL.md").read_text()
-        self.assertIn("Arm your wake once with `docket arm R01 --role <role>`", skill)
+        self.assertIn("docket arm R01 --role planner", skill)
+        self.assertIn("docket conduct R01", skill)
+        self.assertIn("Worker hooks stay silent", skill)
+        launch = (self._skill_root() / "references" / "launch.md").read_text()
+        self.assertIn("Arm your wake once with `docket arm R01 --role <role>`", launch)
 
     def test_t41_skill_is_a_router_not_a_duplicate_protocol(self) -> None:
         """SKILL.md routes to help and references instead of restating the protocol."""
@@ -11514,23 +11519,25 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("review_policy: combined-checker", request)
         self.assertIn("concurrency protocol change", request)
 
-    def test_t51_required_documents_describe_presets_without_em_dashes(self) -> None:
-        """The required architecture and playbooks document standard and quick."""
+    def test_t51_required_documents_route_live_and_recorded_policies_without_em_dashes(self) -> None:
+        """Live playbooks teach quick and route recorded policies to focused detail."""
         repo = Path(DOCKET).parents[3]
         expected = {
             repo / "ARCHITECTURE.md": ("standard preset", "combined-checker"),
             repo / "README.md": ("standard preset", "combined-checker"),
-            self._skill_root() / "SKILL.md": ("standard preset", "quick"),
+            self._skill_root() / "SKILL.md": ("historical-runs.md", "quick"),
             self._skill_root() / "references" / "planner.md":
-                ("standard preset", "coordinator"),
+                ("historical-runs.md", "shared"),
             self._skill_root() / "references" / "orchestrator.md":
                 ("standard preset", "coordinator"),
             self._skill_root() / "references" / "implementor.md":
-                ("standard preset", "checker"),
+                ("historical-runs.md", "shared"),
             self._skill_root() / "references" / "verifier.md":
                 ("combined-checker", "independent verifier"),
             self._skill_root() / "references" / "reviewer.md":
-                ("combined-checker", "independent verifier"),
+                ("historical-runs.md", "verification-obligations.md"),
+            self._skill_root() / "references" / "historical-runs.md":
+                ("standard preset", "combined-checker", "independent-verifier-reviewer"),
         }
         for path, needles in expected.items():
             text = path.read_text()
@@ -11539,7 +11546,7 @@ class DocketCLI(unittest.TestCase):
                 self.assertIn(needle, text, f"{path} does not document {needle}")
 
     def test_t12_standard_preset_documents_and_renders_two_window_layout(self) -> None:
-        """Standard windows share exact herdr steps in docs and help; prompts carry none; quick is still."""
+        """Recorded layouts remain in focused history and orchestrator help, outside live guidance."""
         split_reviewer = ('herdr pane split --current --direction right --ratio 0.5 '
                           '--cwd "$PWD" --env DOCKET_ROLE=reviewer --no-focus   # JSON: result.pane.pane_id')
         start_reviewer = 'herdr agent start reviewer --kind opencode --pane <pane_id> -- --auto'
@@ -11555,25 +11562,30 @@ class DocketCLI(unittest.TestCase):
         skill = self._skill_root() / "SKILL.md"
         planner_ref = self._skill_root() / "references" / "planner.md"
         orch_ref = self._skill_root() / "references" / "orchestrator.md"
-        for path in (skill, planner_ref, orch_ref):
+        historical_ref = self._skill_root() / "references" / "historical-runs.md"
+        for path in (historical_ref, orch_ref):
             text = path.read_text()
             for command in layout:
                 self.assertIn(command, text, f"{path} misses {command[:48]}")
             self.assertNotIn("\u2014", text, f"em dash in {path}")
-        self.assertIn("1:1 vertical split", planner_ref.read_text())
-        self.assertIn("1:1 vertical split", skill.read_text())
+        for path in (skill, planner_ref):
+            self.assertIn("historical-runs.md", path.read_text())
+            self.assertNotIn("Standard preset window layout", path.read_text())
+        self.assertIn("1:1 vertical split", historical_ref.read_text())
         self.assertIn("down in half", orch_ref.read_text())
-        self.assertIn("Only the planner starts the reviewer", planner_ref.read_text())
+        self.assertIn("Only the planner starts the reviewer", historical_ref.read_text())
         self.assertIn("Only the orchestrator starts the verifier", orch_ref.read_text())
         # Help renders the same bytes: fences survive unwrapping.
         orch_help = self.cli("help", "orchestrator").stdout
         planner_help = self.cli("help", "planner").stdout
+        self.assertIn("historical-runs.md", planner_help)
         for command in layout:
             self.assertIn(command, orch_help, f"help orchestrator misses {command[:48]}")
-            self.assertIn(command, planner_help, f"help planner misses {command[:48]}")
-        # The generic quick dispatch snippet is untouched.
+            self.assertNotIn(command, planner_help)
+        # The existing quick launch commands are kept in a focused reference.
+        self.assertIn("references/launch.md", skill.read_text())
         self.assertIn('herdr pane split --current --direction right --cwd "$PWD" --no-focus',
-                      skill.read_text())
+                      (self._skill_root() / "references" / "launch.md").read_text())
         self.cli("init", "t12std", "--mode", "standard",
                  "--evidence-mode", "documents-only")
         std = self.root / ".docket" / "runs" / "t12std"
@@ -12040,11 +12052,11 @@ class DocketCLI(unittest.TestCase):
     # ------------------------------- T71: legacy door and honesty follow-ups
 
     def test_t71_legacy_init_refuses_and_decode_and_migrate_survive(self) -> None:
-        """New legacy runs refuse naming standard and quick; old decodes and migrate keep working."""
+        """New legacy runs refuse naming quick; old decodes and migrate keep working."""
         refused = self.cli("init", "legacy-new", "--workflow", "legacy",
                            "--evidence-mode", "documents-only", ok=False)
         self.assertNotEqual(0, refused.returncode)
-        self.assertIn("standard", refused.stderr.lower())
+        self.assertNotIn("use --mode standard", refused.stderr.lower())
         self.assertIn("quick", refused.stderr.lower())
         self.assertFalse((self.root / ".docket" / "runs" / "legacy-new").exists())
         run = self.init5()
@@ -13815,9 +13827,12 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("hard constraints: none stated", out)
         # Help output is unwrapped the same way, with fences left alone.
         help_text = self.cli("help", "implementor").stdout
-        self.assertIn("Read the complete `Txx-task.mdx`. Own repository discovery: begin with "
-                      "project guidance/manifests", help_text)
-        self.assertIn("```bash\ndocket handoff <run> <owner>\n", help_text)
+        self.assertIn("Read the bound prompt and complete task contract, including decisions "
+                      "and discovery constraints. Begin discovery with project guidance, manifests",
+                      help_text)
+        self.assertIn("recovery.md", help_text)
+        recovery = (self._skill_root() / "references" / "recovery.md").read_text()
+        self.assertIn("```bash\ndocket handoff <run> <owner>\n", recovery)
 
     def test_guidance_triggers_match_whole_words_not_fragments(self) -> None:
         """Common words and fragments no longer pull in unrelated guidance cards."""

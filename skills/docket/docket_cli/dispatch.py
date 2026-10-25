@@ -17,6 +17,7 @@ from .publication import fault, perturb, publish, publish_bytes, publish_json
 from .policy import (is_quick_milestone, max_concurrency_of, mode_of, model_policy, need_run,
                       next_role_fallback, allowed_models_for_role, plan_flag, provider_concurrency_of,
                       provider_of, role_model)
+from .policy import recorded_assignment
 from .baselines import require_baseline, snapshot_path, task_scope_hint
 from .locks import owner_lock
 from .state import (
@@ -206,8 +207,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             die(f"{a.owner} cannot dispatch: provider concurrency {len(active)}/{cap} "
                 "exhausted; wait for a dispatched task to finish")
         primary, _fallbacks, _policy_state, _run_allowed = model_policy(d)
-        allowed = allowed_models_for_role(d, role)
-        configured = role_model(d, role)
+        allowed = allowed_models_for_role(d, role, a.owner)
+        configured = role_model(d, role, a.owner)
         if configured and allowed is not None and configured not in allowed:
             die(f"{a.owner} cannot dispatch: per-role model {configured!r} for {role} "
                 f"is outside the approved run policy {allowed}; amend the plan first")
@@ -314,8 +315,8 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
                 die(f"{a.owner} cannot dispatch: provider concurrency {len(active)}/{cap} "
                     "exhausted; wait for a dispatched task to finish")
             primary, fallbacks, policy_state, _run_allowed = model_policy(d)
-            allowed = allowed_models_for_role(d, role)
-            configured = role_model(d, role)
+            allowed = allowed_models_for_role(d, role, a.owner)
+            configured = role_model(d, role, a.owner)
             if configured and allowed is not None and configured not in allowed:
                 die(f"{a.owner} cannot dispatch: per-role model {configured!r} for {role} "
                     f"is outside the approved run policy {allowed}; amend the plan first")
@@ -382,7 +383,7 @@ def cmd_dispatch(a: argparse.Namespace) -> None:
             if prompt_file is not None and not handoff:
                 print(f"prompt: {prompt_file.relative_to(root())} - send these exact bytes to "
                       "the worker")
-            if policy_state == "absent":
+            if policy_state == "absent" and allowed is None:
                 print(f"run {a.run} has no approved model policy so nothing is being enforced")
             if not model:
                 print("model telemetry unavailable: model is unknown until `docket set-model` "
@@ -459,7 +460,7 @@ def cmd_resume(a: argparse.Namespace) -> None:
         # instead of dispatching. --model names an approved replacement.
         _primary, _fallbacks, _state, _run_allowed = model_policy(d)
         role = str(dispatch.get("role", "implementor") or "implementor")
-        allowed = allowed_models_for_role(d, role)
+        allowed = allowed_models_for_role(d, role, a.owner)
         previous_model = str(dispatch.get("model_requested", "") or "")
         if a.on_limit:
             if round_state != "draft":
@@ -480,7 +481,7 @@ def cmd_resume(a: argparse.Namespace) -> None:
                 die("--on-limit needs --harness opencode or --harness claude for the replacement")
             role = str(dispatch.get("role", "implementor") or "implementor")
             model = next_role_fallback(d, role, previous_model,
-                                       dispatch.get("model_history", []))
+                                       dispatch.get("model_history", []), a.owner)
             if not model:
                 entry = emit_exception(d, a.owner, "model-fallback-exhausted",
                                        "Codex usage limit is exhausted and no untried "
@@ -500,6 +501,9 @@ def cmd_resume(a: argparse.Namespace) -> None:
         if allowed is not None and model not in allowed:
             if a.model:
                 refuse_outside_policy(d, a.owner, model, allowed)
+            if not allowed:
+                die(f"{a.owner} cannot resume: no model is approved by the recorded role policy; "
+                    "resolve the policy with the planner before another launch")
             die(f"{a.owner} cannot resume on model {model or 'unrecorded'!r}: the approved "
                 f"model policy is now [{', '.join(allowed)}]. Resume with "
                 f"`docket resume {a.run} {a.owner} --session {a.session} --model "
@@ -653,7 +657,7 @@ def cmd_switch_model(a: argparse.Namespace) -> None:
             die(f"no active dispatch for {a.owner} in {a.run}; dispatch it first")
         _primary, _fallbacks, _state, _run_allowed = model_policy(d)
         role = str(dispatch.get("role", "implementor") or "implementor")
-        allowed = allowed_models_for_role(d, role)
+        allowed = allowed_models_for_role(d, role, a.owner)
         tried = [h.get("model", "") for h in dispatch.get("model_history", [])
                  if isinstance(h, dict)]
         ordered = list(allowed) if allowed is not None else []
@@ -718,8 +722,15 @@ def refuse_outside_policy(d: Path, owner: str, model: str, allowed: list[str]) -
     and fallback switching call it, so the exception kind, detail shape, and
     open-until-resolved behavior cannot drift between entry points.
     """
+    role = str((read_dispatch(d, owner) or {}).get("role", "implementor"))
+    assignment = recorded_assignment(d, role, owner)
+    source = ""
+    if assignment and assignment["pinned"]:
+        source = f"; {role} is pinned by {assignment['pin_source_file']}"
+    elif assignment and assignment["allowed_models_source_file"]:
+        source = f"; {role} allowed models come from {assignment['allowed_models_source_file']}"
     entry = emit_exception(
         d, owner, "model-fallback-exhausted",
         f"model {model!r} is outside the approved fallback list "
-        f"[{', '.join(allowed)}]; a higher spending tier needs its owner")
+        f"[{', '.join(allowed)}]; a higher spending tier needs its owner{source}")
     die(f"{owner}: {entry['detail']} (exception {entry['id']} is open)")

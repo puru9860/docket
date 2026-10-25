@@ -1,22 +1,9 @@
 # docket
 
-Run a **planner / orchestrator / implementor / verifier / reviewer** pipeline across
-coding agents, coordinated through numbered `.mdx` docket files, with a mechanical
-report-validation gate and zero-token wake signalling.
-
-Five logical roles, one file protocol:
-
-| Role | Model tier | Does |
-| --- | --- | --- |
-| **planner** | biggest | writes the plan, owns intent and constraint amendments |
-| **orchestrator** | flexible | dispatches work, handles real blockers or scope collisions, routes rounds to review |
-| **implementor** | small | implements exactly one task, writes an honest report |
-| **verifier** | small | checks whether the frozen evidence proves acceptance, records pass, fail, or uncertain |
-| **reviewer** | biggest | judges from a fresh context and alone approves, waives, or requests changes |
-
-The planner and orchestrator may be separate (`split`) or one agent (`combined`).
-Implementors can run cheaply in another harness. Docket supports Claude Code, Codex
-(temporary compatibility), and OpenCode.
+Run a **planner / implementor / reviewer** workflow across coding agents, coordinated through numbered `.mdx` files, with a mechanical report-validation gate and zero-token wake signalling.
+The planner defines tasks and milestones, the implementor works them and their corrections, and the independent reviewer checks evidence and approves each milestone.
+Claude Code is the default worker harness.
+Claude Code and Codex are first-class; OpenCode remains supported as an explicit opt-in.
 
 Docket also supports visible peer discussions for brainstorming, feedback, or
 another provider's view on the current topic. Your current agent participates
@@ -24,30 +11,19 @@ directly with one invited peer, preserving the context of your existing session.
 They exchange attributed messages, agree on a written conclusion, and can pause
 or continue with your new direction. Discussions do not need a coding run.
 
-Two presets select tested combinations of mode, workflow, topology, and review policy.
-The quick preset is the default for new runs: a planner defines the outcome, tasks,
-milestones, and their full-suite commands, an implementor implements them, and a reviewer
-decides once per milestone after a frozen full-suite pass. There is no verifier
-session in new quick runs. The implementor waits for the reviewer's approval
-before dispatching the next milestone.
-The standard preset is five sessions (planner, orchestrator, implementor, verifier,
-reviewer) with an independent verifier behind every decision; select it with `--mode standard`.
-New standard runs record `tiered-verifier-reviewer`: the verifier settles each passing task
-for sequencing, and the reviewer approves a closed milestone after `docket batch --verify`
-freezes its full-suite result. Existing standard runs with the recorded
-`independent-verifier-reviewer` policy keep their per-task review behavior.
-New quick runs record `quick-milestone-reviewer`; existing quick runs with
-`combined-checker` keep their coordinator, implementor, and checker policy.
+Quick is the live flow for new coding runs.
+The quick preset is the default for new runs: a planner defines the outcome, tasks, milestones, and their full-suite commands, an implementor implements them, and a reviewer decides once per milestone after a frozen full-suite pass.
+There is no verifier session in new quick runs.
+The implementor waits for the reviewer's approval before dispatching the next milestone.
+The standard preset is deprecated for new runs; compatibility creation emits a warning and existing runs keep their recorded lifecycle and authority.
+Recorded `tiered-verifier-reviewer` and `independent-verifier-reviewer` runs remain supported; see [existing run policies](skills/docket/references/historical-runs.md).
+New quick runs record `quick-milestone-reviewer`; existing quick runs with `combined-checker` keep their coordinator, implementor, and checker policy.
 Quick assigns coordination to the implementor through explicit recorded policy.
-It never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut,
-and it keeps scope claims, complete baselines, immutable evidence, source-drift rejection,
-honest blocking, and decisions bound to exact bundle digests.
+It never uses `--skip-verify`, a blanket `verifier_exempt`, or a legacy completion shortcut, and it keeps scope claims, complete baselines, immutable evidence, source-drift rejection, honest blocking, and decisions bound to exact bundle digests.
 A run that outgrows quick records an escalation request; no command silently changes its mode.
 The two-role quick variant is deferred and refuses explicitly.
-Old runs keep their meaning as a historical legacy decode: a missing workflow
-key still reads as legacy and an explicit legacy plan keeps its semantics.
-New runs cannot select legacy: `docket init` uses standard or quick
-(workflow five-role-v1) and refuses `--workflow legacy`.
+Old runs keep their meaning as a historical legacy decode: a missing workflow key still reads as legacy and an explicit legacy plan keeps its semantics.
+New runs cannot select legacy: `docket init` defaults to quick (workflow five-role-v1) and refuses `--workflow legacy`.
 
 ## Why this instead of prompting one agent to "use subagents"
 
@@ -70,11 +46,8 @@ Three things make it hold up on real work:
   refused until that body passes the whole gate again and is re-verified, and an
   edited blocked report stays waivable because its re-review skips completion
   verification exactly as its submission did.
-- **Each unit of work keeps one context.** Under `round_context: fresh`, the default for new runs, the quick implementor coordinates one subagent per task on its own model.
-  Every correction continues that task's subagent; reviewers similarly keep one subagent per milestone through corrections and re-reviews.
-  Claude Code continues through SendMessage to the agent id, and OpenCode through the task tool with its task_id.
-  A new task or milestone gets a new context; a replacement starts only when the original is gone.
-  Codex roles keep working in their session.
+- **Tasks and corrections share context.** New quick runs record `round_context: shared`: the implementor works in one session without task subagents.
+  Runs that recorded `fresh` retain their existing per-task and per-milestone context behavior; missing values still mean shared context.
 - **Signalling costs nothing while idle.** A supervisor finishes its turn and goes idle.
   A watcher sleeps in the background and re-enters the session only when something is
   actionable, using the harness's own wake mechanism rather than a polling loop that
@@ -175,33 +148,28 @@ use uv; nothing else changes.
 cd <your project> && mkdir -p .docket
 docket init R01 --title "Short name" --objective "What done means for the whole run."
 docket arm R01 --role planner
-docket arm R01 --role reviewer
-docket assign R01 T01 --harness opencode --file src/x.py --verify 'python3 -m unittest tests.test_x' \
+docket assign R01 T01 --file src/x.py --verify 'python3 -m unittest tests.test_x' \
   --title "Task name" --goal "What must be true when done." \
   --criterion "A mechanically checkable criterion" --criterion "Another one" --as planner
 docket batch R01 --create M1 --members T01 --milestone --command 'tests/test.sh' --as planner
 docket batch R01 --close M1 --as planner
-# Implementor takes over after the planner has defined every task and milestone.
-docket dispatch R01 T01 --session impl-1 --agent impl-1 --register
-# dispatch prints `prompt: .docket/runs/R01/.prompts/<file>.txt`; start the worker in
-# its harness and send it exactly that file, e.g. herdr agent prompt impl-1 "$(cat <file>)"
-docket set-model R01 T01 --actual <model label the harness shows>
-docket arm R01 --role implementor      # then wait: docket help signalling, per harness
+# After plan approval, start this plain command in its own Herdr pane.
+docket conduct R01
 ```
 
-That is the start: the planner sets the objective, assigns all tasks, and closes their
-milestone batches before dispatch. `assign` takes the goal and
-criteria, and `dispatch` runs the task-intent gate and writes the worker prompt.
-After task submissions, the implementor runs
-`docket batch R01 --verify M1 --as implementor`.
-The reviewer receives one milestone wake and can
-approve it with `docket batch R01 --approve M1 --as reviewer`. Use `--mode standard`
-for five sessions with an independent verifier.
-In quick, the implementor owns the reviewer launch event. In tiered standard,
-settled batch members wake the orchestrator to run the full suite; a passing
-result wakes the reviewer directly. Uncertain verifier findings wake the reviewer
-for a correction while dependent work stays held. Both presets wake
-the reviewer to recover interrupted decisions and apply granted corrections.
+That is the start: the planner sets the objective, assigns all tasks, and closes their milestone batches before dispatch.
+`assign` takes the goal and criteria, and `dispatch` runs the task-intent gate and writes the worker prompt.
+After task submissions, the implementor runs `docket batch R01 --verify M1 --as implementor`.
+The reviewer receives one milestone wake and can approve it with `docket batch R01 --approve M1 --as reviewer`.
+The quick reviewer shares the [verification obligations](skills/docket/references/verification-obligations.md): independently derive expectations, inspect changed tests, challenge green-but-wrong evidence, and run selective boundary and negative checks without routinely rerunning the identical frozen suite.
+It also audits consequential assumptions and outcome evidence at the real boundary and rereads the original request at final review.
+The conductor launches one visible implementor per milestone in a dedicated worker tab, starts or continues its reviewer, and delivers work only while their panes are idle.
+It retries transient Herdr errors and routes sustained outages, blocked dialogs, idle obligations, and provider usage limits to the planner through existing stall incidents.
+Use `docket reopen R01 --milestone M1 --role implementor` or `--role reviewer` to resume a recorded native worker session in a new pane.
+Workers register themselves and record observed models; launch arguments remain requests.
+The planner ends its turn and keeps its existing wake hook for decisions and completion.
+Herdr is required for the conductor; [launch.md](skills/docket/references/launch.md) describes setup, user-only launch arguments, and the manual fallback.
+Interrupted decisions and correction budgets follow [recovery.md](skills/docket/references/recovery.md).
 
 The role playbooks ship beside the skill and are surfaced by the CLI:
 
@@ -325,8 +293,10 @@ submitted or blocked work it tells you to open a fresh round with `docket decide
 ## Commands
 
 ```
-docket init <run> [--mode quick|standard] [--title T] [--objective TEXT] [--harness H]
+docket init <run> [--mode quick] [--title T] [--objective TEXT] [--harness H]
                                   [--evidence-mode M] [--root alias=path ...]
+docket conduct <run>                                foreground quick worker transport in Herdr
+docket reopen <run> --milestone M --role R           resume a recorded native worker session
 docket assign <run> <owner> [--goal TEXT] [--criterion TEXT ...] [--file PATH ...] [--verify CMD] [--as planner]  # new quick
                                   [--complexity low|high] [--executor implementor|orchestrator]
 docket dispatch <run> <owner> --session S [--agent NAME] [--register]

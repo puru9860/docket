@@ -87,6 +87,55 @@ def execution_health(d: Path, owner: str) -> tuple[str, str]:
     return "idle-unsubmitted", f"round {rnd} draft with no accepted scope"
 
 
+def flag_stall(d: Path, owner: str, cause: str, recipient: str = "", *, checkpoint: bool = True) -> dict:
+    """Open one existing-format incident per owner, cause, recipient, and epoch."""
+    # The duplicate check and the numbered write hold the owner lock, so
+    # two concurrent flags with one cause still yield one incident and two
+    # with different causes never publish the same file. The number comes
+    # from file names, readable or not, and the create is exclusive.
+    with owner_lock(d, owner):
+        rnd, _ = state_of(d, owner)
+        epoch = reopen_epoch(d, owner, rnd)
+        for incident in list_incidents(d, owner):
+            if (incident.get("state") == "open" and incident.get("cause") == cause
+                    and incident.get("epoch") == epoch
+                    and incident.get("recipient", "") == recipient):
+                print(f"already flagged: {incident['id']} ({cause}); one stall yields one incident")
+                return incident
+        pattern = re.compile(rf"{re.escape(owner)}-\d+")
+        for _ in range(100):
+            owned = [p for p in incidents_dir(d).glob("*.json")
+                     if pattern.fullmatch(p.stem)] if incidents_dir(d).is_dir() else []
+            num = next_numbered(owned)
+            iid = f"{owner}-{num}"
+            try:
+                publish_exclusive(incidents_dir(d) / f"{iid}.json", json.dumps({
+                    "id": iid,
+                    "run": d.name,
+                    "owner": owner,
+                    "cause": cause,
+                    "epoch": epoch,
+                    "detected_at": stamp(),
+                    "detected_at_epoch": now_s(),
+                    "state": "open",
+                    **({"recipient": recipient} if recipient else {}),
+                }, indent=2, sort_keys=True) + "\n")
+            except FileExistsError:
+                continue
+            break
+        else:
+            die(f"could not flag a stall for {owner}; retry the command")
+        print(f"flagged stall {iid}: {cause}")
+        print("One incident yields one recovery event until it is resolved or its generation changes.")
+        if checkpoint:
+            try:
+                snapshot = write_checkpoint(d, owner)
+                print(f"automatic checkpoint {snapshot.name} for stalled {owner}")
+            except (OSError, ValueError):
+                pass
+    return next(i for i in list_incidents(d, owner) if i["id"] == iid)
+
+
 def cmd_health(a: argparse.Namespace) -> None:
     """Show execution health separately from report state, and manage stalls."""
     d = need_run(a.run)
@@ -97,47 +146,7 @@ def cmd_health(a: argparse.Namespace) -> None:
         cause = (a.cause or "").strip()
         if not cause:
             die("--flag-stall requires --cause TEXT")
-        # The duplicate check and the numbered write hold the owner lock, so
-        # two concurrent flags with one cause still yield one incident and two
-        # with different causes never publish the same file. The number comes
-        # from file names, readable or not, and the create is exclusive.
-        with owner_lock(d, a.flag_stall):
-            rnd, _ = state_of(d, a.flag_stall)
-            epoch = reopen_epoch(d, a.flag_stall, rnd)
-            for incident in list_incidents(d, a.flag_stall):
-                if (incident.get("state") == "open" and incident.get("cause") == cause
-                        and incident.get("epoch") == epoch):
-                    print(f"already flagged: {incident['id']} ({cause}); one stall yields one incident")
-                    return
-            pattern = re.compile(rf"{re.escape(a.flag_stall)}-\d+")
-            for _ in range(100):
-                owned = [p for p in incidents_dir(d).glob("*.json")
-                         if pattern.fullmatch(p.stem)] if incidents_dir(d).is_dir() else []
-                num = next_numbered(owned)
-                iid = f"{a.flag_stall}-{num}"
-                try:
-                    publish_exclusive(incidents_dir(d) / f"{iid}.json", json.dumps({
-                        "id": iid,
-                        "run": a.run,
-                        "owner": a.flag_stall,
-                        "cause": cause,
-                        "epoch": epoch,
-                        "detected_at": stamp(),
-                        "detected_at_epoch": now_s(),
-                        "state": "open",
-                    }, indent=2, sort_keys=True) + "\n")
-                except FileExistsError:
-                    continue
-                break
-            else:
-                die(f"could not flag a stall for {a.flag_stall}; retry the command")
-            print(f"flagged stall {iid}: {cause}")
-            print("One incident yields one recovery event until it is resolved or its generation changes.")
-            try:
-                checkpoint = write_checkpoint(d, a.flag_stall)
-                print(f"automatic checkpoint {checkpoint.name} for stalled {a.flag_stall}")
-            except (OSError, ValueError):
-                pass
+        flag_stall(d, a.flag_stall, cause)
         return
     if a.resolve_stall:
         path = incidents_dir(d) / f"{a.resolve_stall}.json"

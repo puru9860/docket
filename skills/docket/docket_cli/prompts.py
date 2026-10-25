@@ -18,7 +18,7 @@ from .paths import _ordered, handoffs, latest, next_numbered, reports, root, sco
 from .publication import publish_exclusive
 from .policy import (
     authority_for, fresh_context_resume, fresh_context_tool, high_risk_verifier_model,
-    is_five_role,
+    conductor_managed, is_five_role,
     is_quick_milestone, is_tiered,
     mode_of, need_run,
     require_preset_role, role_effort, role_model, run_policy, submit_op_for,
@@ -522,7 +522,7 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
             if strong:
                 contract_lines.append(f"high-risk verification model: {strong}")
         if role in ("verifier", "checker", "reviewer"):
-            configured_model = role_model(d, role)
+            configured_model = role_model(d, role, owner)
             configured_effort = role_effort(d, role)
             if configured_model:
                 contract_lines.append(f"{role} model: {configured_model}")
@@ -669,9 +669,9 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         parts.append("# Running correction checklist\n\n" + "\n".join(correction_checklist(d, owner)))
     obligations_revision = ""
     report_revision = ""
-    # The quick checker performs the verifier duty, so it carries the same
-    # obligations while its round still awaits verification.
-    if role == "verifier" or (role == "checker" and eff_stage == "verification"):
+    # Quick review owns evidence checks without a separate verification verdict.
+    if (role == "verifier" or (role == "checker" and eff_stage == "verification")
+            or (role == "reviewer" and is_quick_milestone(d))):
         latest_report = latest(reports(d, owner))
         if latest_report is not None:
             try:
@@ -702,7 +702,10 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         if not round_subagent_tool(d, owner):
             steps.append(quick_coordination_step(d, run, owner))
     elif role in SUPERVISOR_WAIT_ROLES and not any("docket watch" in step for step in steps):
-        steps.append(supervisor_wait_step(run, role))
+        steps.append("Conductor-managed session: after deciding, end your turn. "
+                     "The conductor delivers your next obligation; do not watch or arm a wake hook."
+                     if role == "reviewer" and conductor_managed(d)
+                     else supervisor_wait_step(run, role))
     if steps:
         steps.append(
             f"Last, record what docket itself cost you this round, or `none`: `docket feedback "
@@ -783,6 +786,12 @@ def quick_coordination_step(d: Path, run: str, owner: str) -> str:
     """The quick implementor's milestone loop after one of its tasks is submitted."""
     milestone = next((str(batch.get("batch")) for batch in list_batches(d)
                       if batch.get("milestone") and owner in batch.get("members", [])), "")
+    if conductor_managed(d):
+        return (f"Work only milestone {milestone} in this session. After submitting a task, "
+                "end your turn; the conductor delivers the next task or correction. "
+                f"When all members have submitted, run `docket batch {run} --verify {milestone} "
+                "--as implementor` and end your turn. Do not launch a reviewer, start another "
+                "milestone, run docket watch, or arm a wake hook. Use no subagents.")
     return (f"You coordinate the whole run, so a submitted round is not a stopping point: "
             f"dispatch the next undispatched task of milestone {milestone} at once, without "
             f"asking. After every task in milestone {milestone} has submitted, run "

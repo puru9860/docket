@@ -27,6 +27,7 @@ from .verification import (
     current_round_digest, current_task_revision, matching_verifications,
     verifier_exempt_set,
 )
+from .assignments import milestone_assignments, check_batch_tasks, sync_batch_tasks
 
 
 def verification_fragment(d: Path, member: str, rnd: int) -> str:
@@ -426,6 +427,17 @@ def batch_verify_failed(d: Path, batch: dict) -> bool:
 
 
 def cmd_batch(a: argparse.Namespace) -> None:
+    bid = a.create or a.close
+    if bid:
+        d = need_run(a.run)
+        batch_path(d, bid)
+        with owner_lock(d, f"batch-{bid}"):
+            _cmd_batch(a)
+    else:
+        _cmd_batch(a)
+
+
+def _cmd_batch(a: argparse.Namespace) -> None:
     """Create, close, and verify explicit review batches with closed membership.
 
     Milestone approval lives in transitions.cmd_batch_decide (reached through the
@@ -433,6 +445,12 @@ def cmd_batch(a: argparse.Namespace) -> None:
     transition which is defined after this module.
     """
     d = need_run(a.run)
+    if any(getattr(a, f"{role}_{field}", "") for role in
+           ("planner", "implementor", "reviewer", "test_author") for field in ("harness", "model")) \
+            or getattr(a, "reviewer_context", None) or getattr(a, "assignment_reason", "") \
+            or getattr(a, "continuity_reason", ""):
+        if not a.create or not a.milestone:
+            die("assignment and continuity flags apply only to --create ID --milestone")
     if is_quick_milestone(d) and not a.list:
         required = "implementor" if str(getattr(a, "verify", "") or "").strip() else "planner"
         if a.as_role != required:
@@ -463,6 +481,7 @@ def cmd_batch(a: argparse.Namespace) -> None:
             print(f"batch {a.close} is already closed "
                   f"(generation {batch.get('generation', 1)}); membership unchanged")
             return
+        sync_batch_tasks(d, batch)
         batch["state"] = "closed"
         batch["closed_at"] = stamp()
         publish_json(batch_path(d, a.close), batch)
@@ -521,6 +540,9 @@ def cmd_batch(a: argparse.Namespace) -> None:
     }
     if is_quick_milestone(d):
         record["verify_command"] = verify_command
+    if a.milestone:
+        record.update(milestone_assignments(a, d))
+        check_batch_tasks(d, members, record)
     publish_json(batch_path(d, bid), record)
     print(f"created batch {bid} with members {','.join(members)}"
           + (" (milestone)" if a.milestone else ""))

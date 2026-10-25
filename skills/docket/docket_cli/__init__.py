@@ -52,6 +52,7 @@ from . import (
     sessions,
     discussions,
     models,
+    assignments,
     batches,
     liveness,
     five_role,
@@ -74,6 +75,7 @@ from . import (
     release,
     packets,
     dispatch,
+    conductor,
     commands,
     cli,
 )
@@ -104,6 +106,7 @@ MODULES = (
     sessions,
     discussions,
     models,
+    assignments,
     batches,
     liveness,
     five_role,
@@ -126,6 +129,7 @@ MODULES = (
     release,
     packets,
     dispatch,
+    conductor,
     commands,
     cli,
 )

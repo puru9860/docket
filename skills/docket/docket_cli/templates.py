@@ -30,7 +30,7 @@ milestone_dependencies: approval-v1
 workflow: {workflow}
 correction_limit: 2
 verifier_correction: {verifier_correction}
-round_context: fresh
+round_context: {round_context}
 ---
 
 # Plan: <title>

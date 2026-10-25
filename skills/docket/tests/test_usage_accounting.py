@@ -30,7 +30,7 @@ class UsageAccounting(unittest.TestCase):
     def quick_run(self, name):
         self.cli("init", name, "--mode", "quick", "--evidence-mode", "documents-only")
         run = self.f.root / ".docket/runs" / name
-        self.cli("assign", name, "T01", "--harness", "opencode", "--file", "src/t01.py",
+        self.cli("assign", name, "T01", "--harness", "claude", "--file", "src/t01.py",
                  "--verify", "true", "--as", "planner")
         self.f.fill_task(run / "T01-task.mdx")
         self.f.fill_scope(run / "T01-scope.mdx")
@@ -228,7 +228,7 @@ class UsageAccounting(unittest.TestCase):
                  "--objective", "Two small tasks.", "--approach", "One milestone.")
         run = self.f.root / ".docket/runs" / name
         for owner in ("T01", "T02"):
-            self.cli("assign", name, owner, "--harness", "opencode", "--file",
+            self.cli("assign", name, owner, "--harness", "claude", "--file",
                      f"src/{owner.lower()}.py", "--verify", "true", "--as", "planner",
                      "--title", f"Task {owner}", "--goal", "Works.", "--criterion",
                      "The feature works.", "--no-default-criteria")

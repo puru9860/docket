@@ -5,25 +5,16 @@ read the README and `docket help <role>`.
 
 ## The model in one paragraph
 
-Five logical roles (planner, orchestrator, implementor, verifier, reviewer) may
-run as separate agents, or the planner and orchestrator may be combined.
-Supported harnesses are Claude Code,
-Codex (temporary compatibility), and OpenCode.
+Five logical roles (planner, orchestrator, implementor, verifier, reviewer) may run as separate agents, or the planner and orchestrator may be combined.
+Supported harnesses are Claude Code, Codex, and OpenCode.
 They coordinate entirely through Markdown files in `.docket/runs/<run>/`.
-A supervisor learns that a subordinate finished because the *harness* re-enters it, not
-because it polled.
-Mechanical gates validate task intent, atomically claim implementor-discovered scopes,
-detect active-scope collisions, and refuse to mark a report reviewable unless its schema,
-diff boundary, acceptance fidelity, and verification all hold.
-A run declares its lifecycle policy in `plan.mdx` as `workflow: five-role-v1`
-(separate planner and reviewer registrations, verifier findings, correction
-budgets, and reviewer-owned approval). `workflow: legacy` is a historical decode
-for runs that already exist: the original three-role behavior is preserved
-exactly, a missing workflow key still reads as legacy, and `docket migrate`
-moves such a run explicitly. New runs cannot select legacy: `docket init`
-records five-role-v1 through the quick preset by default, or the standard preset
-with `--mode standard`, and refuses `--workflow legacy` with a diagnostic naming
-standard and quick.
+A supervisor learns that a subordinate finished because the *harness* re-enters it, not because it polled.
+Mechanical gates validate task intent, atomically claim implementor-discovered scopes, detect active-scope collisions, and refuse to mark a report reviewable unless its schema, diff boundary, acceptance fidelity, and verification all hold.
+A run declares its lifecycle policy in `plan.mdx` as `workflow: five-role-v1` (separate planner and reviewer registrations, verifier findings, correction budgets, and reviewer-owned approval).
+`workflow: legacy` is a historical decode for runs that already exist: the original three-role behavior is preserved exactly, a missing workflow key still reads as legacy, and `docket migrate` moves such a run explicitly.
+New runs cannot select legacy: `docket init` records five-role-v1 through the quick preset by default.
+`--mode standard` emits a deprecation warning and remains available for compatibility; existing standard runs keep their recorded policies.
+`--workflow legacy` is refused with a diagnostic naming quick.
 
 ## Why files, not messages
 
@@ -470,12 +461,15 @@ evidence, where resolved means a recorded `pass` or `uncertain` verdict or
 Every open lifecycle state wakes exactly the role that can move it, and `test_every_open_lifecycle_state_wakes_a_supervisor` holds that across both presets and both executors.
 Under `five-role-v1` review readiness means verified: the whole-run review batch and every closed batch, milestone or not, wait until each submitted member holds a resolved verification, and verdicts and findings are part of the identity.
 Readiness at submission woke a supervisor with nothing to route and no later event to wait for, so it polled until the verifier finished.
-A standard run routes that wake to the orchestrator, which sends verified work to the reviewer. Old `combined-checker` quick runs route it to the checker; new quick runs wake the reviewer only after a milestone full-suite pass.
+A standard run routes that wake to the orchestrator, which sends verified work to the reviewer.
+Old `combined-checker` quick runs route it to the checker; new quick runs wake the reviewer only after a milestone full-suite pass.
 An orchestrator-owned task counts toward review readiness and the all-decided wake like delegated work, since five-role submission is never terminal for it; a blocked one wakes the reviewer directly, as a blocked aggregate does.
 A delegated task's block wakes the orchestrator first, since it may own the answer, but only the reviewer can settle the round, so the hand-off is durable: `docket route <run> --kind blocked --owner T01 --note TEXT` writes `.routes/T01-01-blocked.json`, the orchestrator's event retires, and the reviewer (the checker in quick) derives `T01:1:blocked-routed` carrying the note until a verdict moves the round.
 A message typed into the reviewer's session would sit behind a Codex poll for up to an hour, while a derived event ends `docket watch` at once.
 An accepted aggregate derives `orch:N:complete` for the plan owner (the planner, or the coordinator in quick), because the reviewer settles the run and the session the user talks to would otherwise keep waiting without ever reporting the outcome.
 `docket assign ... orch` (and any orchestrator-executed task) defaults its harness to the assigning session's own harness, since that session executes it.
+Delegated workers default to `claude`; OpenCode is an explicit opt-in and Codex is first-class.
+When an assigning session and approved planner harness are both unavailable, the own-session fallback is also `claude`.
 A `correction-ready` event retires as soon as a live dispatch record binds its round, and the same wake exists for an orchestrator-owned task and for changes requested on the aggregate.
 An interrupted decision transition derives one `unfinished-<verdict>` event naming the exact finishing command, read from the artifacts first and the journal second, as `applied_steps` does: a report left `changes-requested` with no next round, an applied decision over a report still submitted or blocked, or an in-progress journal.
 It goes to the reviewer in five-role runs and to the legacy orchestrator or split planner otherwise, and a transition whose owner lock is held is still running and derives nothing.
@@ -512,52 +506,41 @@ It never weakens evidence validation and never reinterprets an existing run.
 
 The quick preset is the default for new runs, held in `MODE_NEW_RUN_DEFAULT`.
 Most runs have one clear outcome, and three sessions start and wait far more cheaply than five: every waiting supervisor is a session the harness re-enters with its whole context.
-The standard preset is selected with `--mode standard`.
+The standard preset is deprecated for new runs.
+`--mode standard` prints an explicit warning and remains available for compatibility; it does not change existing run semantics.
 It uses workflow `five-role-v1` with `split` topology and five sessions: planner, orchestrator, implementor, verifier, reviewer.
-New standard runs record `tiered-verifier-reviewer`. A verifier pass settles a task for
-capacity, scope reuse, and dependency dispatch, but never claims reviewer approval.
-The default `verifier_correction: allowed` lets a failing focused check open its own
-correction round. Existing runs that recorded `independent-verifier-reviewer` keep their
-per-task review policy and correction setting.
-A tiered correction takes a versioned correction baseline at dispatch; the earlier
-baseline and its reconstruction artifacts remain immutable, and frozen bundles retain
-the precise baseline they used.
-The new quick preset has three roles: planner, implementor, and reviewer. The planner
-owns the objective, constraints, task assignments, closed milestone membership, and
-each milestone's full-suite command before dispatch. The implementor coordinates the
-task work and runs focused task checks. There is no verifier session. An intact
-passing task bundle settles work for scope reuse and dispatch. The implementor runs
-the planner-declared full suite once per milestone with `docket batch --verify`;
-only then does the reviewer wake and approve the batch. A routed blocker can wake
-review once every unfinished peer has completed implementation or cannot dispatch
-because of dependencies, including a transitive dependency on that blocker. An
-independent runnable peer still completes its work before the reviewer wakes.
-The reviewer can waive the blocker or request a correction. Milestones execute in natural ID order (M1,
-M2, ...): a
-later milestone cannot dispatch until the preceding milestone has a valid
-full-suite pass and an intact reviewer approval. The implementor watches its
-own role for that approval or a correction after running the suite.
-Before an initial approval or reuse, a Git-backed quick milestone pass must match
-the live checkout as well as its frozen member bundles. After approval, its pinned
-source trees and output remain historical evidence while a later milestone edits
-the checkout. Reopening a waived member makes the old milestone decision stale;
-a fresh full-suite result and reviewer decision bind the new bundle, even when
-the reopened task is blocked and waived again and no member remains submitted.
-Readiness suppresses a terminal milestone only when the approval binds its
-current member bundles and full-suite digest. The old
-decision and transition remain under batch history. Batch approval checks every
-member's approval prerequisites while holding their locks, before it journals
-approval intent or applies any member decision. An old in-progress intent that
-published no member approval may be archived as abandoned when its evidence
-moves; one that already published approval still requires exact recovery.
-New quick runs use workflow `five-role-v1`, `split` topology, and review policy
-`quick-milestone-reviewer`. Existing quick runs recorded as `combined-checker` keep
-their coordinator, implementor, checker roles and their original authority.
-After every planned task has a terminal verdict and every milestone has an intact
-approved batch decision, the planner receives the run-complete event. New quick runs
-do not need an additional aggregate report or reviewer decision.
-Both quick policies keep the gate, exact bundle binding, and honest blocks. A skipped
-task check cannot support approval. A role that does not apply fails visibly.
+New standard runs record `tiered-verifier-reviewer`.
+A verifier pass settles a task for capacity, scope reuse, and dependency dispatch, but never claims reviewer approval.
+The default `verifier_correction: allowed` lets a failing focused check open its own correction round.
+Existing runs that recorded `independent-verifier-reviewer` keep their per-task review policy and correction setting.
+A tiered correction takes a versioned correction baseline at dispatch; the earlier baseline and its reconstruction artifacts remain immutable, and frozen bundles retain the precise baseline they used.
+The new quick preset has three roles: planner, implementor, and reviewer.
+The planner owns the objective, constraints, task assignments, closed milestone membership, and each milestone's full-suite command before dispatch.
+The implementor coordinates the task work and runs focused task checks.
+There is no verifier session; the reviewer absorbs its epistemic duties from `references/verification-obligations.md`, with independent expectations and selective boundary and negative checks rather than routine reruns of an identical frozen suite.
+The reviewer classifies consequential assumptions as supported with a source, unresolved, or contradictory, requires changes for contradictions, sends intent ambiguity to the planner, and checks consequential outcomes at their actual boundary.
+Static inspection supports presence claims only, and final review rereads the original request.
+An intact passing task bundle settles work for scope reuse and dispatch.
+The implementor runs the planner-declared full suite once per milestone with `docket batch --verify`; only then does the reviewer wake and approve the batch.
+A routed blocker can wake review once every unfinished peer has completed implementation or cannot dispatch because of dependencies, including a transitive dependency on that blocker.
+An independent runnable peer still completes its work before the reviewer wakes.
+The reviewer can waive the blocker or request a correction.
+Milestones execute in natural ID order (M1, M2, ...): a later milestone cannot dispatch until the preceding milestone has a valid full-suite pass and an intact reviewer approval.
+The implementor watches its own role for that approval or a correction after running the suite.
+Before an initial approval or reuse, a Git-backed quick milestone pass must match the live checkout as well as its frozen member bundles.
+After approval, its pinned source trees and output remain historical evidence while a later milestone edits the checkout.
+Reopening a waived member makes the old milestone decision stale; a fresh full-suite result and reviewer decision bind the new bundle, even when the reopened task is blocked and waived again and no member remains submitted.
+Readiness suppresses a terminal milestone only when the approval binds its current member bundles and full-suite digest.
+The old decision and transition remain under batch history.
+Batch approval checks every member's approval prerequisites while holding their locks, before it journals approval intent or applies any member decision.
+An old in-progress intent that published no member approval may be archived as abandoned when its evidence moves; one that already published approval still requires exact recovery.
+New quick runs use workflow `five-role-v1`, `split` topology, and review policy `quick-milestone-reviewer`.
+Existing quick runs recorded as `combined-checker` keep their coordinator, implementor, checker roles and their original authority.
+After every planned task has a terminal verdict and every milestone has an intact approved batch decision, the planner receives the run-complete event.
+New quick runs do not need an additional aggregate report or reviewer decision.
+Both quick policies keep the gate, exact bundle binding, and honest blocks.
+A skipped task check cannot support approval.
+A role that does not apply fails visibly.
 Both presets keep every invariant: scope claims, complete baselines, immutable content-addressed evidence, source-drift rejection, honest blocking, and decisions bound to exact bundle digests.
 The two-role quick variant is deferred: `--mode quick --agents 2` refuses explicitly and never silently produces the three-role preset.
 A run that outgrows quick records an explicit escalation request with `docket escalate-mode --reason TEXT`.
@@ -568,6 +551,63 @@ A run whose `plan.mdx` has no workflow key is still read as legacy, and a run th
 An unknown or malformed mode or workflow value refuses with a concrete diagnostic and creates nothing.
 It never falls back to legacy or to standard.
 `docket status` shows each run's mode, so the operating preset is visible without reading `plan.mdx`.
+
+## Recorded role assignments
+
+New plans record `assignment_version: 1` and flat role fields for planner, implementor, reviewer, and test_author.
+`assignments.py` resolves user `${XDG_CONFIG_HOME:-~/.config}/docket/config.json`, then project `.docket/config.json`, before creating the run.
+Milestones copy those recorded fields and apply explicit assignment flags with a planner reason; they never reread live config.
+User role allow-lists narrow the existing `allowed_models_for_role` checks, and named model pins also narrow dispatch, resume, and switch-model approvals.
+User pins refuse project and milestone overrides, including an identical requested value, with the pin's source file named.
+Config provenance paths are quoted JSON scalars in flat frontmatter so comment characters do not corrupt them.
+Quick members inherit one implementor assignment, and explicit task conflicts refuse before batch creation or dispatch.
+Closing membership synchronizes inherited draft requests under owner locks before the closed batch is published; a retry finishes a partial draft update.
+`assign --clear-assignment` is draft-only recovery and cannot change started work or evidence.
+Reviewer continuity records `continue` by default or an explicit `continue`/`fresh` with its reason; the conductor consumes it when launching review.
+`docket config [RUN]` exposes sources and restrictions, while status separates milestone requests from observed member models.
+Runs without the assignment version retain their existing model policy and behavior.
+See [assignment configuration](skills/docket/references/assignments.md) for the schema and commands.
+
+## Conductor transport
+
+`docket conduct RUN` is a deterministic foreground process inside Herdr, protected by `.locks/conductor.lock`.
+It calls `derive_events` for implementor, reviewer, and planner, consumes the existing task and milestone readiness events, and exits on the existing intact run-completion event after approved worker cleanup.
+It never introduces lifecycle state, dispatches on behalf of a worker, or types into the planner's pane.
+`.conductor/managed.json` selects worker transport ownership even while the conductor is stopped; worker native hooks stay silent and `launch:reviewer` is no longer an implementor obligation.
+One flat `.conductor/<milestone>-<role>.json` records launch intent, pane, agent name, requested harness/model, launch time, recipient binding, and last delivery.
+Restart reconciles those records against `herdr agent list`, including a launch interrupted before its success record.
+A vanished registered worker is retained for explicit session recovery instead of silently replacing its context.
+An implementor is fresh per milestone, while a live reviewer may continue only with the same requested assignment.
+A single dedicated worker tab is recorded in `.conductor/layout.json`, with a reserved anchor pane for worker splits; the conductor pane is never split by the loop.
+Approved implementors and `fresh` reviewers close once idle, after retaining registration-derived native session identities when available.
+A continued reviewer also closes once it is no longer the next milestone's reuse candidate, and every worker closes at run completion.
+A fresh milestone is a continuation boundary, so a busy older reviewer is never reused across it while its cleanup waits.
+
+The conductor uses the existing role delivery lock, pending records, announcement lease, received identity, and append-only role ledger.
+It checks idle state immediately before `herdr agent prompt`; successful writes record delivery, while failed or interrupted sends remain retryable after the announcement lease unless picked up.
+The crash contract remains at-least-once; unchanged successfully delivered identities stay quiet across restart and native worker hooks do not provide a competing transport.
+Workers still register themselves through dispatch or arm, then pickup acknowledges the exact recipient generation.
+Launch records never supply an observed model or substitute for worker registration.
+Only live user config can supply per-harness launch arguments, and the conductor appends the frozen milestone model flag.
+Project config accepts no launch arguments or permission bypass options.
+Without user launch arguments only the model flag is passed, leaving permission dialogs visible for human attention.
+`docket status` reads the conductor lock, worker tab, and launch records without changing delivery state.
+`docket reopen RUN --milestone M --role ROLE` resumes the saved native session in a new pane, with Claude `--resume`, Codex `resume`, or explicit OpenCode `--session`.
+Native identities come from worker registrations and the existing session ledger, never from requested agent names or guessed recent sessions.
+Reopen records launch intent, uses a new transport session, and leaves the worker to register and move any draft binding through the ordinary resume gate.
+Conductor and reopen mutations serialize through `.locks/conductor-workers.lock`; the long-lived conductor singleton lock remains independent.
+
+Every Herdr operation participates in outage handling, including startup, inspection, delivery, and cleanup.
+Transient errors retry with exponential backoff capped at 30 seconds; only a continuous outage past `--outage-seconds` (default 180) stops the loop after opening a planner incident.
+`--stall-seconds` (default 300) detects an idle pane with an undelivered or unanswered obligation, including dispatched work whose readiness event already retired.
+Quiet busy work, a pane with no obligation, and paused delivery are never idle stalls.
+Repository trust and the known Codex hook-review screen are passed automatically; any other blocked dialog opens a planner incident without typing into it.
+Provider usage-limit detection checks only the final five lines of the harness detection snapshot for idle or blocked agents, including idle-equivalent `done`; it never scans working agents or earlier code output in scrollback.
+A recognized blocked provider error opens one usage-limit incident rather than also being classified as an unknown dialog, and automatic model switching remains disabled.
+`health.flag_stall` is the shared incident writer; conductor incidents add `recipient: planner` and derive through the normal planner hook while ordinary health incidents retain their existing destination.
+A startup stall before dispatch has no work to checkpoint; it must not create an unknown-diff checkpoint that hides the initial task event.
+After recovery the planner resolves the incident with the existing health command.
+See [launch and manual fallback](skills/docket/references/launch.md).
 
 ## Prompts, feedback, and improvements
 
@@ -626,7 +666,9 @@ Acceptance states the failure model and explicitly excluded failure classes befo
 `docket submit --check` runs the same structural checks a submission would and prints what they refuse, with no verify run, freeze, or write; live implementors otherwise read the gate's own source to learn the report rules. An unknown Evidence artifact is refused with the list of what an artifact can be and where to save a real run's output (`.docket/runs/<run>/evidence/`, outside every task diff).
 
 `round_context` in the plan scopes working context to a unit of work.
-Under `fresh`, the default for new runs, the quick implementor coordinates one subagent per task on its own model, and the worker prompt omits the milestone loop.
+New quick runs record `shared`: the implementor works tasks and corrections in its own session without subagents.
+Existing recorded values are never rewritten; non-quick templates retain `fresh`.
+Under recorded `fresh`, the quick implementor coordinates one subagent per task on its own model, and the worker prompt omits the milestone loop.
 `docket dispatch` hands the bound prompt to that subagent on round 1 and instructs the parent to continue it for every correction.
 Claude Code continues with SendMessage to the agent id; OpenCode uses the task tool with its task_id.
 Only a missing subagent calls for a replacement, whose prompt carries the running checklist of all earlier applied required changes, including continuation lines.
@@ -1384,7 +1426,7 @@ findings artifact and bundle, while dependencies, scope, and capacity remain hel
 Reviewer recovery events for interrupted decisions and granted correction budgets
 apply in both presets. A budget-refused reviewer correction preserves its draft,
 including command-line changes, so the grant can finish the original correction.
-Only the quick implementor derives `launch:reviewer`; standard retains the planner
+Only the manually launched quick implementor derives `launch:reviewer`; conductor-managed runs suppress it and standard retains the planner
 as launch owner. The existing registered inbox lease serializes launch pickup
 among sessions of the same role.
 The content-addressed batch verification
@@ -1632,6 +1674,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
 | `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |
 | `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
+| `assignments` | strict flat JSON config ingestion, recorded role resolution and sources, milestone overrides, draft inheritance and recovery, `cmd_config` |
 | `batches` | `milestone_dependency_problem`, `verification_fragment`, `batch_ready`, `frontier_ready`, `cmd_batch` |
 | `liveness` | session registrations, `dispatch_liveness`, `round_dispatched`, `live_dispatches`, `reconcile_dispatches`, `dispatch_dependencies_unmet` |
 | `five_role` | `note_correction`, `correction_budget`, `guard_correction_budget`, `open_escalation`, `open_escalations`, `escalation_events`, `run_complete_event`, `cmd_escalation`, `blocked_route`, `route_blocked`, `cmd_route`, `cmd_escalate_mode` |
@@ -1654,6 +1697,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `release` | `integration_verification_problems`, `validate_frozen_release`, `frozen_bundle_view`, `cmd_release` |
 | `packets` | `task_coverage_row`, `packet_tokens`, `render_bounded_packet`, `render_final_packet`, `correction_basis`, `correction_review_lines`, `cmd_review_packet` |
 | `dispatch` | `capacity_lock`, `dispatch_ownership_problems`, `cmd_dispatch`, `write_checkpoint`, `cmd_resume`, `cmd_switch_model`, `emit_exception` |
+| `conductor` | foreground Herdr loop, per-run lock, launch reconciliation, milestone worker prompts, direct announcements, idle pane cleanup, and read-only conductor status |
 | `commands` | task validation, discovery scope, handoff, set-model, status, diff, bundle, depend, roots, preflight, and migrate |
 | `cli` | the argument parser and `main` |
 

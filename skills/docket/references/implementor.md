@@ -1,235 +1,120 @@
 # Implementor
 
-Implement assigned tasks one round at a time.
+Implement assigned tasks one round at a time and never approve your own work.
+In quick you coordinate task dispatch and milestone checks within your assigned milestone.
+In a conductor-managed session, the conductor owns reviewer launch and milestone handoff.
+The planner has already assigned every task, closed each milestone, and declared its full-suite command.
+New quick runs record `round_context: shared`: work the tasks and corrections in your session without subagents.
+For an existing recorded policy or `fresh` context, follow [historical-runs.md](historical-runs.md) and dispatch's exact instruction.
 
-In the standard preset, the orchestrator assigns tasks and the verifier checks
-each submitted round before the reviewer decides a milestone.
-In new quick runs you also coordinate the run. The planner has already assigned
-every task, created and closed each milestone, and declared its full-suite command.
-Dispatch, implement, and submit each task. Complete each milestone's review before
-starting the next milestone. Run
-`docket batch <run> --verify M1 --as implementor`
-once the milestone's tasks pass their focused
-checks. That full-suite pass wakes the reviewer for one milestone decision.
-In new quick runs, you alone handle `launch:reviewer`: start the reviewer when
-review work is pending and no surviving reviewer session is noted. Claim that
-launch event through the registered inbox before starting the session; retrying
-the claim in your session keeps the same lease, and another session cannot claim
-it while that lease holds.
-Arm the implementor role once, then wait with `docket watch <run> --role implementor`
-for the reviewer approval or a correction. Follow `docket help signalling` for
-the harness-specific wait method. Do not send another prompt into a waiting pane
-to advance a milestone; the approval wake is the handoff.
-After the final milestone decision, the planner receives the completion event;
-new quick runs have no additional aggregate decision.
-There is no verifier in new quick runs. Existing `combined-checker` quick runs
-keep their coordinator and checker duties. An implementor never approves its own work.
-
-Under `round_context: fresh` (the default for new runs) in quick on Claude Code or OpenCode, your session only coordinates: it dispatches, starts one subagent per task, runs the milestone suite, and waits.
-`docket dispatch` prints the exact subagent instruction; do not read the prompt file yourself.
-Keep the subagent's id and continue that same context for every correction to its task.
-On Claude Code use SendMessage to that agent's id; on OpenCode use the task tool with that subagent's task_id.
-Start a replacement only if the original subagent is gone, using the bound prompt and running correction checklist for recovery.
-The worker stops at submission and the parent keeps the milestone loop.
-A standard worker also keeps one context per task across its corrections, with a new context for the next task.
-A Codex implementor, or a run recorded with `round_context: shared` or without the field, keeps working in its session.
-A run that outgrows quick records an escalation request; the implementor keeps working under the recorded preset until an authorized follow-up decides otherwise.
-
-1. Read the complete `Txx-task.mdx`. Own repository discovery: begin with project
-   guidance/manifests and task-specific searches, then follow relevant callers,
-   dependencies, and tests. Stop when you can explain the likely change surface
-   and verification. Broader exploration is allowed when the task genuinely
-   requires it; avoid exhaustive reading that does not improve the decision.
-2. Fill `Txx-scope.mdx` with proposed paths, exact verification, relevant symbols,
-   and discovery reasoning. Your `verify:` adds to the assigned command and never
-   replaces it: when they differ the gate runs both, so a check you cannot pass is a
-   blocker, not something to drop. Then run `docket scope <run> <owner> --submit` before
-   editing. A clean claim lets you continue without supervisor approval. On a
-   collision, stop for orchestration. If later discovery requires another path,
-   amend the capsule and resubmit it; Docket preserves the original diff baseline,
-   which was captured when the task was dispatched. In a run with more than one
-   checkout root, address another checkout as `<alias>:<path>` - run `docket roots
-   <run>` for the aliases - and expect changed paths, and the report's *Files
-   changed* section, to use the same form. A bare path resolves to the deepest
-   declared root containing it, so a nested repository owns its own paths. Only a
-   declared root exists as far as Docket is concerned: if the task needs a checkout
-   that `docket roots` does not list, that is a blocker for the orchestrator, not a
-   path to claim, because the declaration cannot change once a baseline exists.
-3. Run `docket preflight <run> <owner>` when the baseline matters, then implement
-   within the accepted scope. `docket submit` runs the registered `verify:` command
-   once against the final source and freezes its output. Run additional focused
-   checks when debugging or a concrete risk calls for them; an identical manual
-   run immediately before submission is not required. That focused command covers
-   only the area the task touches, and the
-   full suite belongs once per milestone (and at the aggregate in standard), never in a task
-   round. If environment or ambiguity prevents
-   completion, report a blocker rather than claiming success. `docket submit`
-   reports its diff coverage. Unavailable coverage under `evidence_mode: git` is a
-   rejection, not an empty diff: fix the workspace so the task diff is readable, or
-   report the blocker. Do not describe unverifiable work as verified.
-   Run every `docket preflight`, `docket submit`, and `docket verify` with the
-   longest shell timeout available.
-   The rendered prompt computes the minimum synchronous submit allowance from
-   the task's `verify_timeout` plus freeze time. When your shell cap is shorter,
-   run `docket submit <run> <owner> --background` (with the required `--as` role
-   in five-role runs). It starts the same full gate in a detached process and
-   prints a private log path. Read that log or `docket status` for the outcome;
-   do not launch another submit while the background job holds the owner.
-   Never re-run one that may still be running; read its result before retrying.
-   If the task consumes another task's work, record it with `docket depend <run>
-   <owner> --on <other>` before you rely on it. That pins the exact evidence you
-   read; if the other task later freezes something different, your own submission is
-   refused until you reverify against the new evidence and record it again, and so is
-   any approval or waiver of your round while that input is stale. Consuming work that
-   is not yet approved is possible within a closed milestone once tiered verification settles it.
-   New plans record `milestone_dependencies: approval-v1`: consuming work from another milestone requires that milestone's intact approval, even when provisional integration is allowed.
-   Runs without that field keep their recorded settlement and integration rules, and ungrouped tasks keep their integration policy.
-   A blocked, skipped, failed, stale, or patchless bundle is refused. It is
-   readiness, never approval. Record it while your round is still a draft: once you
-   have submitted, `docket depend` is refused, because the pin is part of the evidence
-   the reviewer is reading. If an input moves after you submitted, ask the reviewer for
-   a changes round, then re-record and resubmit so the new input is actually verified.
-   Editing `.deps/<owner>.json` by hand achieves nothing: an approval compares the live
-   record against the one frozen into your round and refuses a mismatch.
-4. Confirm the active harness model and effort rather than trusting launch flags.
-   The orchestrator records them with `docket set-model`; notify the orchestrator
-   if the UI values change or differ from the request. Model policy has three
-   states: absent means no approved policy and any model dispatches with one
-   plain no-policy line; single means one primary with empty fallbacks and
-   exactly that model is approved; list means a primary with fallbacks and
-   exactly those models are approved. Docket records bindings and never launches
-   models: your dispatch binds its rendered prompt bytes as a prompt digest, a
-   new record reads `unobserved` until `docket set-model` verifies you, and
-   dispatch output says it recorded a binding rather than that it started
-   anything. The frozen verification
-   records the model as observed, requested, or unknown - a requested flag is
-   never presented as observed execution. Declare environment inputs the
-   verification depends on in task frontmatter `env:`; declared `KEY=VALUE` inputs
-   override ambient state so the declared value is what runs, and the bundle records
-   the effective value each declared key actually had, with only declared keys ever
-   captured. Any change to command,
-   source, roots, or declared inputs runs verification again, and a verify
-   command that writes into the checkout fails the freeze. A skipped verification
-   may still be recorded with `--skip-verify` and a reason, but it cannot support an
-   approval in any mode; waiving accepts such work without claiming it passed. Read
-   `references/verification-obligations.md` before writing checks: two inputs
-   with independent expectations, separate actual provenance from oracle
-   derivation, byte-sensitive fingerprints, zero/one/many boundaries,
-   reviewed oracle changes, and controlled offline proof or an explicit gap.
-5. Before the report, review your own patch the way the reviewer will, because
-   the reviewer reruns claims rather than trusting them. These are the reasons
-   most first rounds came back: a behavior changed that the task did not ask for;
-   an "every" criterion with sites left unconverted; a changed branch, often an
-   error or recovery path, with no assertion that fails without the change; tests
-   that pass by timing luck; a criterion about a real tool, service, data set, or
-   screen proven only against a fake; a screenshot nobody looked at; docs that
-   still describe the old behavior; and a report claiming more than its artifacts
-   show. A criterion you could only check against a fake is `partial`, with the
-   gap named. For a correction, first reproduce what each required change names,
-   then rerun that same check after the fix and cite it.
-   Run a decisive negative control in a disposable copy: show the key test fails when its guarded behavior is removed.
-   For failure claims, prove the failure was actually injected into the named component and the check detects an incorrect result.
-   Save the observed failing result; never mutate the measured checkout to run a negative control.
-   Correction prompts carry a running checklist of all earlier required changes; preserve earlier fixes as regression checks while addressing the latest decision.
-   Fill the standard task report: summary, files changed, acceptance,
-   verification, and decisions needed. The acceptance criteria are already copied
-   from the task as unchecked boxes; keep their text exactly and only change the
-   checkbox state. Optionally map each criterion to evidence in
-   an `## Evidence` table with one row per stable ID (A1, A2, in task order):
-   `| A1 | met | verify.stdout | none |`. States are `met`, `partial`,
-   `not-met`, or `not-verified`. A `met` row names frozen artifacts or existing
-   paths and carries no gaps; anything else names its gap. The gate enforces
-   the table mechanically when present - duplicate or unknown IDs, missing
-   artifacts, and gaps on `met` fail - but never keyword-polices prose, so
-   "no limitations" and integration-coverage notes are judged on structure.
-   Normal submission needs every required criterion `met`; anything less goes
-   through `--blocked` or an approved amendment, which stay lightweight and
-   skip evidence enforcement.
-   If the assigned requirement itself conflicts with a constraint or cannot be
-   met as written, propose a contract decision before treating it as an
-   implementation failure: `docket propose-amendment <run> <owner> --need TEXT
-   --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT`. Give the
-   planner the smallest decision it can make, with evidence pointers and the
-   effect on acceptance and dependencies. Keep working on unaffected work; do
-   not edit the task contract yourself. Use `--blocked` when execution truly
-   cannot proceed while that decision is pending.
-6. Run `docket submit <run> <owner> --check` first: it lists exactly what the gate
-   would refuse in the current report and runs, freezes, and changes nothing, so the
-   rules never need to be read from docket's source.
-   Submit normally with `docket submit <run> <owner> --as implementor`, or submit
-   a blocker with `docket submit <run> <owner> --blocked --as implementor`. Submitting freezes the whole round -
-   the task revision, the task baseline, the full patch from that baseline, the
-   resulting source revision, your report body, and the verification as it actually
-   ran - into one immutable bundle that the reviewer's verdict will bind to. Let the
-   workspace settle first: a checkout that changes while the verify command runs is
-   refused, because a green result that does not describe the frozen source proves
-   nothing. The same holds for the documents: if the task, your report, your accepted
-   scope, or a consumed input moves while the command runs, the submission is refused
-   and your edit is left alone. Do not edit the report from a second window while a
-   submission is running, and do not run two submissions for one task at once - the
-   second waits for the first and is then refused as already submitted. Read what was
-   frozen with `docket bundle <run> <owner>`.
-7. After submitting, do not edit the report body. It is the evidence the reviewer
-   reviews, and a body that changed since review began makes the decision
-   unusable until the reviewer puts the new body back through the whole gate -
-   sections, acceptance, scope, diff coverage, and verification - which an edit
-   made in a hurry will usually fail. A blocked report is re-reviewed against the
-   blocked checks only and skips completion verification, exactly as its submission
-   did, so an honest blocker stays reviewable; that is not a licence to edit it.
-   Corrections belong in the next round, not in a submitted report. Editing it also
-   leaves the frozen bundle stale for the body in front of the reviewer, which blocks
-   the verdict outright until the whole gate runs again.
-8. If changes are requested, read the numbered decision file, apply every item,
-   fill the new report round, and resubmit. Every correction round carries
-   numbered required changes, including one a verifier opened from its
-   findings, so a round that cannot be rendered is never opened: if the prompt
-   refuses with a diagnostic about numbered changes, the decision is
-   unworkable and the reviewer must restate it.
-
-When resuming, read the task, accepted scope capsule, latest ready handoff, latest
-numbered decision if present, and task-local diff. Recover from those artifacts
-with targeted inspection; the orchestrator does not provide a repository summary.
-
-Before token exhaustion, compaction, session replacement, or an unavoidable
-restart, preserve continuity instead of leaving knowledge in chat or scrollback:
+## Pick up and dispatch the next task
 
 ```bash
-docket handoff <run> <owner>
-# Fill every section of the generated checkpoint.
-docket handoff <run> <owner> --submit
+docket arm <run> --role implementor
+docket pickup <run> --role implementor
+docket status <run> --role implementor
+docket dispatch <run> <owner> --session <session> --agent <agent> --register
 ```
 
-Record exact files and symbols, what is actually complete, what remains,
-verification already run and its result, decisions and risks, and one exact next
-action. Submit the checkpoint while there is still enough context to make it
-useful. It is not a completion report; resume implementation or yield to the
-replacement after it becomes ready. A ready handoff releases execution
-capacity but keeps accepted scope held; the replacement re-acquires the slot
-with `docket resume`, which leaves exactly one live dispatch record.
+Register the first dispatch; reuse that session for subsequent dispatches.
+When launched by the conductor, use its supplied session ID and pickup command; dispatch registers your identity, never the launch request.
+Read the bound prompt and complete task contract, including decisions and discovery constraints.
+Begin discovery with project guidance, manifests, and task-specific searches; follow relevant callers, dependencies, and tests.
+Stop when you can explain the likely change surface and verification; explore more only when the task needs it.
+If a contract changes after dispatch, repeat dispatch to bind the new prompt before working.
+Confirm the active harness model and effort rather than trusting launch flags; record the observed identity with `docket set-model`.
 
-A dispatch retry adopts only the same session with the same registration
-generation. Re-registering the same session name creates a newer generation,
-which is a different writer: the retry is refused and names `docket resume`
-as the recovery, while a same-generation retry adopts the same record as
-before.
+## Claim scope before editing
 
-The CLI owns report state transitions. Do not edit `status:` manually.
+Fill `Txx-scope.mdx` with paths, verification, symbols, and discovery reasoning.
+Your proposed `verify:` adds to the assigned command; it never replaces a failing assigned check.
 
-## Prompt rendering
+```bash
+docket scope <run> <owner> --submit
+docket preflight <run> <owner>
+```
 
-The implementor prompt is rendered for the run workflow, role, and stage from
-the canonical contract: initial implementation, correction, resume,
-verification, and review are distinguishable, and the stage is derived from
-lifecycle documents rather than supplied by the caller. A correction carries
-every numbered required change with bundle and verification pointers. Resume
-names only the latest ready handoff and names the mechanical checkpoint when no ready handoff exists; when none is ready it labels recovery as
-mechanical and directs targeted rediscovery from the task, the accepted capsule, and the task-local diff instead of naming a draft as
-ready. A missing required input refuses with a diagnostic naming the artifact,
-never a placeholder. An untouched task whose mandatory contract still carries unresolved template placeholders is refused the same way, as a missing required artifact.
-`docket dispatch` runs the same task-intent check as `docket validate-task`, so work never starts against a contract the gate rejects. The mandatory contract is the relevant constraints from the plan, the task, Existing decisions and Discovery constraints, not Out of scope alone; the prompt carries task Out of scope plus Existing decisions plus Discovery constraints plus plan hard constraints and plan risks. Mandatory contract, acceptance, and hard constraints are
-never truncated; mandatory size is reported separately and zero guidance budget still carries every mandatory section without dragging playbook prose in. Optional guidance
-lives under a token budget covering profile, cards, headers, and separators;
-zero selects nothing and an oversized first card is skipped. Selected and
-rejected guidance is recorded with reasons. Model matching is exact and
-one-run defaults are removed; an unknown model receives only task-relevant
-cards. Literal commands, fences, and tables survive unchanged.
+A clean claim continues without supervisor approval; on collision stop for orchestration.
+Amend and resubmit scope if discovery needs another path; the original baseline stays immutable.
+Use `docket roots <run>` and `<alias>:<path>` for multiple checkouts.
+An undeclared checkout is a blocker, because declarations cannot change after baseline capture. [Evidence rules](evidence.md) explain deepest-root resolution, consumed inputs, and unavailable coverage.
+
+## Implement and prove the contract
+
+Stay within accepted scope and read [verification-obligations.md](verification-obligations.md) before writing checks.
+Independently derive important expectations; inspect changed tests for false positives, preservation, and error behavior.
+Use different inputs and zero/one/many boundaries when relevant; a fake proves only logic when the criterion names a real system.
+Review your own patch for unrequested behavior, missing sibling sites, untested branches, flaky timing, stale docs, and overstated claims.
+For a correction, reproduce each required change, preserve earlier fixes as regression assertions, then cite the same check after the fix.
+Use decisive negative controls in a disposable copy; prove a claimed failure was injected into the named component and save the failing observation.
+Never mutate the measured checkout to run a negative control.
+`docket submit` runs the registered `verify:` command once against the final source and freezes its output.
+Run extra focused checks for debugging or concrete risk; an identical manual run before submission is unnecessary.
+The full suite belongs once per milestone, never in a task round.
+Run preflight and submission with the longest available shell timeout.
+When the shell cap is shorter than the rendered allowance, use `docket submit <run> <owner> --background` with `--as implementor`.
+Read its private log or status; never retry a verification that may still be running.
+
+Record a consumed input before relying on it and while the round is a draft:
+
+```bash
+docket depend <run> <owner> --on <other>
+```
+
+Only passed, current, patch-bearing evidence is consumable; cross-milestone inputs require intact milestone approval in new runs.
+A moved input after submission needs reviewer changes, a new pin, and another verified submission.
+Re-recording a pin is never reverification; see [recovery.md](recovery.md).
+
+## Submit completion or an honest blocker
+
+Fill summary, every changed file, exact acceptance boxes, verification, and decisions needed.
+Keep criterion wording unchanged; check a box only when the result actually holds. [Evidence and report format](evidence.md) gives the optional stable-ID evidence table and model/environment provenance rules.
+Normal completion needs all required criteria met; missing evidence is a gap, never success.
+
+```bash
+docket submit <run> <owner> --check
+docket submit <run> <owner> --as implementor
+# If completion is blocked, state the question under Decisions needed and use:
+docket submit <run> <owner> --blocked --as implementor
+```
+
+`--check` lists gate refusals without running verification, freezing, or changing state.
+For a conflicting or impossible requirement, ask the planner for the smallest contract decision:
+
+```bash
+docket propose-amendment <run> <owner> --need TEXT --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT
+```
+
+Keep working on unaffected work; use `--blocked` when execution cannot proceed.
+Do not edit the task contract, submitted report body, or lifecycle `status:` yourself.
+Never bypass a failing check with `--skip-verify`; it is for a broken verify command and cannot support approval.
+Source or document drift during verification refuses submission while preserving concurrent edits.
+Read what froze with `docket bundle <run> <owner>`.
+An immutable bundle, its baseline, and its pinned input evidence must remain reconstructable.
+
+## Advance or wait for the milestone
+
+Dispatch the next ready task in the current milestone after the preceding work is done.
+In a conductor-managed run, end your turn after submission; the conductor delivers the next task or correction to this same milestone session.
+When every member has completed implementation, run the planner-declared suite:
+
+```bash
+docket batch <run> --verify M1 --as implementor
+```
+
+A full-suite pass wakes the reviewer; a routed blocker may need changes or waiver before the suite can run.
+In conductor-managed runs, end your turn after the suite; do not run `docket watch`, arm a wake hook, launch roles, or start another milestone.
+The conductor delivers corrections to this session and starts a fresh implementor after intact milestone approval.
+For manual runs only, handle `launch:reviewer` through a registered inbox claim and wait with `docket watch <run> --role implementor`.
+Follow [launch.md](launch.md) for conductor setup and manual fallback, and [signalling.md](signalling.md) for receipts.
+After the final milestone, the planner receives completion; no aggregate decision is needed.
+On changes, read the numbered decision and running checklist, apply every item, fill the new report, and resubmit.
+If numbered changes cannot render, ask the reviewer to restate the unworkable decision.
+
+## Recover or finish
+
+Before compaction, replacement, or interruption, run `docket handoff <run> <owner>`, fill every section, then `docket handoff <run> <owner> --submit`.
+Recover from the task, accepted scope, ready handoff, latest decision, and task-local diff with targeted inspection.
+Read [recovery.md](recovery.md) for session generations, model limits, moved inputs, and unfinished submissions.
+A run that outgrows quick records an escalation and retains its policy until authorized follow-up.
+Record each round's Docket friction or `none` using the rendered feedback command. [Prompt rendering](prompt-rendering.md) explains stages, checkpoints, and refusal on missing mandatory inputs.

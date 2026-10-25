@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .common import (
@@ -381,7 +382,7 @@ def role_fallbacks(d: Path, role: str) -> list[str]:
             if item.strip()]
 
 
-def role_model_chain(d: Path, role: str) -> list[str]:
+def role_model_chain(d: Path, role: str, owner: str = "") -> list[str]:
     """Effective ordered model chain for one role.
 
     The per-role model (or the run primary) first, then the role's own
@@ -389,7 +390,7 @@ def role_model_chain(d: Path, role: str) -> list[str]:
     no model policy at all and any model dispatches.
     """
     primary, fallbacks = policy_models(d)
-    head = role_model(d, role) or primary
+    head = role_model(d, role, owner) or primary
     ordered = ([head] if head else []) + role_fallbacks(d, role) + fallbacks
     seen: list[str] = []
     for item in ordered:
@@ -398,22 +399,35 @@ def role_model_chain(d: Path, role: str) -> list[str]:
     return seen
 
 
-def allowed_models_for_role(d: Path, role: str) -> list[str] | None:
+def allowed_models_for_role(d: Path, role: str, owner: str = "") -> list[str] | None:
     """Run approvals plus models explicitly approved for this role."""
     _primary, _fallbacks, _state, run_allowed = model_policy(d)
-    role_allowed = role_model_chain(d, role)
-    if run_allowed is None and not role_allowed:
-        return None
-    return list(dict.fromkeys([*(run_allowed or []), *role_allowed]))
+    role_allowed = role_model_chain(d, role, owner)
+    allowed = (None if run_allowed is None and not role_allowed else
+               list(dict.fromkeys([*(run_allowed or []), *role_allowed])))
+    assignment = recorded_assignment(d, role, owner)
+    if assignment:
+        restriction = assignment["allowed_models"]
+        if restriction is not None:
+            allowed = (list(restriction) if run_allowed is None else
+                       [m for m in (allowed or []) if m in restriction])
+        if assignment["pinned"] and assignment["model"]:
+            pinned = str(assignment["model"])
+            allowed = [pinned] if allowed is None or pinned in allowed else []
+    return allowed
 
 
-def next_role_fallback(d: Path, role: str, current: str, history: list[dict]) -> str:
+def next_role_fallback(d: Path, role: str, current: str, history: list[dict],
+                       owner: str = "") -> str:
     """Next untried non-Codex model in the role's effective chain, or ''.
 
     Without per-role configuration the chain is the run-wide approved list,
     so this answers exactly as `next_approved_fallback` does.
     """
-    chain = role_model_chain(d, role)
+    chain = role_model_chain(d, role, owner)
+    allowed = allowed_models_for_role(d, role, owner)
+    if allowed is not None:
+        chain = [model for model in chain if model in allowed]
     if not chain:
         return ""
     tried = {str(item.get("model", "")) for item in history if isinstance(item, dict)}
@@ -441,14 +455,95 @@ def max_concurrency_of(d: Path) -> int:
 
 
 ROLE_POLICY_ROLES = ("planner", "orchestrator", "coordinator", "implementor",
-                     "verifier", "reviewer", "checker")
+                     "verifier", "reviewer", "checker", "test_author")
 
 
-def role_model(d: Path, role: str) -> str:
+def role_model(d: Path, role: str, owner: str = "") -> str:
     """Per-role model default from flat plan frontmatter `<role>_model`."""
     if role not in ROLE_POLICY_ROLES:
         return ""
+    assignment = recorded_assignment(d, role, owner)
+    if assignment:
+        return str(assignment["model"])
     return plan_flag(d, f"{role}_model", "").strip()
+
+
+ASSIGNMENT_ROLES = ("planner", "implementor", "reviewer", "test_author")
+
+
+def assignment_snapshot(d: Path) -> dict:
+    """Only recorded policy is consulted after init, never live config files."""
+    plan = d / "plan.mdx"
+    if not plan.exists():
+        return {}
+    try:
+        meta = parse(plan.read_text())[0]
+    except (OSError, ValueError) as exc:
+        die(f"cannot read recorded assignment {plan}: {exc}")
+    if "assignment_version" not in meta:
+        return {}
+    if meta["assignment_version"] != "1":
+        die(f"unknown assignment_version in {d / 'plan.mdx'}")
+    return meta
+
+
+def assignment_batch(d: Path, owner: str) -> dict:
+    if not owner or not assignment_snapshot(d):
+        return {}
+    found = []
+    for path in sorted((d / ".batches").glob("*.json")):
+        try:
+            batch = json.loads(path.read_text())
+            if not isinstance(batch, dict):
+                raise ValueError("expected an object")
+        except (OSError, ValueError) as exc:
+            die(f"cannot read recorded milestone assignment {path}: {exc}")
+        if batch.get("milestone") and owner in batch.get("members", []):
+            found.append(batch)
+    if len(found) > 1:
+        die(f"{owner} belongs to multiple milestones; put each task in exactly one milestone")
+    return found[0] if found else {}
+
+
+def assignment_role(record: dict, role: str) -> dict:
+    """Decode the flat plan or batch fields into one role's policy."""
+    if role not in ASSIGNMENT_ROLES or not record.get("assignment_version"):
+        return {}
+    if str(record["assignment_version"]) != "1":
+        die(f"unknown assignment_version {record['assignment_version']!r}")
+    result = {key.removeprefix(role + "_"): value for key, value in record.items()
+              if key.startswith(role + "_")}
+    allowed = result.get("allowed_models")
+    try:
+        for key, value in result.items():
+            if key.endswith("_source_file") and isinstance(value, str) and value.startswith('"'):
+                result[key] = json.loads(value)
+        if isinstance(allowed, str):
+            allowed = json.loads(allowed)
+        if allowed is not None and (not isinstance(allowed, list) or
+                                   any(not isinstance(item, str) or not item for item in allowed)):
+            raise ValueError("allowed_models must be a list or null")
+        if result.get("harness") not in ("claude", "codex", "opencode") or "model" not in result:
+            raise ValueError("missing model or invalid harness")
+        if result.get("pinned") not in (True, False, "yes", "no"):
+            raise ValueError("invalid pin")
+    except (ValueError, TypeError) as exc:
+        die(f"invalid recorded {role} assignment: {exc}")
+    result["allowed_models"] = allowed
+    result["pinned"] = result.get("pinned") in (True, "yes")
+    return result
+
+
+def conductor_managed(d: Path) -> bool:
+    return (d / ".conductor" / "managed.json").is_file()
+
+
+def recorded_assignment(d: Path, role: str, owner: str = "") -> dict:
+    record = assignment_snapshot(d)
+    if not record:
+        return {}
+    batch = assignment_batch(d, owner) if owner else {}
+    return assignment_role(batch if batch.get("assignment_version") else record, role)
 
 
 def role_effort(d: Path, role: str) -> str:

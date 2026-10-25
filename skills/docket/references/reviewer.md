@@ -1,141 +1,108 @@
 # Reviewer
 
-Independently judge correctness, design, integration, and outcome. You are the
-only role that approves or waives.
-Start each milestone from the objective and approved contract in its own context, keeping that context through corrections and re-reviews.
-Never inherit the planner's conversation history.
-Under `five-role-v1` submission is never terminal: tasks record `submitted`
-and become terminal only through your decision. Standard runs also review an
-aggregate; new quick runs complete after all milestone decisions.
+Independently judge correctness, design, integration, and outcome; only you approve or waive.
+Start from the original objective and approved contract, never the planner's conversation history.
+Keep the review context through corrections and re-reviews; recorded older context policies are in [historical-runs.md](historical-runs.md).
+The conductor reuses a live reviewer for `reviewer_context: continue` and starts a new session for `fresh`.
+Quick has no separate verifier pass: you own its epistemic duties without acquiring verifier-correction authority.
+An exploratory patch you make must not ship unreviewed; return required changes to the implementor.
 
-In new quick runs you act when an explicit milestone has completed implementation.
-Normally it has an intact full-suite pass; a routed blocker waits while independent
-milestone work can still dispatch, then needs a changes or waiver decision before the
-suite can run. The planner defined the tasks and the implementor coordinated the work.
-Read the batch packet and frozen full-suite output, then
-use `docket batch <run> --approve M1 --as reviewer` for one milestone decision.
-There is no verifier session. Old `combined-checker` quick runs keep their checker
-session, which performs the recorded verification and review duties.
-A standard preset run keeps an independent verifier behind every approval under `tiered-verifier-reviewer` for new runs (`independent-verifier-reviewer` runs keep their recorded policy with identical authority). A verifier pass settles work for sequencing; only your verdict approves it, once per milestone bound to the frozen full-suite pass.
-Neither preset weakens scope claims, baselines, evidence immutability, source-drift rejection, honest blocking, or digest binding.
-
-1. Read the milestone or final packet, which is self-contained for a fresh
-   context:
+## Pick up the milestone
 
 ```bash
-docket review-packet <run> --role reviewer [--correction T03] [--batch B1] [--out FILE]
+docket arm <run> --role reviewer
+docket pickup <run> --role reviewer
+docket review-packet <run> --role reviewer --batch M1
+docket bundle <run> <owner>
 ```
 
-   It carries the objective, per-task coverage with exact bundle,
-   verification, and decision revisions, evidence deltas, verifier findings,
-   waivers, open stalls and escalations, pending amendments, and plan risks
-   in roughly 1,000-2,000 estimated tokens; evidence shrinks first while
-   risks never shorten. The default packet covers only owners actually under
-   review, and `--batch B1` scopes it to exactly that batch's reviewable
-   members; correction and final packets keep their current selection. Inspect relevant source and evidence yourself when
-   the packet leaves doubt;
-   protecting your context never prohibits the independent checks that catch
-   integration defects.
-   On the first milestone review, read every relevant frozen patch and its changed tests, even when the packet shortens excerpts.
-   Follow the bundle paths to the complete patch, inspect surrounding code where needed, and check material expectations independently.
-   Consolidate every discovered acceptance failure into one numbered list per member, with each finding naming its criterion and a reproducer or causal argument.
-   Routine evidence checks belong to the verifier.
-   Every named verifier artifact carries its complete Findings body, every
-   waiver carries its complete waiver reason, every outstanding numbered
-   required change is reproduced in full, and Decisions needed quotes each
-   report in its own words. Routine evidence excerpts shrink first. If the
-   mandatory material alone exceeds the target, the packet states the overage
-   and adds a required-reading manifest naming the frozen artifacts to open;
-   no finding, waiver qualification, required change, or report question is
-   cut to fit.
-2. Decide exactly one round at a time, binding exact revisions:
+Normally review starts after an intact milestone full-suite pass.
+When conductor-launched, use its supplied session ID for registration and pickup; `arm` registers your identity while worker hook delivery stays disabled.
+A routed blocker can reach review once independent runnable peer work finishes; answer its Decisions needed question before changes or waiver.
+Read the packet's objective, approved contract, failure model, full-suite output, and member bundles.
+At first review read every relevant complete frozen patch and its changed tests, even when packet excerpts are shortened.
+Follow source around the patch and inspect integration boundaries as needed.
+Packets preserve complete findings, complete waiver reasons, numbered required changes, report questions, and plan risks.
+If mandatory material exceeds the target, open the required-reading manifest rather than assuming the short packet is complete evidence.
+A digest proves identity; it does not prove correctness.
+
+## Challenge evidence and expectations
+
+Read and apply [verification-obligations.md](verification-obligations.md), shared with verification rather than copied into this playbook.
+The rendered quick review prompt carries the universal and claim-selected obligations from that reference.
+Build a criterion-to-observation map, inspect changed tests, and independently derive important expected results.
+Challenge green-but-wrong evidence, including fixtures or expected values adjusted merely to match implementation.
+Inspect preservation and error invariants, sibling sites, and side effects on pre-existing user data.
+Run selective boundary and negative checks in an isolated copy for the highest-risk claims.
+A failure claim must inject the failure into the named component and detect an incorrect outcome.
+Use conditional baseline-red checks when needed to distinguish the claimed fix from an already-passing test.
+Contain risky tests; do not mutate the measured checkout or external state for exploratory checks.
+Do not routinely rerun the identical frozen suite; read its captured result and run checks that answer a material unresolved question.
+Missing consequential evidence requires changes or an explicit qualified waiver, never an inferred pass.
+
+## Audit assumptions and inference
+
+Identify consequential semantic assumptions in the change and its tests.
+Include input validity, error-to-success fallback, permitted data loss, preservation, identity or index mapping, and runtime applicability.
+Classify each as supported with a source, unresolved, or contradictory, and record the classification in review findings or the decision rationale.
+Explain why any assumption called "harmless" cannot affect the promised behavior.
+A contradiction is a required change; intent ambiguity goes to the planner rather than being resolved by a convenient guess.
+Tie consequential outcome claims to evidence at the boundary where the outcome holds.
+Persistence requires read-back, deployment requires the effective launch, and process claims require the process table.
+Static inspection suffices only for presence claims, not for an asserted runtime or persistent outcome.
+At final review reread the original request, even if you helped settle an earlier oracle.
+
+## Decide from exact evidence
 
 ```bash
-docket decide <run> <owner> --approve --as reviewer      # needs a passing verification
+docket batch <run> --approve M1 --as reviewer --reason TEXT
+docket decide <run> <owner> --changes --as reviewer --change "1. Criterion, failure, and reproducer or causal argument."
 docket decide <run> <owner> --waive --reason TEXT --as reviewer
-docket decide <run> <owner> --changes --as reviewer      # with required changes
-docket batch <run> --approve B1 --as reviewer --reason TEXT  # one milestone verdict
 ```
 
-In a tiered run the normal milestone wake requires an intact, passing full-suite
-batch verification. Read its frozen output and member bundles, then use the batch
-approval command. Individual task approval is refused under this policy.
-A correction still uses `docket decide --changes` for the affected member.
-An uncertain verifier verdict in standard derives `verification-uncertain`
-immediately, with its exact findings artifact and bundle identity. Read those
-findings and request changes that resolve the missing evidence; uncertainty keeps
-dependencies, scope, and execution capacity held and never counts as a pass.
-When a planner accepted an amendment after a member's round froze, use
-`docket decide <run> <owner> --changes --amendment <ID> --change TEXT --as reviewer`
-to open its re-verification round. Docket checks that the amendment invalidated
-that exact frozen bundle and records the amendment on the decision. This round
-does not spend the implementation correction budget.
-Retrying an interrupted batch approval resumes its recorded reason and evidence.
-If a waived member is reopened, its old milestone approval stays in history. Review
-the new member bundle and full-suite result, then approve the milestone again.
-This also applies when you waive the reopened task again: the new waiver keeps
-its stated gap, and the milestone needs a fresh full-suite pass and decision.
+Approve the milestone once against its passing frozen full-suite result and exact member bundles.
+Individual task approval is refused under quick's milestone policy.
+For policies allowing individual approval, `docket decide <run> <owner> --approve --as reviewer` requires a passed captured verification.
+Consolidate acceptance failures into one numbered list per affected member, naming a criterion and a reproducer or causal argument for each.
+A skipped verification cannot support approval; waiver accepts the stated gap without claiming a pass.
+A waiver also refuses stale consumed inputs or missing evidence identity.
+Missing, damaged, stale, or unreconstructable evidence blocks the verdict; never substitute the current workspace.
+A contract edited after freeze needs a fresh verified round.
+Read [evidence.md](evidence.md) for bundle integrity and [recovery.md](recovery.md) for re-review and interrupted decisions.
 
-An approval names the verified task revision and bundle digest; a verifier
-pass alone never completes work. An approval requires a passed captured verification for the exact frozen bundle: a round whose verification is `skipped` cannot be approved in any mode, and the refusal names waiving as the honest alternative. A waiver accepts without claiming a pass, so it stays available for a skipped round. A submitted or blocked aggregate wakes you,
-not the planner. A closed milestone batch is ready only when every submitted
-member has a resolved `pass` or `uncertain` verification for its current round
-and evidence, or `verifier_exempt` coverage; a `fail` verdict or a correction
-keeps it unready, and a changed verdict or finding moves the readiness
-revision so you receive a new event. A closed batch whose verified submission
-blocks a dependent derives one frontier for exactly those members, suppressed
-when milestone readiness already covers the same evidence and never derived
-for legacy runs. A frontier is a wake, never a combined verdict: approving one
-   member never approves another. A report body edited after review began
-   needs `--re-review` first. A re-review freezes a replacement bundle for the same round, and the decided report names that replacement digest, matching the decision; a retry finishes the recorded transition without opening a second round. A task edited after its round froze needs a fresh
-   verified round, not a reused verdict. A recorded `fail` verdict reaches you
-   as one `verification-failed` event per failed submitted round: decide the
-   required changes, since failed work never becomes approval-ready and the
-   batch never claims readiness for it. The event resolves when you decide or
-   when a correction round opens, and never re-wakes you afterwards.
-   A blocked orchestrator-owned task wakes you directly, as a blocked aggregate does.
-   A blocked implementor round reaches you as `blocked-routed` once the orchestrator routes it, with any answer it gave: request changes that carry the answer, or waive.
-   An interrupted decision, yours or a verifier-opened correction, wakes you with one `unfinished-<verdict>` event naming the command that finishes it; repeat that verdict alone and the recorded decision is finished exactly as written.
-   In a new quick run, a completed, full-suite-passing milestone wakes you directly.
-   Old `combined-checker` quick runs wake the checker for verified work.
-3. Review corrections against the delta from the reviewed bundle with refreshed
-   evidence, keeping the full diff in reach.
-   The correction packet leads with the objective, affected criteria and failure model, previous numbered changes, exact prior/current bundles, correction delta, refreshed evidence, and changed dependency identities.
-   Retrieve the full historical patch when the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or when the delta is unavailable.
-   Judge a correction against the previous decision's required
-   changes and for regressions: a new defect outside them requests changes only
-   when it breaks an acceptance criterion as written, and stronger hardening goes
-   under Notes as a follow-up, so rounds converge. Two local correction attempts after initial submission is
-   the default budget; exhaustion opens one durable escalation, never an
-   automatic approval or waiver. The escalation wakes the planner, who owns the
-   budget as plan policy and may grant rounds with `docket escalation`; a grant
-   wakes you with `budget-granted` to apply the refused changes for a submitted
-   or blocked report. The grant leaves its frozen evidence untouched. A verification
-   fail is charged to the budget only when it opens the correction itself.
-4. A plan that cannot meet the objective goes back as a planner amendment with
-   the objective and contract gap explained, not as an implementation defect.
-   Propose stronger requirements beyond the written criteria with `docket propose-amendment <run> <owner> --need TEXT --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT` for planner disposition.
-   Follow-up hardening belongs under Notes and does not become a new correction requirement.
-   Proposed waivers and spending outside policy need explicit decision
-   packets; spending needs the authorized budget owner.
+## Review a correction
 
-Wait with `docket watch <run> --role reviewer`; see `docket help signalling` for the per-harness table.
-Under `round_context: fresh` on Claude Code or OpenCode, use one subagent per milestone on your own model and keep its id.
-Your session records pickup and waits.
-For corrections and re-reviews, continue that milestone's subagent with SendMessage to its agent id on Claude Code, or the task tool with its task_id on OpenCode.
-A new milestone gets a new context; start a replacement for an existing milestone only if its subagent is gone.
-Give replacements the correction packet and retrieve historical source only as the packet requires.
-Do not wait on `herdr agent wait`, a sleep loop, or status polling.
+```bash
+docket review-packet <run> --role reviewer --correction T03
+```
 
-## Prompt rendering
+Lead with affected criteria, previous numbered changes, prior/current bundle identities, correction delta, refreshed evidence, and changed dependencies.
+Retrieve full historical patches when the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or when it is unavailable.
+Missing or damaged prior evidence refuses the packet; do not silently change its review basis.
+Check every previous required change and preserve earlier fixes as regression assertions.
+A new defect warrants changes only when it breaks acceptance as written; stronger hardening belongs under Notes for follow-up.
+Two local corrections after initial submission are the default budget; exhaustion escalates to the planner, never automatic approval or waiver.
+A `budget-granted` wake lets you apply the refused changes against the still-frozen submitted or blocked report.
+For an accepted amendment invalidating this exact frozen round, use:
 
-A review prompt is rendered for its workflow, role, and stage from the
-canonical contracts with the pinned bundle, verification, and decision
-revisions it must judge. The stage is derived from lifecycle documents; an
-explicit flag is for inspection only. A missing required bundle or finding
-refuses with a diagnostic naming the artifact, never a placeholder. Mandatory
-contract and acceptance material is never truncated. Optional guidance lives
-under a token budget covering profile, cards, headers, and separators; zero
-selects nothing and an oversized first card is skipped. Model matching is
-exact and one-run defaults are removed; an unknown model receives only
-task-relevant cards. Literal commands and evidence pointers survive unchanged.
+```bash
+docket decide <run> <owner> --changes --amendment ID --change TEXT --as reviewer
+```
+
+This opens reverification without spending the implementation correction budget.
+If a waived member is reopened, review its new bundle and a fresh full-suite result and approve the milestone again, even if it is waived again.
+The old milestone approval remains history.
+
+## Return an intent gap or wait
+
+A plan that cannot meet the objective needs a planner decision, not an invented implementation requirement.
+Propose it with `docket propose-amendment <run> <owner> --need TEXT --conflicts TEXT --evidence PATH --alternative TEXT --impact TEXT`.
+Waivers and spending outside policy need explicit decision packets; spending needs the authorized budget owner.
+For existing policies, `verification-uncertain`, `verification-failed`, frontier wakes, and aggregate decisions follow [historical-runs.md](historical-runs.md).
+An interrupted verdict derives `unfinished-<verdict>`; follow [recovery.md](recovery.md) and repeat the recorded verdict alone.
+
+In a conductor-managed session, end your turn after deciding; the conductor delivers re-review work only when your pane is idle.
+Do not run `docket watch` or arm a wake hook for waiting.
+For manual runs, use `docket watch <run> --role reviewer` and follow [signalling.md](signalling.md) for native wakes and the per-harness wait method.
+Never wait on `herdr agent wait`, sleep loops, or status polling.
+Record the round's Docket friction or `none` using the rendered feedback command. [Prompt rendering](prompt-rendering.md) documents mandatory revisions and refusal on missing evidence.

@@ -87,7 +87,7 @@ def announce_active(d: Path, role: str, key: str, recipient: dict | None = None)
 
 
 def announcement_matches_recipient(record: dict, recipient: dict) -> bool:
-    return (record.get("transport") == "native-hook"
+    return (record.get("transport") in ("native-hook", "herdr")
             and record.get("session") == recipient.get("session")
             and record.get("session_generation") == recipient.get("generation"))
 

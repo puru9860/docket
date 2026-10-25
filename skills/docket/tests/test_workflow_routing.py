@@ -29,7 +29,7 @@ class WorkflowRouting(unittest.TestCase):
         self.cli("init", name, "--mode", mode, "--evidence-mode", "documents-only")
         run = self.f.root / ".docket/runs" / name
         for owner in (("T01", "T02") if dependent else ("T01",)):
-            args = ["assign", name, owner, "--harness", "opencode", "--file",
+            args = ["assign", name, owner, "--harness", "claude", "--file",
                     f"src/{owner.lower()}.py", "--verify", "true"]
             if mode == "quick":
                 args += ["--as", "planner"]

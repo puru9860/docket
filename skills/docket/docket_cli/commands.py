@@ -32,6 +32,11 @@ from .publication import fault, publish, publish_exclusive, publish_json
 from .policy import (
     artifact_policy_fields, is_tiered, max_concurrency_of, mode_of, need_run, require_preset_role,
     is_quick_milestone, role_effort, role_model, role_sessions_for,
+    recorded_assignment, assignment_role, assignment_batch,
+)
+from .assignments import (
+    resolve_config, frontmatter_assignments, clear_task_assignment, task_assignment_conflicts,
+    pin_refusal, validate_role,
 )
 from .evidence import git_root
 from .roots import candidate_roots, declare_roots, read_roots, resolve_scope, root_identity
@@ -93,12 +98,12 @@ def init_policy(a: argparse.Namespace) -> dict[str, str]:
     agents = int(a.agents or 0)
     if requested_workflow == WORKFLOW_LEGACY_DECODE:
         die("legacy workflow is a historical decode for existing runs only and "
-            "cannot be selected for a new run; use --mode standard or --mode quick "
+            "cannot be selected for a new run; use --mode quick "
             "(workflow five-role-v1)")
     if selected_mode == MODE_QUICK:
         if agents == 2:
             die("the two-role quick variant is deferred and is not in this build; "
-                "use --mode quick with three agents or choose --mode standard")
+                "use --mode quick with three agents")
         if agents not in (0, 3):
             die("quick mode is the three-role preset; --agents must be 3 "
                 "(the two-role variant is deferred)")
@@ -155,13 +160,19 @@ def cmd_init(a: argparse.Namespace) -> None:
     if base.exists():
         die(f"run {a.run} already exists at {base}")
     policy = init_policy(a)
+    assignments = resolve_config(a.harness)
+    if policy["mode"] == MODE_STANDARD:
+        print("warning: --mode standard is deprecated for new runs; use --mode quick. "
+              "Compatibility creation remains available; existing runs keep their recorded policy.",
+              file=sys.stderr)
     (base / "docs").mkdir(parents=True)
     plan = base / "plan.mdx"
     # Declared checkout roots are Git evidence by definition, even when `.docket` sits
     # in a plain parent directory with no checkout of its own.
     evidence = a.evidence_mode or ("git" if a.root or git_root() else DOCUMENTS_ONLY)
     text = template("plan").format(
-        run=a.run, harness=a.harness, evidence_mode=evidence, **policy,
+        run=a.run, harness=a.harness, evidence_mode=evidence,
+        round_context="shared" if policy["mode"] == MODE_QUICK else "fresh", **policy,
     )
     # Stating the intent at creation saves the open-and-edit round trip a fresh
     # plan otherwise needs before anything can be assigned.
@@ -172,7 +183,9 @@ def cmd_init(a: argparse.Namespace) -> None:
             meta, body = parse(text)
             body = set_section(body, section, value.strip())
             text = render(meta, body)
-    publish(plan, text)
+    meta, body = parse(text)
+    meta.update(frontmatter_assignments(assignments))
+    publish(plan, render(meta, body))
     print(f"created {plan.relative_to(root())}")
     print(f"mode: {policy['mode']} - workflow {policy['workflow']}, "
           f"topology {policy['topology']}, sessions {policy['role_sessions']}")
@@ -248,6 +261,21 @@ def cmd_assign(a: argparse.Namespace) -> None:
     d = need_run(a.run)
     if is_quick_milestone(d) and a.as_role != "planner":
         die("new quick runs require --as planner when defining tasks")
+    if a.clear_assignment:
+        if a.harness or a.model or a.file or a.files or a.verify or a.goal or a.criterion:
+            die("use --clear-assignment alone with RUN OWNER --as planner; it changes no task intent")
+        clear_task_assignment(d, a.owner)
+        return
+    explicit_harness, explicit_model = bool(a.harness), bool(a.model)
+    assignment = recorded_assignment(d, "implementor", a.owner)
+    if assignment and a.owner != "orch" and a.executor == "implementor":
+        task_assignment_conflicts(d, a.owner, assignment if assignment_batch(d, a.owner)
+                                 else {}, a.harness, a.model)
+        if assignment["pinned"] and (explicit_harness or explicit_model):
+            pin_refusal("implementor", assignment)
+        candidate = {**assignment, "model": a.model or assignment["model"]}
+        validate_role("implementor", candidate, "task assignment")
+        a.harness = a.harness or str(assignment["harness"])
     if a.tier:
         a.complexity = "low" if a.tier == "small" else "high"
         a.executor = "implementor" if a.tier == "small" else "orchestrator"
@@ -259,16 +287,16 @@ def cmd_assign(a: argparse.Namespace) -> None:
         if a.owner == "orch" or a.executor == "orchestrator":
             planned = str(parse((d / "plan.mdx").read_text())[0].get("planner_harness", ""))
             a.harness = calling_harness() or (planned if planned in SUPPORTED_HARNESSES
-                                              else "opencode")
+                                              else "claude")
         else:
-            a.harness = "opencode"
+            a.harness = "claude"
     if reports(d, a.owner):
         die(f"{a.owner} already has a report; use `docket decide` to open a new round")
     # Per-role policy supplies defaults when the assign flags are empty; an
     # explicit flag still wins. Unconfigured roles leave the fields empty.
     assign_role = "orchestrator" if (a.owner == "orch" or a.executor == "orchestrator") else "implementor"
     if not (a.model or "").strip():
-        a.model = role_model(d, assign_role)
+        a.model = role_model(d, assign_role, a.owner)
     if not (a.effort or "").strip():
         a.effort = role_effort(d, assign_role)
     # These become frontmatter lines, and a line break would write a key of its own.
@@ -350,6 +378,11 @@ def cmd_assign(a: argparse.Namespace) -> None:
             if decisions:
                 body = set_section(body, "Existing decisions",
                                    "\n".join(f"- {item}" for item in decisions))
+            text = render(meta, body)
+        if assignment:
+            meta, body = parse(text)
+            meta["assignment_harness_explicit"] = "yes" if explicit_harness else "no"
+            meta["assignment_model_explicit"] = "yes" if explicit_model else "no"
             text = render(meta, body)
         publish(task, text)
         print(f"created {task.relative_to(root())}")
@@ -784,6 +817,9 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
         f"updates: {pmeta.get('progress_updates', 'quiet')}   "
         f"evidence: {evidence_mode(d)}"
     )
+    from .conductor import conductor_status
+    for line in conductor_status(d):
+        print(line)
     if a.role == "planner":
         rnd, st = state_of(d, "orch")
         if rnd:
@@ -894,6 +930,18 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
                   f"generation={batch.get('generation', 1)} "
                   f"members={','.join(str(m) for m in (batch.get('members') or []))} "
                   f"ready={'yes' if ready else 'no'}")
+            if batch.get("assignment_version"):
+                impl = assignment_role(batch, "implementor")
+                review = assignment_role(batch, "reviewer")
+                observed = []
+                for member in batch.get("members", []):
+                    task = d / f"{member}-task.mdx"
+                    actual = parse(task.read_text())[0].get("actual_model", "") if task.is_file() else ""
+                    observed.append(f"{member}:{actual or 'unobserved'}")
+                print(f"    requested: implementor={impl['harness']}/{impl['model'] or '(default)'} "
+                      f"reviewer={review['harness']}/{review['model'] or '(default)'}; "
+                      f"actual: implementor={','.join(observed)} reviewer=unobserved; "
+                      f"reviewer_context={batch.get('reviewer_context', 'continue')}")
     open_incidents = [i for i in list_incidents(d) if i.get("state") == "open"]
     if open_incidents:
         print(f"\nopen stall incidents ({len(open_incidents)}; one incident yields one recovery event):")

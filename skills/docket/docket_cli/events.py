@@ -13,7 +13,7 @@ from .frontmatter import parse, sections
 from .paths import _ordered, dispatch_path, handoffs, latest, owners, read_dispatch, scope_path
 from .publication import publish_json
 from .policy import (
-    is_five_role, is_quick_milestone, is_tiered, mode_of, next_role_fallback, task_executor, topology,
+    conductor_managed, is_five_role, is_quick_milestone, is_tiered, mode_of, next_role_fallback, task_executor, topology,
     verifier_role_of, workflow_of,
 )
 from .baselines import evidence_digest
@@ -68,6 +68,8 @@ def instruction_events(d: Path, role: str) -> list[dict[str, object]]:
 
 def launch_needed_event(d: Path, supervisor: str, target: str) -> tuple[str, str, str] | None:
     """A pending supervisor role without a surviving noted session needs a launch."""
+    if conductor_managed(d) and target in ("implementor", "reviewer"):
+        return None
     if (d.name, supervisor) not in armed():
         return None
     if any(target in ref.get("roles", []) and worker_process_state(ref) != "exited"
@@ -409,6 +411,8 @@ def quick_next_task_event(d: Path) -> tuple[str, str, str, str] | None:
             sessions = [str(read_dispatch(d, o).get("session", "")) for o in owners(d)
                         if read_dispatch(d, o)]
             session = next((s for s in reversed(sessions) if s), "SESSION")
+            if conductor_managed(d):
+                session = '"$DOCKET_SESSION"'
             bid = str(batch.get("batch"))
             return (f"{member}:1:next-task",
                     f"{member} is the next task of milestone {bid} and nothing is dispatched: run "
@@ -441,6 +445,31 @@ def handoff_stall_events(d: Path) -> list[tuple[str, str, str]]:
                     f"idle, send it `docket pickup {d.name} --role {role}` and let it act, and if "
                     f"it is gone, start {role} again. Do not relay normal progress",
                     "sha256:" + hashlib.sha256(f"{role}:{key}:{wake['first']}".encode()).hexdigest()))
+    return out
+
+
+def incident_events(d: Path, role: str) -> list[dict[str, object]]:
+    """Project existing incident records to their declared recovery role."""
+    out = []
+    for incident in list_incidents(d):
+        if incident.get("recipient", "orchestrator") != role:
+            continue
+        if incident.get("state") != "open":
+            continue
+        owner = str(incident.get("owner", ""))
+        try:
+            epoch = reopen_epoch(d, owner, state_of(d, owner)[0])
+        except (OSError, ValueError):
+            epoch = 1
+        if str(incident.get("epoch", 1)) != str(epoch):
+            continue
+        cause = str(incident.get("cause", "stalled"))
+        iid = str(incident.get("id", owner))
+        out.append({"key": f"{owner}:stalled:{iid.rsplit('-', 1)[-1] if '-' in iid else iid}",
+                    "role": role, "workflow": workflow_of(d), "owner": owner,
+                    "round": state_of(d, owner)[0], "generation": epoch,
+                    "revision": f"sha256:{hashlib.sha256(cause.encode()).hexdigest()}",
+                    "message": f"{owner} stalled ({cause}); one incident yields one recovery event"})
     return out
 
 
@@ -548,6 +577,7 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
         })
 
     if role == "planner":
+        out.extend(incident_events(d, role))
         if topology(d) == "combined":
             return []
         for key, message, revision in codex_budget_events(d):
@@ -774,22 +804,7 @@ def derive_events(d: Path, role: str, _logical: bool = False) -> list[dict[str, 
                 key, message, urnd, revision = unfinished
                 emit(key, message, o, urnd, revision)
 
-    for incident in list_incidents(d):
-        if incident.get("state") != "open":
-            continue
-        owner = str(incident.get("owner", ""))
-        try:
-            epoch = reopen_epoch(d, owner, state_of(d, owner)[0])
-        except (OSError, ValueError):
-            epoch = 1
-        if str(incident.get("epoch", 1)) != str(epoch):
-            continue
-        cause = str(incident.get("cause", "stalled"))
-        iid = str(incident.get("id", owner))
-        emit(f"{owner}:stalled:{iid.rsplit('-', 1)[-1] if '-' in iid else iid}",
-             f"{owner} stalled ({cause}); one incident yields one recovery event",
-             owner, state_of(d, owner)[0],
-             f"sha256:{hashlib.sha256(cause.encode()).hexdigest()}")
+    out.extend(incident_events(d, role))
 
     closed_batches = [b for b in list_batches(d) if b.get("state") == "closed"]
     for batch in closed_batches:

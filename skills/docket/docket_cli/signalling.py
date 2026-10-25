@@ -15,7 +15,7 @@ from pathlib import Path
 from .common import DELIVERY_LEASE_SECONDS, STATE_DIR, die, now_s, stamp
 from .paths import root, run_dir
 from .publication import fault, perturb, publish, publish_json
-from .policy import fresh_context_resume, fresh_context_tool, need_run, plan_flag, require_preset_role
+from .policy import conductor_managed, fresh_context_resume, fresh_context_tool, need_run, plan_flag, require_preset_role
 from .baselines import evidence_mode
 from .state import armed
 from .sessions import (
@@ -297,7 +297,7 @@ def cmd_pickup(a: argparse.Namespace) -> None:
         announcements = [read_announce(d, a.role, key) for key, _ in events(d, a.role)]
     received = []
     for notice in announcements:
-        if notice.get("transport") != "native-hook" or notice.get("session") != reg["session"]:
+        if notice.get("transport") not in ("native-hook", "herdr") or notice.get("session") != reg["session"]:
             continue
         if notice.get("session_generation") != reg["generation"]:
             die("announcement belongs to a previous session generation; wait for its fresh wake")
@@ -465,7 +465,13 @@ def cmd_watch(a: argparse.Namespace) -> None:
         if not pairs and not discussion_active:
             raise SystemExit(0)
         live_pairs = [(run, role) for run, role in pairs
-                      if not paused_flag(run_dir(run), role).is_file()]
+                      if not paused_flag(run_dir(run), role).is_file()
+                      and not (role in ("implementor", "reviewer")
+                               and conductor_managed(run_dir(run)))]
+        if pairs and not live_pairs and all(
+                role in ("implementor", "reviewer") and conductor_managed(run_dir(run))
+                for run, role in pairs):
+            raise SystemExit(0)
         for run, role in live_pairs:
             d = run_dir(run)
             recipient = native_session_registration(run, role, create=True) if native else None
