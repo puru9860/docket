@@ -22,7 +22,8 @@ Read the bound prompt and complete task contract, including decisions and discov
 Begin discovery with project guidance, manifests, and task-specific searches; follow relevant callers, dependencies, and tests.
 Stop when you can explain the likely change surface and verification; explore more only when the task needs it.
 If a contract changes after dispatch, repeat dispatch to bind the new prompt before working.
-Confirm the active harness model and effort rather than trusting launch flags; record the observed identity with `docket set-model`.
+Submission records the latest model observed in your registered session telemetry; requested launch flags never count as observations.
+If telemetry is unavailable, confirm the live model and use `docket set-model` before submitting.
 
 ## Claim scope before editing
 
@@ -47,13 +48,15 @@ Use different inputs and zero/one/many boundaries when relevant; a fake proves o
 Review your own patch for unrequested behavior, missing sibling sites, untested branches, flaky timing, stale docs, and overstated claims.
 For a correction, reproduce each required change, preserve earlier fixes as regression assertions, then cite the same check after the fix.
 Use decisive negative controls in a disposable copy; prove a claimed failure was injected into the named component and save the failing observation.
-Never mutate the measured checkout to run a negative control.
+Rebuild the captured baseline with `docket bundle <run> <owner> --baseline --checkout` and run the same focused check in the printed fresh private directory.
+Never use `git stash` or mutate the measured checkout to run a negative control.
 `docket submit` runs the registered `verify:` command once against the final source and freezes its output.
 Run extra focused checks for debugging or concrete risk; an identical manual run before submission is unnecessary.
 The full suite belongs once per milestone, never in a task round.
 Run preflight and submission with the longest available shell timeout.
 When the shell cap is shorter than the rendered allowance, use `docket submit <run> <owner> --background` with `--as implementor`.
-Read its private log or status; never retry a verification that may still be running.
+In conductor-managed sessions prefer foreground submit; if background submission is required, end your turn immediately and never sleep or poll its log.
+Never retry a verification that may still be running.
 
 Record a consumed input before relying on it and while the round is a draft:
 
@@ -73,9 +76,9 @@ Normal completion needs all required criteria met; missing evidence is a gap, ne
 
 ```bash
 docket submit <run> <owner> --check
-docket submit <run> <owner> --as implementor
+docket submit <run> <owner> --as implementor --feedback none
 # If completion is blocked, state the question under Decisions needed and use:
-docket submit <run> <owner> --blocked --as implementor
+docket submit <run> <owner> --blocked --as implementor --feedback none
 ```
 
 `--check` lists gate refusals without running verification, freezing, or changing state.
@@ -96,14 +99,15 @@ An immutable bundle, its baseline, and its pinned input evidence must remain rec
 
 Dispatch the next ready task in the current milestone after the preceding work is done.
 In a conductor-managed run, end your turn after submission; the conductor delivers the next task or correction to this same milestone session.
-When every member has completed implementation, run the planner-declared suite:
+The conductor runs the planner-declared suite automatically when every member is ready.
+For manual runs only, run:
 
 ```bash
 docket batch <run> --verify M1 --as implementor
 ```
 
 A full-suite pass wakes the reviewer; a routed blocker may need changes or waiver before the suite can run.
-In conductor-managed runs, end your turn after the suite; do not run `docket watch`, arm a wake hook, launch roles, or start another milestone.
+In conductor-managed runs, end your turn after submission; do not run `docket watch`, arm a wake hook, launch roles, or start another milestone.
 The conductor delivers corrections to this session and starts a fresh implementor after intact milestone approval.
 For manual runs only, handle `launch:reviewer` through a registered inbox claim and wait with `docket watch <run> --role implementor`.
 Follow [launch.md](launch.md) for conductor setup and manual fallback, and [signalling.md](signalling.md) for receipts.
@@ -117,4 +121,4 @@ Before compaction, replacement, or interruption, run `docket handoff <run> <owne
 Recover from the task, accepted scope, ready handoff, latest decision, and task-local diff with targeted inspection.
 Read [recovery.md](recovery.md) for session generations, model limits, moved inputs, and unfinished submissions.
 A run that outgrows quick records an escalation and retains its policy until authorized follow-up.
-Record each round's Docket friction or `none` using the rendered feedback command. [Prompt rendering](prompt-rendering.md) explains stages, checkpoints, and refusal on missing mandatory inputs.
+Include each round's Docket friction or `none` in `submit --feedback TEXT`. [Prompt rendering](prompt-rendering.md) explains stages, checkpoints, and refusal on missing mandatory inputs.

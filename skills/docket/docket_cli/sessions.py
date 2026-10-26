@@ -34,7 +34,7 @@ from .hook_config import codex_hook_configuration
 # the harness process has to be an ancestor of this one.
 
 HARNESS_SESSION_LEDGER = ".harness-sessions.jsonl"
-SESSION_ROLE_COMMANDS = ("watch", "arm", "feedback", "submit", "handoff", "verify", "decide",
+SESSION_ROLE_COMMANDS = ("launch", "finish", "watch", "arm", "feedback", "submit", "handoff", "verify", "decide",
                          "assign", "dispatch", "resume", "batch", "release", "session")
 
 
@@ -352,6 +352,8 @@ def note_harness_session(d: Path, role: str, owner: str,
 def command_session_role(a: argparse.Namespace, d: Path) -> tuple[str, str]:
     """The role and task a command speaks for, or ('', '') when it names none."""
     owner = str(getattr(a, "owner", "") or getattr(a, "task", "") or "")
+    if a.cmd in ("launch", "finish"):
+        return "planner", ""
     if a.cmd in ("watch", "arm"):
         return str(getattr(a, "role", "") or ""), ""
     if a.cmd == "session":

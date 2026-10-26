@@ -86,7 +86,7 @@ def launch_needed_event(d: Path, supervisor: str, target: str) -> tuple[str, str
             revision)
 
 
-def codex_budget_events(d: Path) -> list[tuple[str, str, str]]:
+def codex_budget_events(d: Path, *, actionable: bool = True) -> list[tuple[str, str, str]]:
     """Warn the plan owner once per current Codex limit window and threshold."""
     sessions = run_harness_sessions(d)
     uses_codex = any(ref.get("harness") == "codex" for ref in sessions)
@@ -104,14 +104,14 @@ def codex_budget_events(d: Path) -> list[tuple[str, str, str]]:
     out = []
     for window, threshold in CODEX_LIMIT_WARN_PERCENT.items():
         reading = limits.get(window)
-        if not isinstance(reading, dict) or float(reading.get("used_percent", 0)) < threshold:
+        if not isinstance(reading, dict) or float(reading.get("used_percent", 0)) < (100 if actionable else threshold):
             continue
         reset = int(float(reading.get("resets_at", 0) or 0))
         key = f"codex-budget:{window}:{reset}"
         message = (f"Codex budget warning: {window} window is "
                    f"{reading['used_percent']:.0f}% used (threshold {threshold}%). "
-                   "Check the premium reserve and approved fallback models before "
-                   "another premium launch; this warning is delivered once per window")
+                   + ("Window exhausted; choose quota recovery or an approved fallback." if actionable else
+                    "Informational; no planner decision is needed." ))
         out.append((key, message, f"sha256:{hashlib.sha256(key.encode()).hexdigest()}"))
     return out
 

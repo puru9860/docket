@@ -15,7 +15,7 @@ Use `docket discuss --list` to find an existing discussion.
 ## Quick coding flow
 
 New runs use quick: the planner defines intent, one visible implementor per milestone works its tasks and corrections, and an independent reviewer decides.
-The planner plans, starts `docket conduct`, and ends its turn.
+The planner applies the plan, runs `docket launch`, and ends its turn.
 Start a fresh planner session for each run, carrying its approved objective and plan.
 The conductor is a plain foreground process in its own Herdr pane, with no model tokens or hidden subagents.
 It opens workers in a dedicated run tab, delivers work only to idle agents, and retains native session identities before closing panes.
@@ -27,35 +27,22 @@ If the user requests a different planner harness or model, launch that planner w
 That session owns planning and starting the conductor; see `references/launch.md` for the manual launch fallback.
 If `docket` is absent from PATH, use `~/.agents/skills/docket/bin/docket`.
 
-```bash
-mkdir -p .docket
-docket init R01 --title "Capability" --objective "Observable outcome." --approach "Shape and reason."
-docket assign R01 T01 --file src/x.py --verify 'python3 -m unittest tests.test_x' --as planner \
-  --title "Task" --goal "Required behavior." --criterion "Observable task-specific result."
-docket batch R01 --create M1 --members T01 --milestone --command 'tests/test.sh' --as planner
-docket batch R01 --close M1 --as planner
-```
-
-Define every task and close every milestone before work starts, and obtain the user's approval of the plan.
-Put constraints and dependencies in the task using `--out-of-scope`, `--decision`, and `--depends-on`.
-Assignments resolve from user config, project config, and milestone overrides; inspect sources, allowed models, and pins with `docket config R01`.
-Every milestone override needs `--assignment-reason`; reviewer `continue` or `fresh` needs its recorded continuity reason.
-Choose `continue` for dependent milestones or deliberately deferred work and `fresh` for independent milestones.
-Only user config may supply harness launch arguments; launch requests never prove the observed model.
-Read `references/assignments.md` for configuration and `references/launch.md` for conductor setup and recovery.
-
-Arm the planner's existing hook and run the conductor as a plain command in its own Herdr pane:
+Read `docket help planner` for one complete JSON plan example and the normal two-command setup:
 
 ```bash
-docket arm R01 --role planner
-docket conduct R01
+docket plan apply R01 --file plan.json
+docket launch R01
 ```
+
+Define every task and close every milestone before work starts, using one milestone unless an intermediate approval is a real checkpoint.
+Assignments resolve from user config, project config, and explicit milestone overrides, respecting user pins and allow-lists.
+The planner needs no transport internals for normal setup; `references/conductor.md` and `references/launch.md` are recovery references only.
 
 Then end your turn; do not launch workers, monitor panes, poll status, or relay healthy progress.
 The conductor delivers worker wakes and starts a fresh implementor only after intact milestone approval.
-Workers register themselves, pick up the announced obligation, and end their turns after submitting, verifying the milestone suite, or deciding.
+Workers register themselves, pick up the announced obligation, and end their turns after submitting or deciding.
 Worker hooks stay silent; the planner keeps its own hook for intent decisions, budgets, stalls, and completion.
-After a planner wake, run `docket pickup R01 --role planner`, inspect status once, and answer the decision it needs.
+For a decision wake use `docket pickup R01 --role planner` and answer its question; completion carries its evidence and uses `docket finish` directly.
 For a status request, read `docket status R01` once, answer, and end your turn.
 
 ## Recover and preserve evidence
@@ -77,7 +64,7 @@ Never delete run files, edit lifecycle status, commit or stash user work to clea
 Submit completion or an honest blocker through the gate; missing evidence never counts as success, and `--skip-verify` cannot support approval.
 The reviewer reads frozen patches and changed tests, challenges consequential assumptions and expectations, and binds decisions to exact evidence.
 Use `references/evidence.md`, `references/verification-obligations.md`, and `references/signalling.md` for the detailed rules.
-When complete, the planner reports the outcome, records feedback, archives with `docket usage R01 --archive`, and disarms the run.
+When complete, the planner reports the evidence carried by its wake and runs `docket finish R01 --feedback TEXT|none`.
 
 ## Request
 

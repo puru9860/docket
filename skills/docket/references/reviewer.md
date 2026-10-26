@@ -33,7 +33,9 @@ The rendered quick review prompt carries the universal and claim-selected obliga
 Build a criterion-to-observation map, inspect changed tests, and independently derive important expected results.
 Challenge green-but-wrong evidence, including fixtures or expected values adjusted merely to match implementation.
 Inspect preservation and error invariants, sibling sites, and side effects on pre-existing user data.
-Run selective boundary and negative checks in an isolated copy for the highest-risk claims.
+Materialize the frozen source with `docket bundle <run> <owner> --checkout`.
+Use the printed fresh private directory for selective boundary and negative checks using the frozen focused command or packet milestone command as cwd-local shell commands.
+Multi-root exports put each checkout under its alias.
 A failure claim must inject the failure into the named component and detect an incorrect outcome.
 Use conditional baseline-red checks when needed to distinguish the claimed fix from an already-passing test.
 Contain risky tests; do not mutate the measured checkout or external state for exploratory checks.

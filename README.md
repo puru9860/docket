@@ -144,23 +144,20 @@ use uv; nothing else changes.
 
 ## Quick start
 
+Write `plan.json` with run fields, explicit roots, tasks, and milestones as in the complete example in `docket help planner`.
+Use one milestone unless an intermediate approval is a real checkpoint.
+
 ```bash
-cd <your project> && mkdir -p .docket
-docket init R01 --title "Short name" --objective "What done means for the whole run."
-docket arm R01 --role planner
-docket assign R01 T01 --file src/x.py --verify 'python3 -m unittest tests.test_x' \
-  --title "Task name" --goal "What must be true when done." \
-  --criterion "A mechanically checkable criterion" --criterion "Another one" --as planner
-docket batch R01 --create M1 --members T01 --milestone --command 'tests/test.sh' --as planner
-docket batch R01 --close M1 --as planner
-# After plan approval, start this plain command in its own Herdr pane.
-docket conduct R01
+docket plan apply R01 --file plan.json
+docket launch R01
 ```
 
-That is the start: the planner sets the objective, assigns all tasks, and closes their milestone batches before dispatch.
-`assign` takes the goal and criteria, and `dispatch` runs the task-intent gate and writes the worker prompt.
-After task submissions, the implementor runs `docket batch R01 --verify M1 --as implementor`.
-The reviewer receives one milestone wake and can approve it with `docket batch R01 --approve M1 --as reviewer`.
+Apply runs the existing init, root declaration, assignment, batch creation, and close gates in a private staging directory and publishes the complete run with one rename.
+Invalid input leaves no run; applying to an existing run refuses.
+Launch opens the conductor pane and arms the planner in its own session.
+The conductor runs the planner-declared milestone suite when every member is ready, recording `actor: conductor` without a verifier or reviewer judgment.
+Manual runs retain `docket batch R01 --verify M1 --as implementor`.
+The reviewer receives one milestone wake and can approve with `docket batch R01 --approve M1 --as reviewer`.
 The quick reviewer shares the [verification obligations](skills/docket/references/verification-obligations.md): independently derive expectations, inspect changed tests, challenge green-but-wrong evidence, and run selective boundary and negative checks without routinely rerunning the identical frozen suite.
 It also audits consequential assumptions and outcome evidence at the real boundary and rereads the original request at final review.
 The conductor launches one visible implementor per milestone in a dedicated worker tab, starts or continues its reviewer, and delivers work only while their panes are idle.
@@ -293,6 +290,9 @@ submitted or blocked work it tells you to open a fresh round with `docket decide
 ## Commands
 
 ```
+docket plan apply <run> --file plan.json              validate and atomically publish the whole plan
+docket launch <run>                                 open conductor and arm planner
+docket finish <run> --feedback TEXT|none             acknowledge, record feedback, archive, disarm
 docket init <run> [--mode quick] [--title T] [--objective TEXT] [--harness H]
                                   [--evidence-mode M] [--root alias=path ...]
 docket conduct <run>                                foreground quick worker transport in Herdr
@@ -311,6 +311,8 @@ docket roots <run> [--declare|--redeclare alias=path ...]
 docket submit <run> <owner> [--as implementor]      validate, freeze, and hand off <- the gate
 docket verify <run> <owner> --result pass --as verifier
 docket bundle <run> <owner> [--round N] [--list]     the frozen evidence for a round
+docket bundle <run> <owner> --checkout [DIR] [--baseline]
+                                                     export frozen or baseline trees outside the workspace
 docket depend <run> <owner> [--on TASK]              consume another task's frozen evidence
 docket batch <run> --create M1 --members T01,T02 --milestone --command CMD --as planner
 docket batch <run> --close M1 --as planner
@@ -452,7 +454,7 @@ Subagents are counted under the session that started them, and a mixed-model ses
 A transcript with no call in the window is reported as a gap, never as zero.
 
 The standard run's final aggregate verdict archives automatically. In new quick
-runs the planner runs `docket usage R01 --archive` after the final milestone.
+runs the completion wake carries milestone verdicts and suite results, and the planner uses `docket finish R01 --feedback TEXT` (or `none`) to acknowledge it, record feedback, archive usage, and disarm.
 Archives live under `~/.local/state/docket/sessions/` with private permissions
 because transcripts can hold secrets.
 The digest then reports token usage by role across runs.
@@ -463,8 +465,8 @@ For a run with premium models, set flat `plan.mdx` fields such as
 and refuses a new premium dispatch, resume, or switch once the remaining
 allowance reaches the review reserve. An unavailable session transcript makes
 the guard refuse a premium launch until usage is known. A non-premium approved
-fallback remains available. Codex account usage crossing its warning threshold
-also wakes the planner once per limit window.
+fallback remains available. Codex account warnings appear in status and conductor output.
+Only an exhausted window wakes the planner; a refused premium conductor launch opens a planner incident.
 
 ### Per-model learning
 
@@ -571,8 +573,8 @@ replacement still runs in a new, registered harness session.
 when a harness shell call cannot last for the task's declared verify timeout.
 Use `docket submit RUN OWNER --background` with the usual `--as` role when
 required. The call returns a private log path while the child holds the owner
-lock through verification, evidence freeze, and report publication. Read the log
-or `docket status` for the outcome. Repeating the background command while it
+lock through verification, evidence freeze, and report publication. In conductor-managed sessions prefer foreground submission; if background submission is necessary, end the turn immediately without sleep or log polling.
+For manual recovery, read the log or `docket status` for the outcome. Repeating the background command while it
 is running reports the existing job instead of starting another verify.
 
 ## License

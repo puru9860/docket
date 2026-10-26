@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import tempfile
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,12 +28,12 @@ from .common import (
 from .frontmatter import parse, render, set_section
 from .paths import (
     dispatch_path, handoffs, latest, next_numbered, owners, planned_tasks, read_dispatch,
-    reports, root, scope_path,
+    reports, root, run_dir, scope_path, staged_run_path,
 )
 from .publication import fault, publish, publish_exclusive, publish_json
 from .policy import (
     artifact_policy_fields, is_tiered, max_concurrency_of, mode_of, need_run, require_preset_role,
-    is_quick_milestone, role_effort, role_model, role_sessions_for,
+    is_quick_milestone, plan_flag, role_effort, role_model, role_sessions_for,
     recorded_assignment, assignment_role, assignment_batch,
 )
 from .assignments import (
@@ -46,7 +48,7 @@ from .baselines import (
 )
 from .bundles import (
     FINAL_STATES, PROVISIONAL_ALLOWED, bundle_dir, bundle_problems, bundles_for,
-    latest_bundle, load_bundle, source_identity,
+    latest_bundle, load_bundle, source_identity, materialize_bundle_tree,
 )
 from .locks import owner_lock
 from .state import (
@@ -70,7 +72,13 @@ from .sessions import (
     reviewer_observed_models, run_harness_sessions,
 )
 from .liveness import dispatch_dependencies_unmet, dispatch_liveness, live_dispatches, missed_wakes
-from .batches import batch_ready, cmd_batch as _batches_cmd_batch
+from .batches import batch_ready, cmd_batch as _batches_cmd_batch, quick_milestone_plan_problems
+from .five_role import run_complete_event
+from .models import cmd_feedback
+from .sessions import collect_run_usage
+from .signalling import cmd_arm, cmd_disarm, cmd_pickup
+from .conductor import conductor_dir, herdr, read_worker
+from .common import LAUNCHER
 from .delivery import delivery_lock, sweep_role
 from .health import execution_health
 from .gate import required_section_problems, task_intent_problems
@@ -156,7 +164,7 @@ def init_policy(a: argparse.Namespace) -> dict[str, str]:
 def cmd_init(a: argparse.Namespace) -> None:
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", a.run):
         die("run id must contain only letters, numbers, dots, underscores, and hyphens")
-    base = root() / STATE_DIR / "runs" / a.run
+    base = run_dir(a.run)
     if base.exists():
         die(f"run {a.run} already exists at {base}")
     policy = init_policy(a)
@@ -818,6 +826,9 @@ def print_status(a: argparse.Namespace, d: Path) -> None:
         f"updates: {pmeta.get('progress_updates', 'quiet')}   "
         f"evidence: {evidence_mode(d)}"
     )
+    from .events import codex_budget_events
+    for _key, warning, _revision in codex_budget_events(d, actionable=False):
+        print(warning)
     from .conductor import conductor_status
     for line in conductor_status(d):
         print(line)
@@ -992,6 +1003,15 @@ def cmd_diff(a: argparse.Namespace) -> None:
 def cmd_bundle(a: argparse.Namespace) -> None:
     """Show the frozen review evidence for a round, and whether it is intact."""
     d = need_run(a.run)
+    if getattr(a, "checkout", None) is not None:
+        if a.owner == 'orch' and not a.baseline:
+            entry = latest_bundle(d, a.owner, a.round)
+            problems = aggregate_bundle_problems(d, entry) if entry else ['no aggregate bundle']
+            if problems:
+                die("DAMAGED: " + "; ".join(problems))
+        return materialize_bundle_tree(d, a.owner, Path(a.checkout) if a.checkout else None, baseline=a.baseline, rnd=a.round)
+    if getattr(a, "baseline", False):
+        die("--baseline requires --checkout [DIR]")
     entries = bundles_for(d, a.owner, a.round)
     if not entries:
         scope = f" round {a.round}" if a.round else ""
@@ -1383,3 +1403,222 @@ def cmd_migrate(a: argparse.Namespace) -> None:
         sweep_role(d, "planner")
     print(f"migrated {a.run} from {previous} to {WORKFLOW_FIVE_ROLE}; "
           "legacy artifacts preserved and legacy event identities retired")
+
+
+def plan_json_arguments(parser: argparse.ArgumentParser, command: str, run: str,
+                        fields: dict, positional: list[str] | None = None) -> argparse.Namespace:
+    if not isinstance(fields, dict):
+        die(f"{command} fields must be a JSON object")
+    subparser = next(action for action in parser._actions
+                     if isinstance(action, argparse._SubParsersAction)).choices[command]
+    actions = {action.dest: action for action in subparser._actions if action.option_strings}
+    argv = [command, run, *(positional or [])]
+    normalized_keys = set()
+    for key, value in fields.items():
+        key = key.replace("-", "_")
+        if key in normalized_keys:
+            die(f"duplicate {command} plan field {key!r}")
+        normalized_keys.add(key)
+        if key not in actions or key in ("help", "as_role", "clear_assignment", "tier", "files"):
+            die(f"unknown or unsupported {command} plan field {key!r}")
+        action = actions[key]
+        option = action.option_strings[0]
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            if not isinstance(value, bool):
+                die(f"{command}.{key} must be a JSON boolean")
+            if value:
+                argv.append(option)
+        elif isinstance(action, argparse._AppendAction):
+            if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                die(f"{command}.{key} must be a list of strings")
+            for item in value:
+                argv.extend((option, item))
+        else:
+            if not isinstance(value, (str, int)) or isinstance(value, bool):
+                die(f"{command}.{key} must be a string or integer")
+            argv.extend((option, str(value)))
+    if command in ("assign", "batch"):
+        argv.extend(("--as", "planner"))
+    return parser.parse_args(argv)
+
+
+def cmd_plan_apply(a: argparse.Namespace) -> None:
+    if a.action != "apply":
+        die("use docket plan apply RUN --file plan.json")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", a.run):
+        die("invalid run id")
+    target = run_dir(a.run)
+    if target.exists():
+        die(f"run {a.run} already exists; use granular commands for amendments")
+    try:
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate JSON key {key!r}")
+                result[key] = value
+            return result
+        data = json.loads(Path(a.file).read_text(), object_pairs_hook=unique_object,
+                          parse_constant=lambda value: die(f"invalid JSON constant {value}"))
+    except (OSError, ValueError) as exc:
+        die(f"cannot read plan file: {exc}")
+    if not isinstance(data, dict) or set(data) - {"run", "roots", "tasks", "milestones"}:
+        die("plan must contain run, roots, tasks, and milestones only")
+    run_fields = data.get("run", {})
+    roots = data.get("roots", [])
+    tasks, milestones = data.get("tasks"), data.get("milestones")
+    if not isinstance(roots, list) or any(not isinstance(r, str) for r in roots):
+        die("roots must be a list of alias=path strings")
+    if not isinstance(run_fields, dict) or "root" in run_fields:
+        die("run must be an object; declare checkouts in roots")
+    if not isinstance(tasks, list) or not tasks or not isinstance(milestones, list) or not milestones:
+        die("tasks and milestones must be nonempty lists")
+    run_fields = dict(run_fields)
+    plan_sections = {name: run_fields.pop(name, "") for name in ("risks", "out_of_scope")}
+    policy = run_fields.pop("policy", {})
+    allowed_policy = {"primary_model", "fallback_models", "premium_models", "token_budget",
+                      "review_reserve", "correction_limit", "max_concurrency", "provisional_integration"}
+    allowed_policy.update(f"max_concurrency_{h}" for h in SUPPORTED_HARNESSES)
+    if not isinstance(policy, dict) or set(policy) - allowed_policy:
+        die("run.policy contains an unknown or lifecycle field")
+    for key, value in policy.items():
+        if not isinstance(value, (str, int)) or isinstance(value, bool) or "\n" in str(value) or "\r" in str(value):
+            die(f"run.policy.{key} must be a flat string or integer")
+        if key in ("token_budget", "review_reserve", "correction_limit", "max_concurrency") or key.startswith("max_concurrency_"):
+            try:
+                number = int(value)
+            except ValueError:
+                die(f"run.policy.{key} must be a whole number")
+            if number < (1 if key in ("token_budget", "max_concurrency") or key.startswith("max_concurrency_") else 0):
+                die(f"run.policy.{key} is out of range")
+    if "token_budget" in policy and int(policy.get("review_reserve", 0)) >= int(policy['token_budget']):
+        die("run.policy.review_reserve must be smaller than token_budget")
+    if policy.get("provisional_integration", "forbidden") not in ("forbidden", "allowed"):
+        die("run.policy.provisional_integration must be forbidden or allowed")
+    if any(not isinstance(value, str) for value in plan_sections.values()):
+        die("run risks and out_of_scope must be strings")
+    init = plan_json_arguments(a.parser, "init", a.run, {**run_fields, "root": roots})
+    if not str(init.objective).strip():
+        die("run.objective is required")
+    assignments, creations, closings = [], [], []
+    task_ids, membership = [], []
+    for task in tasks:
+        if not isinstance(task, dict) or not isinstance(task.get("owner"), str):
+            die("each task needs owner and assign fields")
+        fields = dict(task)
+        owner = fields.pop("owner")
+        if owner in task_ids or not re.fullmatch(r"T[0-9]+", owner):
+            die(f"duplicate or invalid task owner {owner!r}")
+        task_ids.append(owner)
+        assignments.append(plan_json_arguments(a.parser, "assign", a.run, fields, [owner]))
+    for assignment in assignments:
+        dependencies = {dep.strip() for spec in assignment.depends_on for dep in spec.split(",")}
+        unknown = sorted(dependencies - set(task_ids))
+        if unknown:
+            die(f"{assignment.owner} depends on unknown task(s): {', '.join(unknown)}; "
+                "assign every dependency in this plan")
+    milestone_ids = set()
+    for milestone in milestones:
+        if not isinstance(milestone, dict):
+            die("each milestone must be an object")
+        fields = dict(milestone)
+        bid, members = fields.pop("id", ""), fields.pop("members", [])
+        if not isinstance(bid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", bid) or bid in milestone_ids:
+            die(f"duplicate or invalid milestone id {bid!r}")
+        milestone_ids.add(bid)
+        if not isinstance(members, list) or not members or any(m not in task_ids for m in members):
+            die(f"milestone {bid} needs assigned members")
+        if set(fields) & {"create", "close", "list", "verify", "approve", "milestone"}:
+            die("milestone lifecycle fields are generated by plan apply")
+        membership.extend(members)
+        creations.append(plan_json_arguments(a.parser, "batch", a.run,
+            {**fields, "create": bid, "members": ",".join(members), "milestone": True}))
+        closings.append(plan_json_arguments(a.parser, "batch", a.run, {"close": bid}))
+    if sorted(membership) != sorted(task_ids):
+        die("each task must belong to exactly one milestone")
+    # Existing commands validate config, roots, intent, cycles, baselines and pins
+    # in a private build; only the complete accepted run is ever made visible.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".plan-", dir=target.parent))
+    stage.rmdir()
+    try:
+        with staged_run_path(a.run, stage), contextlib.redirect_stdout(io.StringIO()):
+            cmd_init(init)
+            plan = stage / "plan.mdx"
+            meta, body = parse(plan.read_text())
+            meta.update({key: str(value) for key, value in policy.items()})
+            for name, value in plan_sections.items():
+                if value:
+                    body = set_section(body, "Risks" if name == "risks" else "Out of scope", value)
+            publish(plan, render(meta, body))
+            for assignment in assignments:
+                cmd_assign(assignment)
+                problems = task_intent_problems(stage, assignment.owner)
+                if problems:
+                    die(f"{assignment.owner}: " + "; ".join(problems))
+            for creation in creations:
+                _batches_cmd_batch(creation)
+            for closing in closings:
+                _batches_cmd_batch(closing)
+            problems = quick_milestone_plan_problems(stage, task_ids[0])
+            if problems:
+                die("; ".join(problems))
+        with owner_lock(target.parent, "plan-" + a.run):
+            if target.exists():
+                die(f"run {a.run} already exists; nothing replaced")
+            os.rename(stage, target)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    print(f"run {a.run}: applied {len(tasks)} task(s), {len(milestones)} closed milestone(s); "
+          f"start with `docket launch {a.run}`")
+
+
+def cmd_launch(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    if os.environ.get("HERDR_ENV") != "1":
+        die("docket launch requires a Herdr pane (HERDR_ENV=1)")
+    if not is_quick_milestone(d) or not list_batches(d):
+        die("launch requires a planned quick milestone run")
+    problems = quick_milestone_plan_problems(d, str(list_batches(d)[0]['members'][0]))
+    if problems:
+        die("; ".join(problems))
+    with owner_lock(d, "launch"):
+        path = conductor_dir(d) / "launch.json"
+        record = read_worker(path)
+        if record:
+            die(f"conductor launch already recorded in {path}; restart docket conduct in its pane")
+        if plan_flag(d, 'round_context', '') != 'shared':
+            die("launch requires round_context: shared; use manual recovery for historical runs")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_arm(argparse.Namespace(run=a.run, role="planner", session="", agent="",
+                harness_session_ref=getattr(a, "harness_session_ref", None)))
+        pane = herdr("pane", "split", "--current", "--direction", "down", "--cwd", str(root()), "--no-focus")["pane"]["pane_id"]
+        publish_json(path, {"pane": pane, "run": a.run, "at": stamp()})
+        herdr("pane", "run", pane, f"{shlex.quote(sys.executable)} {shlex.quote(str(LAUNCHER))} conduct {shlex.quote(a.run)}")
+    print(f"run {a.run}: conductor started in {pane}; planner armed; end your turn")
+
+
+def cmd_finish(a: argparse.Namespace) -> None:
+    d = need_run(a.run)
+    event = run_complete_event(d)
+    if event is None:
+        die("run is not complete; all milestone approvals must remain intact")
+    # Optional feedback and telemetry cannot make an accepted run unfinishable.
+    try:
+        cmd_pickup(argparse.Namespace(run=a.run, role="planner", session=""))
+    except (Exception, SystemExit):
+        pass
+    try:
+        cmd_feedback(argparse.Namespace(run=a.run, add=True, digest=False, list=False,
+            import_ops=False, role="planner", task="", round="", category="other",
+            body=a.feedback, evidence="", log="", since="", top=10, model="", provider="",
+            harness="", origin="agent", prompt_digest="", profile_revisions="", confidence="low"))
+    except (Exception, SystemExit):
+        print("optional feedback unavailable", file=sys.stderr)
+    try:
+        collect_run_usage(d, archive=True)
+    except (Exception, SystemExit):
+        print("optional usage archive unavailable", file=sys.stderr)
+    cmd_disarm(argparse.Namespace(run=a.run, role=None))
+    print(event[1])
+    print(f"run {a.run}: finished; usage archive attempted, watchers disarmed")

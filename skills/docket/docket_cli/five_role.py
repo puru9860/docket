@@ -191,10 +191,17 @@ def run_complete_event(d: Path) -> tuple[str, str, str, int, str] | None:
         signature = ";".join(f"{batch.get('batch')}:{(batch.get('verification') or {}).get('digest')}"
                              for batch in sorted(milestones, key=lambda item: str(item.get("batch"))))
         revision = "sha256:" + hashlib.sha256(signature.encode()).hexdigest()
+        summary = []
+        for batch in sorted(milestones, key=lambda b: str(b['batch'])):
+            verification = batch['verification']
+            members = ", ".join(f"{m}: {state_of(d, str(m))[1]}" for m in batch['members'])
+            summary.append(f"{batch['batch']}: approved; {members}; suite {verification.get('command')!r} "
+                           f"{verification.get('status')} (exit {verification.get('returncode')}); "
+                           f"evidence {verification.get('digest')}")
         return (f"milestones:complete:{revision[7:19]}",
                 f"run {d.name} is complete: {len(milestones)} milestone(s) approved. Tell the "
-                f"user the outcome, record feedback, run `docket usage {d.name} --archive`, "
-                f"and `docket disarm {d.name}`", "", 0, revision)
+                f"user the outcome and run `docket finish {d.name} --feedback TEXT|none`.\n"
+                + "\n".join(summary), "", 0, revision)
     rnd, st = state_of(d, "orch")
     if st not in ("approved", "waived", "completed"):
         return None

@@ -715,13 +715,11 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
                      "The conductor delivers your next obligation; do not watch or arm a wake hook."
                      if role == "reviewer" and conductor_managed(d)
                      else supervisor_wait_step(run, role))
-    if steps:
+    if steps and role != "implementor":
         steps.append(
-            f"Last, record what docket itself cost you this round, or `none`: `docket feedback "
-            f"{run} --add --role {role} --task {owner} --round {state_of(d, owner)[0]} --category "
-            "instruction|discovery|verification|recovery|dispatch|routing|review|delivery|other "
-            "--body \"a missing or unclear instruction, a refusal you worked around, a command "
-            "you had to look up, or waiting\"`.")
+            f"Record Docket friction or `none`: `docket feedback {run} --add --role {role} "
+            f"--task {owner} --round {state_of(d, owner)[0]} --category other --body TEXT`.")
+    if steps:
         parts.append("# Steps\n\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
     parts.append("# Pointers\n\n" + "\n".join(f"- {item}" for item in pointers))
     revisions = [f"renderer: {renderer_revision()}"]
@@ -798,8 +796,7 @@ def quick_coordination_step(d: Path, run: str, owner: str) -> str:
     if conductor_managed(d):
         return (f"Work only milestone {milestone} in this session. After submitting a task, "
                 "end your turn; the conductor delivers the next task or correction. "
-                f"When all members have submitted, run `docket batch {run} --verify {milestone} "
-                "--as implementor` and end your turn. Do not launch a reviewer, start another "
+                "The conductor runs the milestone suite when ready. Do not launch a reviewer, start another "
                 "milestone, run docket watch, or arm a wake hook. Use no subagents.")
     return (f"You coordinate the whole run, so a submitted round is not a stopping point: "
             f"dispatch the next undispatched task of milestone {milestone} at once, without "
@@ -904,6 +901,15 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         return f" --as {acting[0]}" if acting else ""
 
     report = f"{rel}/{owner}-report-{rnd:02d}.mdx"
+    checkout = (f"For selective execution, run `docket bundle {run} {owner} --checkout`; "
+                "use the printed fresh private directory for the frozen contract's focused verify command "
+                "or the milestone command from the packet with the exported directory as cwd "
+                "(multi-root checkouts are under their aliases). Do not routinely rerun the identical suite.")
+    if role in ("reviewer", "verifier", "checker") and owner != 'orch':
+        frozen, _problems = current_bundle(d, owner, rnd)
+        command = str((frozen or {}).get('verification', {}).get('command', ''))
+        if command:
+            checkout += f" Focused check: `cd PRINTED_CHECKOUT && ({command})`; replace PRINTED_CHECKOUT with the printed directory and apply its frozen declared environment."
     decide_as = as_role("decide:approve")
     if role == "reviewer" and is_tiered(d) and owner != "orch":
         milestone = next((str(batch.get("batch")) for batch in list_batches(d)
@@ -928,7 +934,7 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
                            "argument. Put hardening under Notes; propose stronger requirements "
                            "with `docket propose-amendment` for the planner.")
             return [f"Read `docket review-packet {run} --role reviewer --batch {milestone}` ",
-                    review_duty,
+                    review_duty, checkout,
                     f"Approve the milestone once with `docket batch {run} --approve "
                     f"{milestone} --as reviewer --reason TEXT`; request changes for an "
                     f"affected task with `docket decide {run} {owner} --changes --as reviewer`."]
@@ -952,7 +958,7 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         f"`docket decide {run} {owner} --waive --reason TEXT{decide_as}` for a blocker you accept.",
     ]
     if role in ("verifier", "reviewer", "checker"):
-        read = (f"Read the frozen round with `docket bundle {run} {owner}`: the patch, the "
+        read = checkout + " " + (f"Read the frozen round with `docket bundle {run} {owner}`: the patch, the "
                 "report, and the verification as it actually ran.")
         if owner == "orch":
             read = (f"Read `docket review-packet {run} --role reviewer` and the aggregate with "
@@ -1004,9 +1010,10 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         "verify command and any observed output (or say submit will capture it), and decisions needed.",
         f"Run `docket submit {run} {owner} --check` until it passes: it lists exactly what the "
         "gate would refuse and changes nothing, so never read docket's own source to learn the "
-        f"rules. Then submit with `docket submit {run} {owner}{submit_as}`. If you cannot finish honestly, "
+        f"rules. Then submit with `docket submit {run} {owner}{submit_as} --feedback TEXT|none` "
+        "(what Docket cost this round). If you cannot finish honestly, "
         f"write the question under Decisions needed and run `docket submit {run} {owner} "
-        f"--blocked{submit_as}`. Never edit the report after submitting.",
+        f"--blocked{submit_as} --feedback TEXT|none`. Never edit the report after submitting.",
     ]
     task_path = d / f"{owner}-task.mdx"
     if task_path.is_file():
@@ -1019,6 +1026,9 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
             finish.append(
                 f"The declared verify may run for {declared_timeout} seconds. Allow at least "
                 f"{declared_timeout + 30} seconds for a synchronous submit, including its freeze. "
+                + ("Conductor-managed: submit in the foreground; if your shell limit requires "
+                 "background submission, end your turn immediately. Never sleep or poll its log. "
+                 if conductor_managed(d) else "") +
                 f"If your shell call has a shorter limit, use `docket submit {run} {owner}"
                 f"{submit_as} --background`; it returns while the full gate continues in a "
                 "separate process. Read the printed private log path and never start a second "
@@ -1049,7 +1059,10 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         "   - Each changed branch, error and recovery paths included, has an assertion "
         "that fails without your change; see it fail once against the old code. Tests "
         "wait on files or events, never on fixed sleeps.\n"
-        "   - Run a decisive negative control in an isolated copy: show the key test "
+        f"   - For a decisive negative control run `docket bundle {run} {owner} --baseline --checkout` "
+        "and use the printed fresh private directory to run the same focused check. "
+        "Never use git stash or change the user's checkout for a negative control. "
+        "In an isolated copy, show the key test "
         "fails when the guarded behavior is removed; for failure claims, prove the "
         "failure was actually injected into the named component and the test detects "
         "incorrect behavior. Save the observed failing result.\n"

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .common import COVERAGE_AVAILABLE, LAUNCHER, die, stamp
 from .frontmatter import parse, render, sections
-from .paths import latest, reports, root, scope_path
+from .paths import dispatch_path, latest, read_dispatch, reports, root, scope_path
 from .publication import perturb, publish, publish_json
 from .policy import is_five_role, need_run, require_five_role, submit_op_for, topology
 from .baselines import baseline_path, evidence_mode, task_verify
@@ -26,7 +26,11 @@ from .verification import (
     run_verification, task_env, verify_slot_busy, verify_slot_path, verify_slot_refusal,
 )
 from .feedback import machine_feedback
-from .models import record_outcome
+from .models import cmd_feedback, record_outcome
+from .sessions import (harness_session, run_harness_sessions, session_transcripts,
+                       claude_calls, codex_calls, opencode_calls, opencode_session_rows,
+                       _in_window, harness_process_ref, session_until)
+from .liveness import read_registration
 from .gate import gate_problems
 
 
@@ -66,6 +70,68 @@ def drifted_inputs(d: Path, owner: str, rep: Path, verified: dict[str, str]) -> 
     return problems
 
 
+def submission_feedback(d: Path, a: argparse.Namespace, rnd: str) -> None:
+    try:
+        cmd_feedback(argparse.Namespace(run=a.run, add=True, digest=False, list=False,
+            import_ops=False, role=a.as_role or "implementor", task=a.owner, round=str(rnd),
+            category="other", body=a.feedback, evidence="", log="", since="", top=10, model="", provider="",
+            harness="", origin="agent", prompt_digest="", profile_revisions="", confidence="low"))
+    except (Exception, SystemExit):
+        print("feedback could not be recorded; submission remains successful", file=sys.stderr)
+
+
+def apply_submission_observation(d: Path, owner: str, rep: Path) -> None:
+    meta, _ = parse(rep.read_text())
+    observed = submission_model(d, owner)
+    if observed and observed != meta.get("actual_model"):
+        for path in (rep, d / f"{owner}-task.mdx"):
+            if path.is_file():
+                model_meta, model_body = parse(path.read_text())
+                model_meta["actual_model"] = observed
+                history = model_meta.get("model_history", "").split(" -> ")
+                model_meta["model_history"] = " -> ".join([x for x in history if x] + [observed])
+                publish(path, render(model_meta, model_body))
+        dispatch = read_dispatch(d, owner)
+        dispatch["model_observed"] = observed
+        dispatch.setdefault("model_history", []).append({"at": stamp(), "kind": "observed", "model": observed})
+        process = harness_process_ref()
+        if process:
+            dispatch["worker_process"] = process
+        publish_json(dispatch_path(d, owner), dispatch)
+
+
+def submission_model(d: Path, owner: str) -> str:
+    dispatch = read_dispatch(d, owner)
+    if not dispatch or dispatch.get("state") != "dispatched":
+        return ""
+    registration = read_registration(str(dispatch.get("session", "")))
+    ref = harness_session([d.name, owner])
+    if (not ref or registration.get("generation") != dispatch.get("session_generation")
+            or registration.get("workspace") != str(root().resolve())
+            or registration.get("run") != d.name
+            or registration.get("role") != dispatch.get("role")):
+        return ""
+    native = registration.get("native_harness") or {}
+    if any(native.get(k) != ref.get(k) for k in ("harness", "session_id")):
+        return ""
+    noted = next((r for r in run_harness_sessions(d)
+                  if r.get("harness") == ref["harness"] and r.get("session_id") == ref["session_id"]
+                  and dispatch.get("role") in r.get("roles", [])), None)
+    if not noted:
+        return ""
+    try:
+        if ref["harness"] == "opencode":
+            calls, _, _ = opencode_calls(opencode_session_rows(ref["session_id"]))
+        else:
+            files = session_transcripts(ref)
+            calls, _, _ = claude_calls(files[:1]) if ref["harness"] == "claude" else codex_calls(files)
+        observed = [c for c in calls if c.get("model") and
+                    _in_window(str(c.get("at", "")), str(noted.get("first_seen", "")), session_until(d, noted))]
+        return str(max(observed, key=lambda c: str(c.get("at", "")))["model"]) if observed else ""
+    except (OSError, ValueError, TypeError, KeyError):
+        return ""
+
+
 def cmd_submit(a: argparse.Namespace) -> None:
     """The gate. A report becomes visible to the reviewer only if it passes here."""
     d = need_run(a.run)
@@ -101,6 +167,10 @@ def check_submission(a: argparse.Namespace, d: Path) -> None:
     if not rep:
         die(f"no report for {a.owner} in {a.run}")
     meta, body = parse(rep.read_text())
+    if not meta.get("actual_model"):
+        observed = submission_model(d, a.owner)
+        if observed:
+            meta["actual_model"] = observed
     blocked = a.blocked or meta.get("status", "") == "blocked"
     problems = gate_problems(d, a.run, a.owner, rep, meta, body, blocked)
     if problems:
@@ -139,6 +209,7 @@ def background_submit(a: argparse.Namespace, d: Path) -> None:
     child runs the ordinary submit path, holding owner_lock through verify,
     freeze, ledger publication, and the report write.
     """
+    require_five_role(a, d, submit_op_for(d, a.owner))
     lock_path = background_submit_lock(d, a.owner)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     holder = lock_path.open("a+")
@@ -160,6 +231,8 @@ def background_submit(a: argparse.Namespace, d: Path) -> None:
         if verify_slot_busy(slot):
             verify, _ = task_verify(d, a.owner)
             die(verify_slot_refusal(slot, verify or "the registered verify command"))
+        with owner_lock(d, a.owner):
+            apply_submission_observation(d, a.owner, rep)
         job_dir = d / ".submit-jobs"
         job_dir.mkdir(mode=0o700, exist_ok=True)
         os.chmod(job_dir, 0o700)
@@ -176,6 +249,8 @@ def background_submit(a: argparse.Namespace, d: Path) -> None:
             argv.extend(("--verify-timeout", str(a.verify_timeout)))
         if a.as_role:
             argv.extend(("--as", a.as_role))
+        if getattr(a, "feedback", None) is not None:
+            argv.extend(("--feedback", a.feedback))
         env = dict(os.environ, DOCKET_SESSION_CAPTURE="off")
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -214,6 +289,8 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
             f"{rep.name} has status: {status} - reports stay draft until submit; "
             "restore status: draft and run `docket submit`"
         )
+    apply_submission_observation(d, a.owner, rep)
+    meta, body = parse(rep.read_text())
     blocked = a.blocked or status == "blocked"
     task = d / f"{a.owner}-task.mdx"
     verified = submission_identity(d, a.owner, rep)
@@ -370,3 +447,5 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
         record_outcome(d, a.owner, meta.get("round", "?"), "submit", "blocked",
                        sections(parse(rep.read_text())[1]).get("Decisions needed", ""), rep.name)
     print(f"\n{rep.name}: {verdict}")
+    if getattr(a, "feedback", None) is not None:
+        submission_feedback(d, a, meta.get("round", ""))

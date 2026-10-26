@@ -521,7 +521,11 @@ There is no verifier session; the reviewer absorbs its epistemic duties from `re
 The reviewer classifies consequential assumptions as supported with a source, unresolved, or contradictory, requires changes for contradictions, sends intent ambiguity to the planner, and checks consequential outcomes at their actual boundary.
 Static inspection supports presence claims only, and final review rereads the original request.
 An intact passing task bundle settles work for scope reuse and dispatch.
-The implementor runs the planner-declared full suite once per milestone with `docket batch --verify`; only then does the reviewer wake and approve the batch.
+The conductor runs the planner-declared full suite when a milestone becomes verify-ready, through the existing batch verification path under its batch lock.
+The frozen verification records `actor: conductor`; infrastructure claims no implementor, verifier, or reviewer judgment.
+A suite refusal records its event identity and reason, opens one planner stall incident for that identity, and keeps the conductor loop alive without waking a worker to repeat the suite.
+Unchanged refused identities stay suppressed across restart; the incident names the explicit batch verification command for recovery.
+Manual runs retain `docket batch --verify` with the implementor actor; only a passing intact result wakes milestone review.
 A routed blocker can wake review once every unfinished peer has completed implementation or cannot dispatch because of dependencies, including a transitive dependency on that blocker.
 An independent runnable peer still completes its work before the reviewer wakes.
 The reviewer can waive the blocker or request a correction.
@@ -551,6 +555,22 @@ A run whose `plan.mdx` has no workflow key is still read as legacy, and a run th
 An unknown or malformed mode or workflow value refuses with a concrete diagnostic and creates nothing.
 It never falls back to legacy or to standard.
 `docket status` shows each run's mode, so the operating preset is visible without reading `plan.mdx`.
+
+## Atomic plan application and finish
+
+`docket plan apply RUN --file plan.json` translates strict stdlib JSON into the existing init, assign, batch creation, and close argument schemas.
+The file holds run options and flat budget policy, explicit roots, every task, and closed milestones with assignments and reviewer continuity.
+Duplicate keys, unknown fields, malformed IDs, incomplete intent, unknown dependencies, cycles, config restrictions, incomplete baselines, and conflicting assignments refuse the whole operation.
+Milestone closing and the launch/conductor plan checks also refuse task or batch edges whose target has not been assigned.
+The ordinary command paths run against a private stage selected by a process-local context variable, so the documents carry the final run ID and unchanged checkout identities.
+A single rename under a per-run creation lock publishes the complete run; failures remove the unpublished stage and an existing target always refuses.
+No baseline is recaptured and no checkout is modified to obtain one.
+`docket launch RUN` opens one plain conductor pane, registers the planner's own harness binding, arms its hook, and refuses a duplicate recorded launch.
+Granular commands remain available for amendments and recovery.
+
+The quick completion event includes each milestone approval, member verdict, full-suite command, status, exit code, and evidence digest.
+`docket finish RUN --feedback TEXT|none` checks the intact completion projection, receives the wake, records optional feedback, archives run usage, and disarms the run.
+Optional feedback and telemetry failures never invalidate completion.
 
 ## Recorded role assignments
 
@@ -586,7 +606,9 @@ A fresh milestone is a continuation boundary, so a busy older reviewer is never 
 The conductor uses the existing role delivery lock, pending records, announcement lease, received identity, and append-only role ledger.
 It checks idle state immediately before `herdr agent prompt`; successful writes record delivery, while failed or interrupted sends remain retryable after the announcement lease unless picked up.
 The crash contract remains at-least-once; unchanged successfully delivered identities stay quiet across restart and native worker hooks do not provide a competing transport.
-Workers follow a numbered startup sequence: register through dispatch or arm, then pickup, then read role and task guidance.
+Workers follow a numbered startup sequence: register through dispatch or arm, then pickup, then act on the rendered contract without another role playbook read.
+Successful deliveries record per-section hashes of their rendered guidance; continued sessions receive only changed sections and explicit retired-section notices.
+A first delivery or missing history always sends the complete contract.
 Conductor delivery retains the obligation message in the recipient-generation receipt so pickup can show it without a second claim or delivery.
 A receipt whose event no longer matches current state is explicitly non-actionable context; it never supplies lifecycle authority.
 Launch records never supply an observed model or substitute for worker registration.
@@ -611,7 +633,7 @@ A recognized blocked provider error opens one usage-limit incident rather than a
 `health.flag_stall` is the shared incident writer; conductor incidents add `recipient: planner` and derive through the normal planner hook while ordinary health incidents retain their existing destination.
 A startup stall before dispatch has no work to checkpoint; it must not create an unknown-diff checkpoint that hides the initial task event.
 After recovery the planner resolves the incident with the existing health command.
-See [launch and manual fallback](skills/docket/references/launch.md).
+See [conductor operations](skills/docket/references/conductor.md) and [manual fallback](skills/docket/references/launch.md).
 
 ## Prompts, feedback, and improvements
 
@@ -664,7 +686,8 @@ Implementor steps put a self-review before the report, built from the reasons fi
 Implementor self-review includes a decisive negative control in an isolated copy, proving the key test fails when its guard is removed and that claimed failures are actually injected into the named component.
 Verifier prompts map criteria to independent observations, inspect changed tests for false positives, and run one or two decisive negative controls.
 The guidance budgets 2-3 minutes of model work plus declared check runtime, recording material gaps as uncertainty rather than a rushed pass and avoiding duplicate runs of an identical captured suite.
-Planner guidance defines a milestone as one demonstrable capability, normally 2-4 tasks, and sizes each task by a checkable behavior with meaningful tests that fits one context.
+Planner guidance defaults to one milestone and sizes each task by a checkable behavior with meaningful tests that fits one context.
+Additional milestones require a real intermediate approval checkpoint: a risky foundation, independently shippable parts, or work exceeding one implementor context.
 Shared discovery and invariants justify merging; independent acceptance or context overflow justify splitting.
 Acceptance states the failure model and explicitly excluded failure classes before implementation.
 `docket submit --check` runs the same structural checks a submission would and prints what they refuse, with no verify run, freeze, or write; live implementors otherwise read the gate's own source to learn the report rules. An unknown Evidence artifact is refused with the list of what an artifact can be and where to save a real run's output (`.docket/runs/<run>/evidence/`, outside every task diff).
@@ -683,7 +706,8 @@ Codex roles keep working in their session, and runs without the field retain sha
 Every draft report round, at assignment, at dispatch, and when a correction opens, is seeded with the task's acceptance criteria as unchecked boxes when it still holds the template placeholder, because retyping them exactly is the commonest way a worker fails the gate; nothing a worker wrote is ever replaced.
 
 Feedback is embedded in every run so bottlenecks surface as docket is used.
-Every rendered prompt ends with a step asking the role to record what docket itself cost it that round, or `none`, and `docket feedback --add` ties the report to the dispatch's prompt digest and model automatically.
+Implementor prompts fold round feedback into `docket submit --feedback TEXT|none`; other roles retain a compact feedback step.
+The feedback record binds to the dispatch prompt digest and model automatically, and optional feedback failure never blocks submission.
 Each record is also appended to a user-level log (`~/.local/state/docket/feedback.jsonl`, `DOCKET_FEEDBACK_LOG` to move it, `off` to disable), so observations accumulate across runs and projects.
 docket appends machine observations of its own at the points that cost roles effort, at no model cost: a gate refusal, a prompt rebound after the task changed, a resume, and an exhausted correction budget.
 `docket feedback --digest` summarizes the log by role, category, and recurring item; the `none` reports are the denominator that shows which roles and stages run without friction.
@@ -709,6 +733,10 @@ A supervisor routinely runs commands on another role's behalf, arming the verifi
 A command names its role by its own `--as`/`--role`, so a planner's `assign --as planner` is noted as the planner rather than falling into the new quick default of implementor.
 An explicit transport registration (`arm --session`, `session --register`, `dispatch --register`) made from the session noted for that same role also records the session's native and process identity (`native_harness`, `native_process`) in the registration, which is what lets the companion prove its terminal; a registration for another role, or one that already holds an identity, is never given the caller's.
 `docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) as one record per model call and counts the calls inside the session's run window. The window opens when the role first joined this run and closes at the earlier of the run's end (its last decision plus a wrap-up allowance that also covers the run's own closing feedback) and the moment the same session was first noted by another run, so a TUI kept open or reused after `/clear` never inflates a closed run. Codex's cumulative counter becomes per-call deltas over every shard of the thread, the resumed `rollout-<time>-<sid>_<shard>.jsonl` continuation included once its own session_meta names the thread; a repeated reading is not another call. Each session also splits its totals by model call by call, so one OpenCode session that moved between three models no longer counts its whole total under each of them, and model scorecards use that split. A transcript with no call inside the window reports `telemetry: empty`, a gap rather than zero tokens. A command an OpenCode subagent runs is credited to its root session, whose usage already sums its subagents. `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the run-window usage there, and the final aggregate verdict archives automatically.
+Submission observes the latest model call from the exact dispatch-bound native session and registration generation, inside its noted run window.
+`submit --check` uses the observation without writing; submission records it in the report, task, and dispatch before capturing verification identity.
+Without an observation the actual-model refusal remains; launch requests never supply observations.
+A detached submission captures the observation in its proven parent before detaching.
 When a worker records its actual model from inside its harness, the live
 dispatch also records that proven harness process identity. If a draft round
 still holds the dispatch 60 seconds after that process exits, `docket health`
@@ -839,9 +867,9 @@ The check runs before a premium dispatch, resume, or model switch; an ongoing
 session can consume more tokens, so this is an admission guard, not a hard
 account spend limit. If any noted session's usage is unavailable, the guard
 refuses a new premium launch. Missing cost and model telemetry reads `unknown`,
-and tokens are not a currency guarantee. The account-wide Codex usage reading
-also derives one planner wake per warning threshold and current reset window;
-the Stop hook can deliver that wake without a status poll.
+and tokens are not a currency guarantee. The account-wide Codex usage reading shows informational threshold warnings in status and conductor output.
+Only an exhausted window derives a planner wake; a refused premium conductor launch opens a planner-directed stall incident.
+The usage-limit stall recovery path stays unchanged.
 Task sizing warns on guessed breadth without ever rejecting on file
 count.
 
@@ -1116,8 +1144,12 @@ aggregate.
 The address is `sha256` over the manifest, which itself carries a `sha256` of every
 artifact beside it. So a bundle cannot be edited without changing its own name, and a
 later workspace edit, a later report edit, a retry, or a whole later round can only ever
-produce a *different* address. `docket bundle <run> <owner>` recomputes every artifact
-digest and reports `DAMAGED` rather than showing evidence it cannot vouch for.
+produce a *different* address. `docket bundle <run> <owner>` recomputes every artifact digest and reports `DAMAGED` rather than showing evidence it cannot vouch for.
+Its `--checkout [DIR]` variant exports frozen source trees outside every declared checkout and the workspace; omitting DIR allocates a fresh private directory and prints its path.
+`--baseline` exports the pinned baseline for a negative control.
+Before submission, the baseline variant rebuilds the captured snapshot; afterwards it uses the immutable bundle baseline, including an explicit `--round`.
+Exports use run-private Git indexes and object storage, read raw blobs without smudge filters, preserve symlinks and executable modes, and publish a complete destination with one rename.
+Multiple roots are separate alias directories; unavailable trees or damaged evidence refuse without publishing a destination.
 
 A bundle is self-contained on purpose. `.snapshots/` is where a baseline is *captured*,
 not where it is kept for review, so the record and the three reconstruction artifacts of

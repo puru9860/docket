@@ -284,9 +284,9 @@ class FlowChanges(unittest.TestCase):
 
     def test_planner_guidance_defines_capability_and_context_sizing(self):
         guidance = self.cli("help", "planner").stdout
-        for phrase in ("one demonstrable capability", "2-4 tasks", "one working context",
+        for phrase in ("one demonstrable capability", "default to one milestone", "one working context",
                        "shared discovery", "failure model", "excluded failure classes",
-                       "different milestones"):
+                       "real intermediate approval checkpoint"):
             self.assertIn(phrase, guidance.lower())
         verifier = self.cli("help", "verifier").stdout
         self.assertIn("2-3 minutes", verifier)

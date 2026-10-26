@@ -8,19 +8,15 @@ Mechanically enforceable parts remain in `docket submit`.
 
 ## honest-acceptance
 
-Build a criterion-to-observation map, inspect changed tests for false positives, and run one or two decisive negative controls for the highest-risk claims in an isolated copy.
-Budget 2-3 minutes of model work plus declared check runtime; a verifier records `uncertain` for missing material evidence, while a quick reviewer requests changes or an explicit qualified waiver rather than a rushed approval.
-Do not rerun an identical captured suite or require a mutation for every branch.
-Prove each acceptance claim honestly from observable behavior.
-Keep actual-output provenance separate from independently derived expectations, exercise materially different inputs when the behavior depends on input, and state any unverified condition explicitly.
-A check that fails when the behavior is removed in an isolated copy is the minimum evidence that the check observes the claimed behavior.
-For a failure or concurrency criterion, confirm a test injects that failure into the component the criterion names, such as killing the writing process rather than a bystander, and that every case starts from the state it claims rather than from what an earlier case left behind.
-Look for sibling sites that share the defect, including another caller, mode, or path through the same behavior; either test them or explain why they differ.
-Prove existing behavior still works where the change could disturb it, with a focused regression assertion rather than an unchanged broad-suite result.
-Check side effects on things the change did not create, such as pre-existing files, records, sessions, and user data.
-A passing happy path does not prove those effects stayed within the task contract.
-Derive important expectations independently and challenge green-but-wrong results with selective boundary and negative checks.
-Use conditional baseline-red checks when needed to establish that a test distinguishes the claimed fix; contain risky execution in an isolated copy.
+Build a criterion-to-observation map from independently derived expectations; inspect changed tests for false positives.
+Run one or two decisive negative controls for highest-risk claims in an isolated copy; do not require a mutation for every branch.
+Budget 2-3 minutes of model work plus declared check runtime; record `uncertain` (verifier) or request changes/qualified waiver (quick reviewer) for material gaps.
+Do not rerun an identical captured suite.
+Keep actual-output provenance separate from expected values; vary inputs when behavior depends on input and state unverified conditions.
+For failure/concurrency claims, check each test injects that failure into the component the criterion names and every case starts from the state it claims.
+Check sibling sites, preservation of existing behavior with focused regression assertions, and side effects on pre-existing files, records, sessions, and user data.
+A happy path does not prove preservation.
+Challenge green-but-wrong results with selective boundary and negative checks; use conditional baseline-red checks to establish that a test distinguishes the fix.
 
 ## offline-operation
 

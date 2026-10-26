@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -33,7 +34,8 @@ from .signalling import ledger_for
 from .health import flag_stall
 from .prompts import compose_prompt
 from .dispatch import guard_review_reserve
-from .batches import quick_milestone_implementation_problem, quick_milestone_plan_problems
+from .batches import cmd_batch_verify, quick_milestone_implementation_problem, quick_milestone_plan_problems
+from .events import codex_budget_events
 
 
 class HerdrError(Exception):
@@ -206,7 +208,13 @@ def ensure_worker(d: Path, batch: dict, role: str, agents: list[dict]) -> dict:
         assignment = assignment_role(batch, role)
         if not assignment:
             die(f'milestone {bid} has no recorded {role} assignment')
-        guard_review_reserve(d, str(assignment['model']))
+        refusal = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(refusal):
+                guard_review_reserve(d, str(assignment['model']))
+        except SystemExit:
+            conductor_stall(d, {}, f'premium launch refused for {bid}: ' + refusal.getvalue().strip())
+            return {}
         if role == 'reviewer' and batch.get('reviewer_context') == 'continue':
             candidate = previous_reviewer(d, batch)
             if candidate and not candidate.get('closed_at') and matching_agent(candidate, agents):
@@ -284,7 +292,13 @@ def idle_worker(record: dict) -> bool:
         raise
 
 
-def worker_prompt(d: Path, batch: dict, record: dict, event: dict) -> str:
+def conductor_prompt_sections(prompt: str) -> dict[str, str]:
+    chunks = re.split(r"(?m)(?=^# )", prompt)
+    return {chunk.splitlines()[0]: chunk.strip() for chunk in chunks if chunk.strip()}
+
+
+def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
+                  section_hashes: dict | None = None) -> str:
     role, bid, sid = record['role'], str(batch['batch']), record['session']
     owner = str(event.get('owner') or '')
     header = (f"You are the {role} for Docket run {d.name}, milestone {bid}, in a conductor-managed "
@@ -302,7 +316,7 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict) -> str:
     header += ("\nStartup, in this exact order:\n\n"
                f"1. Register first: `{register}`.\n"
                f"2. Then pick up the delivery: `docket pickup {d.name} --role {role} --session {sid}`.\n"
-               f"3. Read `docket help {role}` and any bound prompt from step 1, then handle the obligation below.\n\n")
+               f"3. Handle the contract below; it is the bound guidance. No role help read is needed.\n\n")
     header += f"Obligation {event['key']}: {event['message']}\n"
     if str(event['key']).startswith('instruction:'):
         iid = str(event['key']).split(':')[1]
@@ -314,7 +328,21 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict) -> str:
     if owner:
         prompt, _info = compose_prompt(d, d.name, owner, role,
                                       stage='review' if role == 'reviewer' else '')
-        header += '\n' + prompt
+        rendered = conductor_prompt_sections(prompt)
+        if section_hashes is not None:
+            section_hashes.update({name: hashlib.sha256(body.encode()).hexdigest()
+                                   for name, body in rendered.items()})
+        previous = record.get('prompt_sections') or {}
+        if previous:
+            changed = [body for name, body in rendered.items()
+                       if previous.get(name) != hashlib.sha256(body.encode()).hexdigest()]
+            removed = [name for name in previous if name not in rendered]
+            header += '\nContinued context: retain unchanged contract and duties. Changed sections follow.\n'
+            if removed:
+                header += 'Retired sections: ' + ', '.join(removed) + '\n'
+            header += '\n\n'.join(changed)
+        else:
+            header += '\n' + prompt
     header += (f"\nAfter {'submitting or running the milestone suite' if role == 'implementor' else 'deciding'}, "
                "end your turn. The conductor will deliver the next obligation.\n")
     return header
@@ -324,7 +352,8 @@ def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
     role, key = record['role'], str(event['key'])
     if paused_flag(d, role).is_file() or not idle_worker(record):
         return
-    prompt = worker_prompt(d, batch, record, event)
+    section_hashes = {}
+    prompt = worker_prompt(d, batch, record, event, section_hashes)
     # This is the same lock used by hook announcement and pickup, including the send.
     with delivery_lock(d, role):
         sweep_role(d, role)
@@ -366,6 +395,8 @@ def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
                 log.seek(0, os.SEEK_END)
                 log.write(key + '\n')
                 log.flush()
+        if section_hashes:
+            record['prompt_sections'] = section_hashes
         record.update(last_delivery_at=stamp(), last_delivery_key=key)
         publish_json(worker_path(d, str(batch['batch']), role), record)
         delivery_log(d, role, {'kind': 'delivered', 'key': key, 'transport': 'herdr',
@@ -516,10 +547,56 @@ def monitor_workers(d: Path, batches: list[dict], stall_seconds: float) -> None:
         publish_json(worker_path(d, record['milestone'], role), record)
 
 
+def conduct_batch_verification(d: Path, batch: dict, event: dict) -> None:
+    identity = {key: event.get(key) for key in ('key', 'role', *IDENTITY_FIELDS)}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    path = conductor_dir(d) / 'verification-refusals' / f'{digest}.json'
+    refusal = read_worker(path)
+    if not refusal:
+        detail = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(detail):
+                cmd_batch_verify(argparse.Namespace(verify=str(batch['batch']), command='', timeout=900,
+                    as_role='', verification_actor='conductor'), d)
+            return
+        except SystemExit as exc:
+            reason = detail.getvalue().strip() or str(exc.code)
+            refusal = {'event': identity, 'reason': reason, 'at': stamp()}
+            publish_json(path, refusal)
+    if refusal.get('incident'):
+        return
+    # Persist the refused identity before flagging, so restart finishes the notice
+    # without rerunning an unchanged suite or waking a worker to run it instead.
+    cause = (f"conductor milestone {batch['batch']} verification refused [{digest}]: "
+             f"{refusal['reason']}; after recovery run "
+             f"docket batch {d.name} --verify {batch['batch']} --as implementor")
+    incident = next((item for item in list_incidents(d)
+                     if item.get('cause') == cause and item.get('recipient') == 'planner'), None)
+    if incident is None:
+        owner = next((str(member) for member in batch['members']
+                      if state_of(d, str(member))[1] not in ('approved', 'waived', 'completed')),
+                     str(batch['members'][0]))
+        incident = flag_stall(d, owner, cause, recipient='planner', checkpoint=False)
+    publish_json(path, {**refusal, 'incident': incident['id']})
+
+
 def conduct_once(d: Path, stall_seconds: float = 300) -> bool:
     agents = herdr('agent', 'list')['agents']
     batches = sorted([b for b in list_batches(d) if b.get('milestone') and b.get('state') == 'closed'],
                      key=lambda b: milestone_sort_key(str(b['batch'])))
+    warning_path = conductor_dir(d) / 'budget.json'
+    warnings = {key: message for key, message, _revision in codex_budget_events(d, actionable=False)}
+    previous_warnings = read_worker(warning_path)
+    for key, message in warnings.items():
+        if previous_warnings.get(key) != message:
+            print(message, flush=True)
+    if warnings != previous_warnings:
+        publish_json(warning_path, warnings)
+    implementation = derive_events(d, 'implementor')
+    for event in implementation:
+        if ':verify-ready:' in str(event['key']):
+            bid = str(event['key']).split(':')[1]
+            conduct_batch_verification(d, next(b for b in batches if str(b['batch']) == bid), event)
     implementation = derive_events(d, 'implementor')
     approvals = {str(ev['key']).split(':')[1] for ev in implementation
                  if str(ev['key']).startswith('batch:') and str(ev['key']).endswith(':approved')}
@@ -554,7 +631,7 @@ def conduct_once(d: Path, stall_seconds: float = 300) -> bool:
     for role, derived in (('implementor', implementation), ('reviewer', derive_events(d, 'reviewer'))):
         for event in derived:
             key = str(event['key'])
-            if key.endswith(':approved') or key.startswith('launch:'):
+            if key.endswith(':approved') or key.startswith('launch:') or ':verify-ready:' in key:
                 continue
             batch = event_batch(event, batches)
             if not batch and key.startswith('instruction:'):
@@ -572,7 +649,8 @@ def conduct_once(d: Path, stall_seconds: float = 300) -> bool:
                     d, str(event['owner'])):
                 continue
             record = ensure_worker(d, batch, role, agents)
-            deliver(d, batch, record, event)
+            if record:
+                deliver(d, batch, record, event)
     monitor_workers(d, batches, stall_seconds)
     return False
 

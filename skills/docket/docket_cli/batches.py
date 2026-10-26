@@ -477,6 +477,9 @@ def _cmd_batch(a: argparse.Namespace) -> None:
         batch = read_batch(d, a.close)
         if not batch:
             die(f"no batch {a.close!r} in {a.run}")
+        problems = unassigned_batch_dependencies(d, batch)
+        if problems:
+            die("; ".join(problems))
         if batch.get("state") == "closed":
             print(f"batch {a.close} is already closed "
                   f"(generation {batch.get('generation', 1)}); membership unchanged")
@@ -548,6 +551,18 @@ def _cmd_batch(a: argparse.Namespace) -> None:
           + (" (milestone)" if a.milestone else ""))
 
 
+def unassigned_batch_dependencies(d: Path, batch: dict) -> list[str]:
+    problems = []
+    edges = batch.get("depends_on") or {}
+    for member in batch.get("members", []):
+        dependencies = set(task_depends_on(d, str(member))) | set(edges.get(str(member), []))
+        for dependency in sorted(dependencies):
+            if not (d / f"{dependency}-task.mdx").is_file():
+                problems.append(f"milestone {batch.get('batch')} member {member} depends on "
+                                f"unassigned task {dependency}; assign it before closing or launching")
+    return problems
+
+
 def quick_milestone_plan_problems(d: Path, owner: str) -> list[str]:
     """All quick tasks and closed milestone membership precede implementation."""
     if not is_quick_milestone(d) or owner == "orch":
@@ -562,7 +577,8 @@ def quick_milestone_plan_problems(d: Path, owner: str) -> list[str]:
             key = str(member)
             membership[key] = membership.get(key, 0) + 1
     covered = set(membership)
-    problems = []
+    problems = [problem for batch in milestones
+                for problem in unassigned_batch_dependencies(d, batch)]
     if not planned:
         problems.append("the plan names no tasks")
     if planned - assigned:
@@ -703,6 +719,7 @@ def _cmd_batch_verify_locked(a: argparse.Namespace, d: Path, bid: str) -> None:
                         "reason": "the run declares evidence_mode: documents-only"}
     verification: dict[str, object] = {
         "command": command,
+        "actor": str(getattr(a, "verification_actor", "") or getattr(a, "as_role", "") or "orchestrator"),
         "status": str(record.get("status", "")),
         "returncode": record.get("returncode"),
         "output_fingerprint": record.get("output_fingerprint", ""),

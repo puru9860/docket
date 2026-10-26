@@ -7816,7 +7816,10 @@ class DocketCLI(unittest.TestCase):
         self.cli("arm", "demo", "--role", "planner")
         env = {"CODEX_HOME": str(home)}
         events = self.cli_env(env, "events", "demo", "--role", "planner", "--peek").stdout
-        self.assertIn("Codex budget warning", events)
+        self.assertNotIn("Codex budget warning", events)
+        status = self.cli_env(env, "status", "demo").stdout
+        self.assertIn("Codex budget warning", status)
+        rollout.write_text(rollout.read_text().replace("75", "100"))
         wake = self.cli_env(env, "watch", "demo", "--role", "planner", "--timeout", "0",
                             ok=False)
         self.assertEqual(2, wake.returncode)
@@ -10705,8 +10708,8 @@ class DocketCLI(unittest.TestCase):
             self.assertIn(f"docket arm <run> --role {role}", signalling)
         self.assertNotIn("Combined topology uses only the\norchestrator role", signalling)
         skill = (self._skill_root() / "SKILL.md").read_text()
-        self.assertIn("docket arm R01 --role planner", skill)
-        self.assertIn("docket conduct R01", skill)
+        self.assertIn("docket launch R01", skill)
+        self.assertIn("docket plan apply R01", skill)
         self.assertIn("Worker hooks stay silent", skill)
         launch = (self._skill_root() / "references" / "launch.md").read_text()
         self.assertIn("Arm your wake once with `docket arm R01 --role <role>`", launch)
@@ -13764,8 +13767,8 @@ class DocketCLI(unittest.TestCase):
         self.assertIn("# Steps", initial)
         self.assertIn("`.docket/runs/steps/T01-scope.mdx`", initial)
         self.assertIn("`docket scope steps T01 --submit`", initial)
-        self.assertIn("`docket submit steps T01 --as implementor`", initial)
-        self.assertIn("`docket submit steps T01 --blocked --as implementor`", initial)
+        self.assertIn("`docket submit steps T01 --as implementor --feedback TEXT|none`", initial)
+        self.assertIn("`docket submit steps T01 --blocked --as implementor --feedback TEXT|none`", initial)
         self.assertIn("`.docket/runs/steps/T01-report-01.mdx`", initial)
         # The checks first rounds most often missed come before the report.
         review = initial.index("check your work the way the reviewer will")
@@ -13803,7 +13806,7 @@ class DocketCLI(unittest.TestCase):
         legacy = self.init_legacy_as("old", evidence_mode="documents-only")
         self.assign_simple_in(legacy, "old", "T01")
         old = self.prompt_text_in("old", "T01", "implementor")
-        self.assertIn("`docket submit old T01`", old)
+        self.assertIn("`docket submit old T01 --feedback TEXT|none`", old)
         self.assertNotIn("--as", old)
 
     def prompt_text_in(self, run_id: str, owner: str, role: str) -> str:
@@ -14773,7 +14776,7 @@ class DocketCLI(unittest.TestCase):
         self.assign_simple_in(run, "fb", "T01")
         self.cli("dispatch", "fb", "T01", "--session", "w1", "--register")
         prompt = self.prompt_text_in("fb", "T01", "implementor")
-        self.assertIn("`docket feedback fb --add --role implementor --task T01 --round 1", prompt)
+        self.assertIn("docket submit fb T01 --as implementor --feedback TEXT|none", prompt)
         self.cli("feedback", "fb", "--add", "--role", "implementor", "--task", "T01",
                  "--round", "1", "--category", "instruction",
                  "--body", "had to look up the scope capsule format")

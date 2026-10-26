@@ -38,7 +38,7 @@ from .conductor import cmd_conduct, cmd_reopen
 from .commands import (
     cmd_assign, cmd_batch_entry, cmd_bundle, cmd_depend, cmd_diff, cmd_handoff, cmd_init,
     cmd_migrate, cmd_preflight, cmd_roots, cmd_scope, cmd_set_model, cmd_status,
-    cmd_validate_task,
+    cmd_validate_task, cmd_plan_apply, cmd_launch, cmd_finish,
 )
 
 
@@ -87,6 +87,21 @@ def main() -> None:
             pass
     p = argparse.ArgumentParser(prog="docket", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("plan", help="apply one complete JSON plan atomically")
+    q.add_argument("action", choices=("apply",))
+    q.add_argument("run")
+    q.add_argument("--file", required=True)
+    q.set_defaults(fn=cmd_plan_apply, parser=p)
+
+    q = sub.add_parser("launch", help="open the conductor pane and arm this planner")
+    q.add_argument("run")
+    q.set_defaults(fn=cmd_launch)
+
+    q = sub.add_parser("finish", help="receipt completion, record feedback, archive usage and disarm")
+    q.add_argument("run")
+    q.add_argument("--feedback", required=True, help="planner feedback text or none")
+    q.set_defaults(fn=cmd_finish)
 
     q = sub.add_parser("discuss", help="exchange attributed peer messages outside the coding lifecycle")
     q.add_argument("discussion", nargs="?", help="stable discussion ID, e.g. C01")
@@ -238,6 +253,7 @@ def main() -> None:
     q.add_argument("--skip-verify", action="store_true", help="skip the task's verify command")
     q.add_argument("--skip-verify-reason", default="", help="required audit reason when skipping verification")
     q.add_argument("--verify-timeout", type=int, help="override the task-level timeout")
+    q.add_argument("--feedback", default=None, help="round feedback text or none; optional, never a gate")
     q.add_argument("--background", action="store_true",
                    help="run the full submit transition detached from a short harness shell call")
     q.add_argument("--check", action="store_true",
@@ -536,6 +552,10 @@ def main() -> None:
     q.add_argument("--round", type=int, help="a specific round; default is the newest")
     q.add_argument("--list", action="store_true", help="list every bundle frozen for this owner")
     q.set_defaults(fn=cmd_bundle)
+
+    q.add_argument("--checkout", nargs="?", const="", default=None, metavar="DIR",
+                   help="export frozen trees; omit DIR for a fresh private directory")
+    q.add_argument("--baseline", action="store_true", help="materialize the task baseline for negative controls")
 
     q = sub.add_parser("depend", help="record consumption of another task's frozen evidence")
     q.add_argument("run")

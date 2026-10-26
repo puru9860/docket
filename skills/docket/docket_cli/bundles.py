@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 
 from .common import EMPTY_TREE_SHA1, SHA_DIGEST_RE
-from .paths import root
+from .paths import latest, reports, root
 from .publication import fault, keep_private, publish_bytes, publish_json
 from .evidence import empty_tree, git_argv, git_env, git_raw, is_state_path, state_prefix
 from .roots import declared_roots, root_identity
@@ -713,3 +713,139 @@ def publish_bundle(
 
 
 VERIFY_OUTPUT_KEYS = ("stdout_text", "stderr_text", "stdout_bytes", "stderr_bytes")
+
+
+def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
+                            baseline: bool = False, rnd: int | None = None) -> None:
+    """Export pinned trees through private indexes, never through the measured checkout."""
+    import tempfile
+    from .common import die
+
+    roots = declared_roots(d)
+    private_parent = None
+    if destination is None:
+        surfaces = [root().resolve(), *(Path(str(record['path'])).resolve() for record in roots)]
+        candidates = [Path(os.environ[key]).expanduser().resolve()
+                      for key in ('TMPDIR', 'TEMP', 'TMP') if os.environ.get(key)]
+        candidates.extend(Path(name) for name in ('/tmp', '/var/tmp', '/usr/tmp'))
+        parent = next((path for path in candidates if path.is_dir()
+                       and os.access(path, os.W_OK | os.X_OK)
+                       and all(path != surface and surface not in path.parents for surface in surfaces)), None)
+        if parent is None:
+            die("no temporary directory outside the checkout roots; use --checkout DIR")
+        private_parent = Path(tempfile.mkdtemp(prefix="docket-checkout-", dir=parent))
+        destination = private_parent / "tree"
+    else:
+        destination = destination.expanduser().resolve()
+    try:
+        for record in roots:
+            checkout = Path(str(record['path'])).resolve()
+            if destination == checkout or checkout in destination.parents or destination in checkout.parents:
+                die("--checkout must be outside every declared checkout, including its ancestors")
+        if destination == root() or root() in destination.parents:
+            die("--checkout must be outside the workspace")
+        if destination.exists():
+            die(f"checkout destination already exists: {destination}")
+        if not destination.parent.is_dir():
+            die("checkout destination parent must exist")
+        trees = []
+        selected_round = rnd
+        if baseline and rnd is None:
+            report = latest(reports(d, owner))
+            if report:
+                from .frontmatter import parse
+                selected_round = int(parse(report.read_text())[0].get('round', '1'))
+        entry = latest_bundle(d, owner, selected_round)
+        if baseline and not entry and rnd is None:
+            records, problem = baseline_roots(d, 'run' if owner == 'orch' else owner)
+            if problem:
+                die(f"baseline unavailable: {problem}")
+            for record in records:
+                tree, problem = baseline_tree(d, 'run' if owner == 'orch' else owner, record)
+                if problem:
+                    die(f"baseline unavailable: {problem}")
+                problems = tree_problems(d, record, [tree])
+                if problems:
+                    die("DAMAGED: " + "; ".join(problems))
+                trees.append((record, tree))
+        else:
+            if not entry:
+                die(f"no frozen evidence bundle for {owner}")
+            problems = bundle_problems(d, owner, entry)
+            if problems:
+                die("DAMAGED: " + "; ".join(problems))
+            manifest = load_bundle(d, owner, entry)
+            records = {str(r['alias']): r for r in manifest['baseline']['roots']}
+            source_roots = (manifest['patch'].get('roots', []) if baseline else manifest['source'].get('roots', []))
+            for source in source_roots:
+                record = dict(records[str(source['alias'])])
+                if not record.get('git_dir'):
+                    record.update(next((r for r in roots if r['alias'] == source['alias']), {}))
+                trees.append((record, str(source['baseline_tree'] if baseline else source['tree'])))
+            if not trees:
+                die("frozen tree unavailable; documents-only evidence has no checkout")
+        stage = Path(tempfile.mkdtemp(prefix='.docket-checkout-', dir=destination.parent))
+        try:
+            for record, tree in trees:
+                alias = str(record['alias'])
+                if not alias or Path(alias).name != alias or alias in ('.', '..'):
+                    die("DAMAGED: invalid root alias")
+                output = stage if len(trees) == 1 else stage / alias
+                output.mkdir(exist_ok=True)
+                env = private_git_env(d, record, f'checkout.{os.getpid()}.{alias}.index')
+                index = Path(env['GIT_INDEX_FILE'])
+                index.unlink(missing_ok=True)
+                try:
+                    code, _, err = private_git(env, root(), 'read-tree', tree)
+                    if not code:
+                        code, entries, err = private_git(env, root(), 'ls-files', '--stage', '-z')
+                    if not code:
+                        export_index_entries(env, output, entries)
+                    if code:
+                        die(f"frozen tree unavailable: {first_line(err)}")
+                finally:
+                    index.unlink(missing_ok=True)
+            os.rename(stage, destination)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    except BaseException:
+        if private_parent is not None:
+            shutil.rmtree(private_parent, ignore_errors=True)
+        raise
+    print(f"materialized {'baseline' if baseline else 'frozen bundle'} for {owner}: {destination}")
+    if len(trees) > 1:
+        print("roots: " + ', '.join(str(record['alias']) for record, _ in trees))
+    print("Run the registered focused or milestone suite with this directory as cwd; "
+          "multi-root exports place each checkout under its alias.")
+
+
+def export_index_entries(env: dict[str, str], output: Path, entries: bytes) -> None:
+    from .common import die
+
+    parsed = []
+    for entry in entries.split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, oid, _stage = metadata.decode().split()
+        relative = Path(os.fsdecode(name))
+        if relative.is_absolute() or any(part in ("..", ".git") for part in relative.parts):
+            die("DAMAGED: unsafe path in frozen tree")
+        parsed.append((mode, oid, relative))
+    symlinks = {path for mode, _oid, path in parsed if mode == '120000'}
+    if any(parent in symlinks for _mode, _oid, path in parsed for parent in path.parents):
+        die("DAMAGED: frozen tree traverses a symlink")
+    for mode, oid, relative in parsed:
+        target = output / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if mode == '160000':
+            target.mkdir(exist_ok=True)
+            continue
+        code, data, err = private_git(env, root(), 'cat-file', 'blob', oid)
+        if code:
+            die("frozen blob unavailable: " + first_line(err))
+        if mode == '120000':
+            target.symlink_to(os.fsdecode(data))
+        else:
+            target.write_bytes(data)
+            target.chmod(0o755 if mode == '100755' else 0o644)

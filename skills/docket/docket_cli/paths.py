@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -19,8 +21,21 @@ def root() -> Path:
     return here
 
 
+_RUN_BUILD_PATH = contextvars.ContextVar("docket_run_build_path", default=None)
+
+
+@contextlib.contextmanager
+def staged_run_path(run: str, path: Path):
+    token = _RUN_BUILD_PATH.set((run, path))
+    try:
+        yield
+    finally:
+        _RUN_BUILD_PATH.reset(token)
+
+
 def run_dir(run: str) -> Path:
-    return root() / STATE_DIR / "runs" / run
+    staged = _RUN_BUILD_PATH.get()
+    return staged[1] if staged and staged[0] == run else root() / STATE_DIR / "runs" / run
 
 
 def _seq_key(p: Path) -> tuple[tuple[int, ...], str]:
