@@ -56,7 +56,7 @@ Launch arguments come only from the user config, so a repository cannot enable a
 | 3. Conductor, reopen, stall detection | Done; verified in live runs with one and two milestones |
 | 4. Friction from the eval and the live runs | Done |
 | 5. Risk-triggered pre-dispatch oracle check, historical support boundary, removal of obsolete paths | Not started |
-| 6. Premium-turn reduction | Done; one live rerun measured |
+| 6. Premium-turn reduction | Done; two live reruns measured |
 
 Planner-as-writer was considered and dropped: the planner never implements.
 
@@ -76,4 +76,6 @@ Changes:
 - The planner defaults to one milestone unless an intermediate approval is a real checkpoint.
 - Fixed a race in which concurrent source captures shared one scratch index and refused an unchanged approval; refusals now name the moved member, root, or paths.
 
-On a two-milestone eval task, the planner went from 25 turns to 13, and its premium tokens fell by about half.
+On the same eval task, the planner went from 25 turns and 1.47M tokens to 10 turns and 0.55M.
+Opus and Codex together used 1.99M, against 2.64M for a flow in which Opus implements and Codex reviews, with every hidden test passing in both.
+This is one run per configuration; more tasks are needed before trusting the margin.
