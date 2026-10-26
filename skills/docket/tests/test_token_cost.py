@@ -157,6 +157,39 @@ class TokenCost(unittest.TestCase):
         busy = self.cli('dispatch', 'demo', 'T02', '--session', 'other', ok=False)
         self.assertIn('src/a.py overlaps T01', busy.stderr + busy.stdout)
 
+    def test_plan_apply_warns_about_a_path_in_every_task_scope(self):
+        data = self.plan()
+        task = data['tasks'][0]
+        data['tasks'] = [dict(task, owner=o, title=f'Feature {o}', file=[f'src/{o}.py', 'test/'])
+                         for o in ('T01', 'T02', 'T03')]
+        data['milestones'][0]['members'] = ['T01', 'T02', 'T03']
+        out = self.apply(data).stdout
+        self.assertIn("every task's scope includes test/", out)
+        self.assertNotIn('src/T01.py', out)
+
+    def test_a_correction_whose_dispatch_was_refused_is_not_reviewed(self):
+        data = self.plan()
+        task = data['tasks'][0]
+        data['tasks'] = [dict(task, owner=o, title=f'Feature {o}') for o in ('T01', 'T02')]
+        data['milestones'][0]['members'] = ['T01', 'T02']
+        self.apply(data)
+        run = self.f.root / '.docket/runs/demo'
+        for owner in ('T01', 'T02'):
+            self.cli('dispatch', 'demo', owner, '--session', 'worker', '--register')
+            self.f.fill_scope(run / f'{owner}-scope.mdx')
+            self.cli('scope', 'demo', owner, '--submit')
+            self.f.fill_task_report(run / f'{owner}-report-01.mdx')
+            self.cli('submit', 'demo', owner, '--as', 'implementor', '--feedback', 'none')
+            self.cli('decide', 'demo', owner, '--changes', '--as', 'reviewer',
+                     '--change', '1. Correct the shared file.')
+        self.cli('dispatch', 'demo', 'T01', '--session', 'worker')
+        self.cli('dispatch', 'demo', 'T02', '--session', 'other', ok=False)
+
+        self.f.fill_task_report(run / 'T02-report-02.mdx')
+        refused = self.cli('submit', 'demo', 'T02', '--as', 'implementor', '--feedback', 'none', ok=False)
+        self.assertIn('round 2 was never dispatched', refused.stderr + refused.stdout)
+        self.assertEqual(('2', 'draft'), tuple(map(str, self.mod.state_of(run, 'T02'))))
+
     def test_completion_contains_verdicts_suite_and_finish_archives_disarms(self):
         run = self.ready()
         self.cli('arm', 'demo', '--role', 'planner')

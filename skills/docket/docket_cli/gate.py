@@ -13,7 +13,7 @@ from .common import (
 from .frontmatter import (
     CODE_FENCE, checkbox_items, duplicate_sections, is_empty, parse, sections, stated,
 )
-from .paths import planned_tasks, root
+from .paths import planned_tasks, read_dispatch, root
 from .roots import declared_roots
 from .baselines import assignment_evidence
 from .state import generated_path_hint, names_path, state_of
@@ -335,6 +335,16 @@ def gate_problems(
                 and task_meta.get("scope_status") != "ready"
             ):
                 problems.append("implementor discovery scope is not ready; submit it with `docket scope`")
+        # A correction round whose dispatch was refused has no baseline capture of its
+        # own; reviewing it spends a correction round on evidence nobody can rebuild.
+        dispatched = read_dispatch(d, owner)
+        if not blocked and dispatched and str(dispatched.get("round", "")) != str(expected_round):
+            problems.append(
+                f"round {expected_round} was never dispatched (the dispatch record is for round "
+                f"{dispatched.get('round', '')}): run `docket dispatch {run} {owner}` first. If it is "
+                "refused for scope another task holds, submit that task first and dispatch again; "
+                "a refusal you cannot clear is `docket submit --blocked`"
+            )
         coverage, coverage_detail, changed, outside = assignment_evidence(d, owner)
         print(f"diff coverage: {coverage} - {coverage_detail}")
         if coverage == COVERAGE_AVAILABLE:

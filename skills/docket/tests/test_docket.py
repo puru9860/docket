@@ -1944,6 +1944,8 @@ class DocketCLI(unittest.TestCase):
         self.cli("dispatch", "eg", "T01", "--session", "w1", "--register")
 
         def submit(rnd: int) -> None:
+            if rnd > 1:
+                self.cli("dispatch", "eg", "T01", "--session", "w1")
             self.fill_task_report(run / f"T01-report-{rnd:02d}.mdx",
                                   files="- `src/t01.py:1` - implemented T01.")
             self.cli("submit", "eg", "T01", "--as", "implementor")
@@ -5993,6 +5995,8 @@ class DocketCLI(unittest.TestCase):
         report.write_text(report.read_text().replace("\nTODO: finish\n", "\n"))
 
         def submit(rnd: int) -> None:
+            if rnd > 1:
+                self.cli("dispatch", "eg", "T01", "--session", "w1")
             self.fill_task_report(run / f"T01-report-{rnd:02d}.mdx",
                                   files="- `src/t01.py:1` - implemented T01.")
             self.cli("submit", "eg", "T01", "--as", "implementor")
@@ -14630,6 +14634,8 @@ class DocketCLI(unittest.TestCase):
                 self.cli("submit", "ml", owner, "--as", "implementor", ok=False)
                 report.write_text(report.read_text().replace("\nTODO: finish\n", "\n"))
             for rnd in (1, 2):
+                if rnd > 1:
+                    self.cli("dispatch", "ml", owner, "--session", f"w-{owner}")
                 self.fill_task_report(run / f"{owner}-report-{rnd:02d}.mdx",
                                       files=f"- `src/{owner.lower()}.py:1` - implemented.")
                 self.cli("submit", "ml", owner, "--as", "implementor")

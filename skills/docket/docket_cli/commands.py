@@ -1588,6 +1588,12 @@ def cmd_plan_apply(a: argparse.Namespace) -> None:
         shutil.rmtree(stage, ignore_errors=True)
     print(f"run {a.run}: applied {len(tasks)} task(s), {len(milestones)} closed milestone(s); "
           f"start with `docket launch {a.run}`")
+    scopes = [set(t.get("file") or []) for t in tasks if isinstance(t, dict)]
+    if len(scopes) >= 3:
+        for path in sorted(set.intersection(*scopes)):
+            print(f"warning: every task's scope includes {path}; tasks sharing it take turns on it "
+                  "and nothing shows which task owns a change there, so narrow it to the tasks "
+                  "that need it")
 
 
 def cmd_launch(a: argparse.Namespace) -> None:

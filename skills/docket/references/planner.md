@@ -3,6 +3,8 @@
 Own objective, constraints, tasks, milestones, and intent amendments.
 The implementor discovers and implements; only the independent reviewer approves or waives.
 Use a fresh planner session for each run.
+Before writing the plan, read the code the request touches and follow the repository's own context instructions (AGENTS.md, CLAUDE.md, or the project-context tools they name).
+Carry the standing constraints they give into risks and out of scope.
 
 ## Size the work
 
