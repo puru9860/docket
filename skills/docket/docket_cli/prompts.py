@@ -596,10 +596,11 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         try:
             tmeta, _ = parse((d / f"{owner}-task.mdx").read_text())
             if not model_source:
-                model_source = str(tmeta.get("actual_model", "") or tmeta.get("requested_model", ""))
+                model_source = (role_model(d, role, owner) if role in ('reviewer', 'verifier', 'checker')
+                                else str(tmeta.get("actual_model", "") or tmeta.get("requested_model", "")))
             # A task left on OpenCode's default model would render round 1 with no
             # model guidance, though the model it starts on is already knowable.
-            if not model_source and tmeta.get("harness") == "opencode":
+            if not model_source and role == "implementor" and tmeta.get("harness") == "opencode":
                 model_source = opencode_default_model()
         except (OSError, ValueError):
             pass
@@ -644,10 +645,9 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         pointers.append(f"latest decision: {run_rel}/{decs[-1].name}")
     if handoff_line and role in ("implementor", "orchestrator", "coordinator"):
         pointers.append(handoff_line)
-    pointers += [
-        f"task-local diff: docket diff {run} {owner}",
-        f"frozen evidence: docket bundle {run} {owner}",
-    ]
+    if role not in ('reviewer', 'verifier', 'checker'):
+        pointers.append(f"task-local diff: docket diff {run} {owner}")
+    pointers.append(f"frozen evidence: docket bundle {run} {owner}")
     if model:
         pointers.append(f"execution metadata (not identity): model={model}")
     header_lines = [
@@ -711,8 +711,7 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         if not round_subagent_tool(d, owner):
             steps.append(quick_coordination_step(d, run, owner))
     elif role in SUPERVISOR_WAIT_ROLES and not any("docket watch" in step for step in steps):
-        steps.append("Conductor-managed session: after deciding, end your turn. "
-                     "The conductor delivers your next obligation; do not watch or arm a wake hook."
+        steps.append("After deciding, end your turn; the conductor delivers the next obligation."
                      if role == "reviewer" and conductor_managed(d)
                      else supervisor_wait_step(run, role))
     if steps and role != "implementor":
@@ -904,7 +903,7 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
     checkout = (f"For selective execution, run `docket bundle {run} {owner} --checkout`; "
                 "use the printed fresh private directory for the frozen contract's focused verify command "
                 "or the milestone command from the packet with the exported directory as cwd "
-                "(multi-root checkouts are under their aliases). Do not routinely rerun the identical suite.")
+                "(multi-root checkouts are under their aliases).")
     if role in ("reviewer", "verifier", "checker") and owner != 'orch':
         frozen, _problems = current_bundle(d, owner, rnd)
         command = str((frozen or {}).get('verification', {}).get('command', ''))
@@ -928,8 +927,8 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
                            "dependencies, shared invariants, or unrelated code, or the delta is "
                            "unavailable. Preserve regression checks against the criteria."
                            if rnd > 1 else
-                           "Read the complete frozen patches and changed tests; check material "
-                           "expectations independently. Return one consolidated numbered list per "
+                           "Read the complete frozen patches and changed tests from the immutable paths linked in the packet. "
+                           "Return one consolidated numbered list per "
                            "member, each finding naming its criterion and a reproducer or causal "
                            "argument. Put hardening under Notes; propose stronger requirements "
                            "with `docket propose-amendment` for the planner.")

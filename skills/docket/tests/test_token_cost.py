@@ -92,6 +92,26 @@ class TokenCost(unittest.TestCase):
                 self.assertFalse((self.f.root / '.docket/runs/demo').exists())
                 self.assertFalse(list((self.f.root / '.docket/runs').glob('.plan-*')))
 
+    def test_plan_errors_name_the_json_path_without_another_commands_usage(self):
+        data = self.plan(); data['tasks'][0]['risk'] = 'medium'
+        refused = self.apply(data, ok=False)
+        self.assertIn('tasks[0].risk must be one of: low, high', refused.stderr)
+        self.assertNotIn('usage:', refused.stderr)
+        data = self.plan(); data['tasks'][0]['verify_timeout'] = 'soon'
+        refused = self.apply(data, ok=False)
+        self.assertIn('tasks[0]:', refused.stderr)
+        self.assertNotIn('usage:', refused.stderr)
+        self.assertFalse((self.f.root / '.docket/runs/demo').exists())
+
+    def test_plan_accepts_risks_and_out_of_scope_as_lists(self):
+        data = self.plan()
+        data['run'].update(risks=['Malformed model output.', 'Lost user additions.'],
+                           out_of_scope=['No migration.'])
+        self.apply(data)
+        plan = (self.f.root / '.docket/runs/demo/plan.mdx').read_text()
+        self.assertIn('- Malformed model output.\n- Lost user additions.', plan)
+        self.assertIn('- No migration.', plan)
+
     def test_plan_preserves_assignment_pins_and_refuses_bad_roots(self):
         config = Path(os.environ['XDG_CONFIG_HOME']) / 'docket/config.json'
         config.parent.mkdir(parents=True)
@@ -373,10 +393,13 @@ class ConductorTokenCost(unittest.TestCase):
     def test_launch_opens_plain_conductor_and_arms_planner_once(self):
         # The fake records pane run but deliberately never executes a live loop.
         fake = self.c.bin / 'herdr'
+        # Real `herdr pane run` exits 0 and prints nothing.
         source = fake.read_text().replace("if a[:2] == ['pane', 'get']:",
-            "if a[:2] == ['pane', 'run']: reply({})\nif a[:2] == ['pane', 'get']:")
+            "if a[:2] == ['pane', 'run']:\n    save()\n    sys.exit(0)\nif a[:2] == ['pane', 'get']:")
         fake.write_text(source)
-        self.c.cli('launch', 'demo')
+        result = self.c.cli('launch', 'demo')
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertIn('conductor started', result.stdout)
         calls = self.c.state()['calls']
         self.assertEqual(1, len([a for a in calls if a[:2] == ['pane', 'run']]))
         self.assertIn('demo planner', (self.c.f.root / '.docket/watch.conf').read_text())

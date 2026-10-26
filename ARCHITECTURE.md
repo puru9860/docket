@@ -169,6 +169,7 @@ The Git runner uses `GIT_FIXED_CONFIG` for stable patch prefixes, quoting, submo
 `git_env()` removes caller Git directory, index, object-store, namespace, config-parameter, and diff overrides before every Git call, and sets `GIT_OPTIONAL_LOCKS=0` so status cannot refresh the measured index.
 `git_text()` and `git_raw()` preserve non-UTF-8 paths or raw patch bytes, and return an unavailable result when Git fails or times out.
 Reconstruction uses a private index and object directory under `.docket/`, with the checkout's Git objects available only as alternates.
+Each mutable index lives in a unique per-capture scratch directory that is removed afterwards, so conductor inspection, approval, export, and baseline reconstruction cannot reset another capture's index.
 `retain_tree_objects()` copies every object added by a pinned tree beyond its pinned HEAD into `.bundles/objects`, including staged content that Git would otherwise leave only in the user's object store.
 The private store is never pruned, because later Git cleanup must not make an earlier bundle unrebuildable.
 `PRIVATE_STATE_DIRS` makes `.snapshots`, `.baselines`, and `.bundles` owner-only directories because captured patches, untracked bodies, and objects can contain secrets.
@@ -607,7 +608,7 @@ The conductor uses the existing role delivery lock, pending records, announcemen
 It checks idle state immediately before `herdr agent prompt`; successful writes record delivery, while failed or interrupted sends remain retryable after the announcement lease unless picked up.
 The crash contract remains at-least-once; unchanged successfully delivered identities stay quiet across restart and native worker hooks do not provide a competing transport.
 Workers follow a numbered startup sequence: register through dispatch or arm, then pickup, then act on the rendered contract without another role playbook read.
-Successful deliveries record per-section hashes of their rendered guidance; continued sessions receive only changed sections and explicit retired-section notices.
+Successful deliveries record hashes of their rendered guidance, with numbered steps compared individually; continued sessions receive only changed sections or steps and explicit retired-section notices.
 A first delivery or missing history always sends the complete contract.
 Conductor delivery retains the obligation message in the recipient-generation receipt so pickup can show it without a second claim or delivery.
 A receipt whose event no longer matches current state is explicitly non-actionable context; it never supplies lifecycle authority.
@@ -661,7 +662,8 @@ means no optional guidance at all and still carries every mandatory section; an 
 Selected and rejected guidance is recorded with reasons in the prompt digest.
 Model matching is exact on the normalized identifier, never a substring, and
 one-run model defaults are removed. Unknown models receive no model profile
-and only task-relevant cards under that policy. Model, provider, and effort
+and only task-relevant cards under that policy.
+Reviewer, verifier, and checker profile selection uses their own configured or explicitly supplied model, never the task implementor's observed model. Model, provider, and effort
 are execution metadata, never persona filler. Raw observations never enter
 prompts. Verifier prompts add a universal `honest-acceptance` duty and select
 the offline-operation, changed-oracle, event-aggregation, content-fingerprint,
@@ -914,7 +916,8 @@ qualification, every outstanding numbered required change, and every report's
 actual Decisions needed text and complete acceptance wording are mandatory and
 are never shortened. Full frozen contract, report, and patch paths remain
 available when excerpts shrink. Initial milestone reviews read the complete relevant patches and changed tests and independently check material expectations; the packet is
-an index to that evidence. A late
+an index to that evidence.
+Reviewer prompts name the immutable patch paths in that packet and do not also direct a live `docket diff`. A late
 finding is rendered in the same order as the earlier findings, not discarded
 by a summary. When mandatory material alone exceeds the target, the packet
 states the overage and adds an explicit required-reading manifest naming the
@@ -1149,6 +1152,9 @@ Its `--checkout [DIR]` variant exports frozen source trees outside every declare
 `--baseline` exports the pinned baseline for a negative control.
 Before submission, the baseline variant rebuilds the captured snapshot; afterwards it uses the immutable bundle baseline, including an explicit `--round`.
 Exports use run-private Git indexes and object storage, read raw blobs without smudge filters, preserve symlinks and executable modes, and publish a complete destination with one rename.
+After exporting frozen bytes, they may link Git-ignored `.venv`, `venv`, and `node_modules` directories for registered commands and print each linked target.
+Links never replace a frozen entry and cannot target the checkout or its ancestors, Docket state, `.env`-style paths, or known credential directories.
+Arbitrary ignored data is neither copied nor linked into exports.
 Multiple roots are separate alias directories; unavailable trees or damaged evidence refuse without publishing a destination.
 
 A bundle is self-contained on purpose. `.snapshots/` is where a baseline is *captured*,
@@ -1470,7 +1476,8 @@ among sessions of the same role.
 The content-addressed batch verification
 stores complete stdout and stderr, the command, source identity, and member bundle digests
 in one private directory rename. A changed source or member invalidates the pass, and a
-failed or timed-out result routes to the orchestrator. The normal reviewer readiness wake
+failed or timed-out result routes to the orchestrator.
+Approval uses one diagnostic validation pass to name the exact artifact, member digest, or root metadata and changed file modes/object IDs, including frozen and current values. The normal reviewer readiness wake
 waits for an intact passing batch result. `docket batch RUN --approve BID --as reviewer`
 records one milestone decision bound to that digest and applies each member approval
 through its ordinary evidence-bound transition. An interrupted group decision resumes

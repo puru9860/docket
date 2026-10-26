@@ -20,7 +20,8 @@ Normally review starts after an intact milestone full-suite pass.
 When conductor-launched, use its supplied session ID for registration and pickup; `arm` registers your identity while worker hook delivery stays disabled.
 A routed blocker can reach review once independent runnable peer work finishes; answer its Decisions needed question before changes or waiver.
 Read the packet's objective, approved contract, failure model, full-suite output, and member bundles.
-At first review read every relevant complete frozen patch and its changed tests, even when packet excerpts are shortened.
+At first review read every relevant complete frozen patch and its changed tests at the immutable paths linked in the packet, even when packet excerpts are shortened.
+Use those paths as the patch source; a live `docket diff` would repeat the patch against mutable work.
 Follow source around the patch and inspect integration boundaries as needed.
 Packets preserve complete findings, complete waiver reasons, numbered required changes, report questions, and plan risks.
 If mandatory material exceeds the target, open the required-reading manifest rather than assuming the short packet is complete evidence.
@@ -34,6 +35,7 @@ Build a criterion-to-observation map, inspect changed tests, and independently d
 Challenge green-but-wrong evidence, including fixtures or expected values adjusted merely to match implementation.
 Inspect preservation and error invariants, sibling sites, and side effects on pre-existing user data.
 Materialize the frozen source with `docket bundle <run> <owner> --checkout`.
+The export prints any linked ignored dependency environments, such as `.venv`, so registered commands can run from the printed directory.
 Use the printed fresh private directory for selective boundary and negative checks using the frozen focused command or packet milestone command as cwd-local shell commands.
 Multi-root exports put each checkout under its alias.
 A failure claim must inject the failure into the named component and detect an incorrect outcome.

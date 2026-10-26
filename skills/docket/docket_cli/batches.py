@@ -278,104 +278,142 @@ def freeze_batch_verification(d: Path, bid: str, verification: dict[str, object]
     return {**record, "digest": digest}
 
 
-def batch_verification_intact(d: Path, batch: dict) -> bool:
+def batch_verification_integrity_problems(d: Path, batch: dict) -> list[str]:
     verification = batch.get("verification")
     if not isinstance(verification, dict):
-        return False
+        return ["no frozen full-suite verification"]
     digest = verification.get("digest")
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        return False
+        return ["full-suite verification has no valid digest"]
     where = batch_verification_dir(d, str(batch.get("batch", "")), digest)
     try:
         manifest = json.loads((where / "manifest.json").read_text())
+        if not isinstance(manifest, dict):
+            return ["full-suite manifest is malformed"]
         content = {key: value for key, value in manifest.items() if key != "digest"}
-        if manifest.get("digest") != digest or hashlib.sha256(_canonical(content)).hexdigest() != digest[7:]:
-            return False
-        if manifest.get("record") != {key: value for key, value in verification.items()
-                                      if key != "digest"}:
-            return False
+        current = "sha256:" + hashlib.sha256(_canonical(content)).hexdigest()
+        if manifest.get("digest") != digest or current != digest:
+            return [f"full-suite manifest digest frozen={digest} current={current}"]
+        if manifest.get("record") != {key: value for key, value in verification.items() if key != "digest"}:
+            return ["full-suite metadata differs from its immutable manifest"]
+        problems = []
         for name in ("stdout", "stderr"):
-            if hashlib.sha256((where / name).read_bytes()).hexdigest() != manifest["artifacts"][name]:
-                return False
-        return True
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
+            current = hashlib.sha256((where / name).read_bytes()).hexdigest()
+            frozen = manifest["artifacts"][name]
+            if current != frozen:
+                problems.append(f"full-suite artifact {name} frozen={frozen} current={current}")
+        return problems
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return [f"full-suite evidence {where} unavailable: {exc}"]
 
 
-def batch_verification_matches(d: Path, batch: dict, *, historical: bool = False) -> bool:
-    """Whether intact output describes the members and the required source.
+def batch_verification_intact(d: Path, batch: dict) -> bool:
+    return not batch_verification_integrity_problems(d, batch)
 
-    A completed milestone may be audited after later work changes the checkout.
-    Reusing a pass or making a new decision must also match the live source.
-    """
-    verification = batch.get("verification")
-    if not isinstance(verification, dict) or not batch_verification_intact(d, batch):
-        return False
-    if not verification.get("command"):
-        return False
-    frozen_members = verification.get("member_bundles")
+
+def batch_source_changes(d: Path, frozen: list, current: list) -> list[str]:
+    from .bundles import baseline_roots, private_git_env, private_git, first_line
+    from .paths import root
+    records, _ = baseline_roots(d, "run")
+    by_alias = {str(record['alias']): record for record in records}
+    old = {str(record.get('alias', '')): record for record in frozen}
+    new = {str(record.get('alias', '')): record for record in current}
+    problems = []
+    for alias in sorted(set(old) | set(new)):
+        before, after = old.get(alias, {}), new.get(alias, {})
+        for key in ('path', 'head', 'branch', 'tree'):
+            if before.get(key) != after.get(key):
+                problems.append(f"root {alias} {key} moved: frozen={before.get(key)!r} current={after.get(key)!r}")
+        left, right = before.get('tree'), after.get('tree')
+        if left == right or not left or not right or alias not in by_alias:
+            continue
+        env = private_git_env(d, by_alias[alias], 'batch-diagnostic.index')
+        code, data, error = private_git(env, root(), 'diff-tree', '-r', '--raw', '--no-abbrev',
+                                         '--no-renames', '-z', str(left), str(right))
+        if code:
+            problems.append(f"root {alias} changed paths unavailable: {first_line(error)}")
+            continue
+        fields = data.split(b"\0")
+        for index in range(0, len(fields) - 1, 2):
+            metadata = fields[index].decode().split()
+            if len(metadata) != 5:
+                continue
+            name = os.fsdecode(fields[index + 1])
+            problems.append(f"  {alias}:{name} frozen={metadata[0][1:]}:{metadata[2]} "
+                            f"current={metadata[1]}:{metadata[3]}")
+    if frozen != current and not problems:
+        problems.append(f"root ordering changed: frozen={list(old)} current={list(new)}")
+    return problems
+
+
+def batch_verification_problems(d: Path, batch: dict, *, historical: bool = False,
+                                require_pass: bool = True) -> list[str]:
+    problems = batch_verification_integrity_problems(d, batch)
+    if problems:
+        return problems
+    verification = batch['verification']
+    if require_pass and verification.get('status') != 'passed':
+        problems.append(f"full-suite status frozen={verification.get('status')!r}; approval requires passed")
+    if not verification.get('command'):
+        problems.append("full-suite verification has no command")
+    frozen_members = verification.get('member_bundles')
     if not isinstance(frozen_members, dict):
-        return False
-    if dict(frozen_members) != current_member_bundles(d, batch):
-        return False
-    frozen_source = verification.get("source")
+        return [*problems, "full-suite verification has no member bundle map"]
+    current_members = current_member_bundles(d, batch)
+    for member in sorted(set(frozen_members) | set(current_members)):
+        if frozen_members.get(member) != current_members.get(member):
+            problems.append(f"member {member} bundle moved: frozen={frozen_members.get(member)!r} "
+                            f"current={current_members.get(member)!r}")
+    frozen_source = verification.get('source')
     if is_quick_milestone(d) or historical:
-        # Preserve the frozen tree for audit after later milestones edit the checkout.
         from .bundles import baseline_roots, tree_problems
         from .baselines import evidence_mode
         if not isinstance(frozen_source, dict):
-            return False
-        frozen_roots = frozen_source.get("roots", [])
-        if evidence_mode(d) == "documents-only":
-            return frozen_source.get("coverage") == "documents-only" and frozen_roots == []
-        records, problem = baseline_roots(d, "run")
-        if problem or not isinstance(frozen_roots, list) or len(frozen_roots) != len(records):
-            return False
-        by_alias = {str(record.get("alias", "")): record for record in records}
+            return [*problems, "full-suite source record is malformed"]
+        frozen_roots = frozen_source.get('roots', [])
+        if evidence_mode(d) == 'documents-only':
+            if frozen_source.get('coverage') != 'documents-only' or frozen_roots != []:
+                problems.append("full-suite source does not match documents-only evidence")
+            return problems
+        records, problem = baseline_roots(d, 'run')
+        if problem:
+            return [*problems, f"run baseline unavailable: {problem}"]
+        if not isinstance(frozen_roots, list) or len(frozen_roots) != len(records):
+            return [*problems, "full-suite roots differ from the run baseline root inventory"]
+        by_alias = {str(record['alias']): record for record in records}
+        seen = set()
         for source in frozen_roots:
             if not isinstance(source, dict):
-                return False
-            alias = str(source.get("alias", ""))
-            record = by_alias.get(alias)
-            tree = str(source.get("tree", ""))
-            if not record or not tree or source.get("path") != record.get("path"):
-                return False
-            if tree_problems(d, record, [tree]):
-                return False
-        if historical:
-            return True
-        current_source, problem = current_batch_source(d)
-        return not problem and frozen_roots == current_source
+                return [*problems, "full-suite root record is malformed"]
+            alias = str(source.get('alias', ''))
+            record, tree = by_alias.get(alias), str(source.get('tree', ''))
+            if not record or not tree or alias in seen or source.get('path') != record.get('path'):
+                return [*problems, f"root {alias} identity differs from its baseline: "
+                        f"frozen={source.get('path')!r} current={(record or {}).get('path')!r}"]
+            seen.add(alias)
+            problems.extend(f"root {alias}: {item}" for item in tree_problems(d, record, [tree]))
+        if historical or problems:
+            return problems
+    else:
+        frozen_roots = frozen_source.get('roots', []) if isinstance(frozen_source, dict) else frozen_source
     current_source, problem = current_batch_source(d)
-    if problem and problem != "documents-only":
-        return False
-    if isinstance(frozen_source, dict):
-        frozen_roots = frozen_source.get("roots", [])
-        current_roots = current_source
-        if frozen_roots != current_roots:
-            # Documents-only runs freeze an empty source with a reason; equality
-            # there means still documents-only, which stays valid.
-            if not (not frozen_roots and not current_roots):
-                return False
-    elif frozen_source != current_source:
-        return False
-    return True
+    if problem and problem != 'documents-only':
+        return [*problems, f"current source unavailable: {problem}; frozen roots={frozen_roots!r}"]
+    if not isinstance(frozen_roots, list) or any(not isinstance(row, dict) for row in frozen_roots):
+        return [*problems, "full-suite source roots are malformed"]
+    return problems + batch_source_changes(d, frozen_roots, current_source)
+
+
+def batch_verification_matches(d: Path, batch: dict, *, historical: bool = False) -> bool:
+    return not batch_verification_problems(d, batch, historical=historical, require_pass=False)
 
 
 def batch_verification_valid(d: Path, batch: dict) -> bool:
-    """A passing full-suite result bound to the current member and source bytes."""
-    verification = batch.get("verification")
-    return (isinstance(verification, dict)
-            and str(verification.get("status", "")) == "passed"
-            and batch_verification_matches(d, batch))
+    return not batch_verification_problems(d, batch)
 
 
 def batch_verification_historical_valid(d: Path, batch: dict) -> bool:
-    """An intact pass for current member bundles, even after later source edits."""
-    verification = batch.get("verification")
-    return (isinstance(verification, dict)
-            and str(verification.get("status", "")) == "passed"
-            and batch_verification_matches(d, batch, historical=True))
+    return not batch_verification_problems(d, batch, historical=True)
 
 
 def milestone_dependency_problem(d: Path, owner: str, other: str) -> str:

@@ -293,8 +293,17 @@ def idle_worker(record: dict) -> bool:
 
 
 def conductor_prompt_sections(prompt: str) -> dict[str, str]:
-    chunks = re.split(r"(?m)(?=^# )", prompt)
-    return {chunk.splitlines()[0]: chunk.strip() for chunk in chunks if chunk.strip()}
+    result = {}
+    for chunk in re.split(r"(?m)(?=^# )", prompt):
+        if not chunk.strip():
+            continue
+        name = chunk.splitlines()[0]
+        if name == '# Steps':
+            for step in re.split(r"(?m)(?=^[0-9]+\. )", chunk)[1:]:
+                result[f"# Steps / {step.split('.', 1)[0]}"] = step.strip()
+        else:
+            result[name] = chunk.strip()
+    return result
 
 
 def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
@@ -322,7 +331,6 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
         iid = str(event['key']).split(':')[1]
         header += f"After handling it, run `docket instruct {d.name} --role {role} --resolve {iid}`.\n"
     if role == 'reviewer':
-        header += f"Read `docket review-packet {d.name} --role reviewer --batch {bid}`.\n"
         owner = owner or next((str(m) for m in batch['members']
                                if state_of(d, str(m))[1] in ('submitted', 'blocked')), '')
     if owner:
@@ -335,7 +343,13 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
         previous = record.get('prompt_sections') or {}
         if previous:
             changed = [body for name, body in rendered.items()
-                       if previous.get(name) != hashlib.sha256(body.encode()).hexdigest()]
+                       if not name.startswith('# Steps / ')
+                       and previous.get(name) != hashlib.sha256(body.encode()).hexdigest()]
+            changed_steps = [body for name, body in rendered.items()
+                             if name.startswith('# Steps / ')
+                             and previous.get(name) != hashlib.sha256(body.encode()).hexdigest()]
+            if changed_steps:
+                changed.append('# Steps (changed)\n\n' + '\n'.join(changed_steps))
             removed = [name for name in previous if name not in rendered]
             header += '\nContinued context: retain unchanged contract and duties. Changed sections follow.\n'
             if removed:
@@ -343,8 +357,8 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
             header += '\n\n'.join(changed)
         else:
             header += '\n' + prompt
-    header += (f"\nAfter {'submitting or running the milestone suite' if role == 'implementor' else 'deciding'}, "
-               "end your turn. The conductor will deliver the next obligation.\n")
+    if role == 'implementor':
+        header += "\nAfter submitting, end your turn. The conductor will deliver the next obligation.\n"
     return header
 
 

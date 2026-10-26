@@ -56,5 +56,24 @@ Launch arguments come only from the user config, so a repository cannot enable a
 | 3. Conductor, reopen, stall detection | Done; verified in live runs with one and two milestones |
 | 4. Friction from the eval and the live runs | Done |
 | 5. Risk-triggered pre-dispatch oracle check, historical support boundary, removal of obsolete paths | Not started |
+| 6. Premium-turn reduction | Done; one live rerun measured |
 
 Planner-as-writer was considered and dropped: the planner never implements.
+
+## Premium-turn reduction
+
+In Claude Code every model turn rereads a prefix of at least 43k tokens, so premium cost follows the number of turns, not the size of each output.
+The live runs showed most planner turns going to Docket mechanics rather than planning.
+Changes:
+
+- `docket plan apply RUN --file plan.json` builds the whole run from one JSON plan in a private staging directory and publishes it only when every existing command accepted it; errors name the plan path.
+- `docket launch RUN` opens the conductor pane and arms the planner; `docket finish RUN --feedback TEXT|none` acknowledges completion, records feedback, archives usage, and disarms.
+- Informational provider budget warnings appear in status and the conductor output instead of waking the planner.
+- The conductor runs ready milestone suites without a model, and a refused suite becomes a planner stall instead of stopping the conductor.
+- `docket bundle RUN OWNER --checkout [DIR]` and `--baseline` rebuild a frozen or baseline tree outside the checkout, linking only ignored dependency directories such as `.venv`; negative controls no longer touch the measured checkout.
+- Submission records the model observed in the registered session's telemetry and accepts `--feedback`.
+- Planner reading dropped from about 34k to 11k characters; continued worker sessions receive only changed prompt sections.
+- The planner defaults to one milestone unless an intermediate approval is a real checkpoint.
+- Fixed a race in which concurrent source captures shared one scratch index and refused an unchanged approval; refusals now name the moved member, root, or paths.
+
+On a two-milestone eval task, the planner went from 25 turns to 13, and its premium tokens fell by about half.

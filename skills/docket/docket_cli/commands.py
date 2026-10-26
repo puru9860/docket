@@ -77,7 +77,7 @@ from .five_role import run_complete_event
 from .models import cmd_feedback
 from .sessions import collect_run_usage
 from .signalling import cmd_arm, cmd_disarm, cmd_pickup
-from .conductor import conductor_dir, herdr, read_worker
+from .conductor import HerdrError, conductor_dir, herdr, read_worker
 from .common import LAUNCHER
 from .delivery import delivery_lock, sweep_role
 from .health import execution_health
@@ -1406,9 +1406,11 @@ def cmd_migrate(a: argparse.Namespace) -> None:
 
 
 def plan_json_arguments(parser: argparse.ArgumentParser, command: str, run: str,
-                        fields: dict, positional: list[str] | None = None) -> argparse.Namespace:
+                        fields: dict, positional: list[str] | None = None,
+                        where: str = "") -> argparse.Namespace:
+    where = where or command
     if not isinstance(fields, dict):
-        die(f"{command} fields must be a JSON object")
+        die(f"{where} must be a JSON object")
     subparser = next(action for action in parser._actions
                      if isinstance(action, argparse._SubParsersAction)).choices[command]
     actions = {action.dest: action for action in subparser._actions if action.option_strings}
@@ -1417,29 +1419,39 @@ def plan_json_arguments(parser: argparse.ArgumentParser, command: str, run: str,
     for key, value in fields.items():
         key = key.replace("-", "_")
         if key in normalized_keys:
-            die(f"duplicate {command} plan field {key!r}")
+            die(f"{where}: duplicate field {key!r}")
         normalized_keys.add(key)
         if key not in actions or key in ("help", "as_role", "clear_assignment", "tier", "files"):
-            die(f"unknown or unsupported {command} plan field {key!r}")
+            die(f"{where}.{key} is not a supported plan field")
         action = actions[key]
         option = action.option_strings[0]
+        values = value if isinstance(value, list) else [value]
+        if action.choices and any(str(v) not in action.choices for v in values):
+            die(f"{where}.{key} must be one of: {', '.join(c for c in action.choices if c)}")
         if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
             if not isinstance(value, bool):
-                die(f"{command}.{key} must be a JSON boolean")
+                die(f"{where}.{key} must be a JSON boolean")
             if value:
                 argv.append(option)
         elif isinstance(action, argparse._AppendAction):
             if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
-                die(f"{command}.{key} must be a list of strings")
+                die(f"{where}.{key} must be a list of strings")
             for item in value:
                 argv.extend((option, item))
         else:
             if not isinstance(value, (str, int)) or isinstance(value, bool):
-                die(f"{command}.{key} must be a string or integer")
+                die(f"{where}.{key} must be a string or integer")
             argv.extend((option, str(value)))
     if command in ("assign", "batch"):
         argv.extend(("--as", "planner"))
-    return parser.parse_args(argv)
+    # A plan error names its JSON path instead of printing another command's usage.
+    with contextlib.redirect_stderr(io.StringIO()) as refusal:
+        try:
+            return parser.parse_args(argv)
+        except SystemExit:
+            pass
+    detail = refusal.getvalue().strip().splitlines()
+    die(f"{where}: {detail[-1].split(': error: ', 1)[-1] if detail else 'invalid fields'}")
 
 
 def cmd_plan_apply(a: argparse.Namespace) -> None:
@@ -1495,14 +1507,17 @@ def cmd_plan_apply(a: argparse.Namespace) -> None:
         die("run.policy.review_reserve must be smaller than token_budget")
     if policy.get("provisional_integration", "forbidden") not in ("forbidden", "allowed"):
         die("run.policy.provisional_integration must be forbidden or allowed")
-    if any(not isinstance(value, str) for value in plan_sections.values()):
-        die("run risks and out_of_scope must be strings")
-    init = plan_json_arguments(a.parser, "init", a.run, {**run_fields, "root": roots})
+    for name, value in plan_sections.items():
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            plan_sections[name] = "\n".join(f"- {item}" for item in value)
+        elif not isinstance(value, str):
+            die(f"run.{name} must be a string or a list of strings")
+    init = plan_json_arguments(a.parser, "init", a.run, {**run_fields, "root": roots}, where="run")
     if not str(init.objective).strip():
         die("run.objective is required")
     assignments, creations, closings = [], [], []
     task_ids, membership = [], []
-    for task in tasks:
+    for index, task in enumerate(tasks):
         if not isinstance(task, dict) or not isinstance(task.get("owner"), str):
             die("each task needs owner and assign fields")
         fields = dict(task)
@@ -1510,7 +1525,8 @@ def cmd_plan_apply(a: argparse.Namespace) -> None:
         if owner in task_ids or not re.fullmatch(r"T[0-9]+", owner):
             die(f"duplicate or invalid task owner {owner!r}")
         task_ids.append(owner)
-        assignments.append(plan_json_arguments(a.parser, "assign", a.run, fields, [owner]))
+        assignments.append(plan_json_arguments(a.parser, "assign", a.run, fields, [owner],
+                                               where=f"tasks[{index}]"))
     for assignment in assignments:
         dependencies = {dep.strip() for spec in assignment.depends_on for dep in spec.split(",")}
         unknown = sorted(dependencies - set(task_ids))
@@ -1532,7 +1548,8 @@ def cmd_plan_apply(a: argparse.Namespace) -> None:
             die("milestone lifecycle fields are generated by plan apply")
         membership.extend(members)
         creations.append(plan_json_arguments(a.parser, "batch", a.run,
-            {**fields, "create": bid, "members": ",".join(members), "milestone": True}))
+            {**fields, "create": bid, "members": ",".join(members), "milestone": True},
+            where=f"milestones[{len(milestone_ids) - 1}]"))
         closings.append(plan_json_arguments(a.parser, "batch", a.run, {"close": bid}))
     if sorted(membership) != sorted(task_ids):
         die("each task must belong to exactly one milestone")
@@ -1592,9 +1609,18 @@ def cmd_launch(a: argparse.Namespace) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_arm(argparse.Namespace(run=a.run, role="planner", session="", agent="",
                 harness_session_ref=getattr(a, "harness_session_ref", None)))
-        pane = herdr("pane", "split", "--current", "--direction", "down", "--cwd", str(root()), "--no-focus")["pane"]["pane_id"]
+        try:
+            pane = herdr("pane", "split", "--current", "--direction", "down", "--cwd", str(root()), "--no-focus")["pane"]["pane_id"]
+        except HerdrError as exc:
+            die(f"launch could not open the conductor pane: {exc}; planner armed, nothing started")
         publish_json(path, {"pane": pane, "run": a.run, "at": stamp()})
-        herdr("pane", "run", pane, f"{shlex.quote(sys.executable)} {shlex.quote(str(LAUNCHER))} conduct {shlex.quote(a.run)}")
+        try:
+            # `herdr pane run` prints nothing on success, so its output is not JSON.
+            herdr("pane", "run", pane, f"{shlex.quote(sys.executable)} {shlex.quote(str(LAUNCHER))} "
+                  f"conduct {shlex.quote(a.run)}", raw=True)
+        except HerdrError as exc:
+            die(f"launch opened pane {pane} but could not start the conductor: {exc}; "
+                f"run `docket conduct {a.run}` in that pane")
     print(f"run {a.run}: conductor started in {pane}; planner armed; end your turn")
 
 

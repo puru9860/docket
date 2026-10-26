@@ -690,7 +690,7 @@ def _cmd_batch_decide_locked(a: argparse.Namespace, d: Path, bid: str) -> None:
     from .batches import (
         batch_ready as _batch_ready,
         batch_verification_historical_valid as _batch_historical,
-        batch_verification_valid as _batch_valid,
+        batch_verification_problems as _batch_problems,
         current_member_bundles as _member_bundles,
     )
     from .state import read_batch as _read_batch
@@ -736,10 +736,12 @@ def _cmd_batch_decide_locked(a: argparse.Namespace, d: Path, bid: str) -> None:
         ready, _ = _batch_ready(d, batch)
         if not ready:
             die(f"batch {bid} is not ready: every submitted member needs resolved verification")
-    if not _batch_valid(d, batch):
-        die(f"batch {bid} has no valid full-suite pass for its current member bundles and "
-            f"source; run `docket batch {d.name} --verify {bid} --command CMD` first. A changed "
-            "member or source invalidates the previous pass rather than reusing it")
+    problems = _batch_problems(d, batch)
+    if problems:
+        recovery = (f"docket batch {d.name} --verify {bid} --as implementor" if is_quick_milestone(d)
+                    else f"docket batch {d.name} --verify {bid} --command CMD")
+        die(f"batch {bid} has no valid full-suite pass for its current member bundles and source:\n  - "
+            + "\n  - ".join(problems) + f"\nAfter resolving these changes, run `{recovery}`")
     verification = batch.get("verification")
     assert isinstance(verification, dict)
     if journal and (journal.get("batch_verification") != verification.get("digest")

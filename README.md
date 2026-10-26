@@ -333,6 +333,9 @@ docket help <role> --run R01 --owner T01              compact guidance for that 
 ```
 
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
+A checkout export can reuse ignored `.venv`, `venv`, or `node_modules` directories through printed runtime links.
+Exports exclude arbitrary ignored data, `.env`-style entries, credentials, and Docket state.
+
 The active help form uses the same canonical contract and command renderer as
 `docket prompt`, without writing a prompt record. The full playbook remains
 available through `docket help <role>`.

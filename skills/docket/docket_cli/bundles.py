@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
-from .common import EMPTY_TREE_SHA1, SHA_DIGEST_RE
+from .common import EMPTY_TREE_SHA1, SHA_DIGEST_RE, STATE_DIR
 from .paths import latest, reports, root
 from .publication import fault, keep_private, publish_bytes, publish_json
-from .evidence import empty_tree, git_argv, git_env, git_raw, is_state_path, state_prefix
+from .evidence import empty_tree, git_argv, git_env, git_raw, git_text, is_state_path, state_prefix
 from .roots import declared_roots, root_identity
 from .baselines import evidence_mode, snapshot_dir, snapshot_path
 
@@ -125,6 +127,18 @@ def private_git_env(d: Path, record: dict[str, object], index: str) -> dict[str,
     return env
 
 
+@contextlib.contextmanager
+def reconstruction_index(d: Path, record: dict[str, object], label: str):
+    env = private_git_env(d, record, label)
+    # Concurrent inspections must never reset or unlink another capture's index.
+    scratch = Path(tempfile.mkdtemp(prefix="index-", dir=bundle_work(d)))
+    env["GIT_INDEX_FILE"] = str(scratch / "index")
+    try:
+        yield env
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def moved_paths(d: Path, owner: str, before: dict[str, str], after: dict[str, str],
                 limit: int = 12) -> str:
     """The paths that differ between two source captures, for a refusal to name."""
@@ -208,72 +222,71 @@ def baseline_tree(d: Path, owner: str, record: dict[str, object]) -> tuple[str, 
     path = Path(str(record.get("path", "")))
     if not path.is_dir():
         return "", f"the declared root {path} is missing"
-    env = private_git_env(d, record, f"{owner}.{alias}.baseline.index")
-    Path(env["GIT_INDEX_FILE"]).unlink(missing_ok=True)
-    base = str(record.get("base_tree") or EMPTY_TREE_SHA1)
-    code, _, _ = private_git(env, path, "read-tree", base)
-    if code:
-        return "", f"Git cannot read the pinned baseline tree {base[:12]} for {alias}"
-    snap = snapshot_dir(d, owner)
-    for key, label in (("staged_patch", "staged"), ("worktree_patch", "worktree")):
-        name = str(record.get(key, ""))
-        if not name:
-            continue
-        patch = snap / name
-        if not patch.is_file():
-            return "", f"the captured {label} baseline patch for {alias} is missing"
-        if not patch.stat().st_size:
-            continue
-        code, _, err = private_git(
-            env, path, "apply", "--cached", "--binary", "--whitespace=nowarn", str(patch),
-        )
+    with reconstruction_index(d, record, f"{owner}.{alias}.baseline.index") as env:
+        base = str(record.get("base_tree") or EMPTY_TREE_SHA1)
+        code, _, _ = private_git(env, path, "read-tree", base)
         if code:
-            return "", (
-                f"the captured {label} baseline patch for {alias} no longer applies: "
-                f"{first_line(err)}"
+            return "", f"Git cannot read the pinned baseline tree {base[:12]} for {alias}"
+        snap = snapshot_dir(d, owner)
+        for key, label in (("staged_patch", "staged"), ("worktree_patch", "worktree")):
+            name = str(record.get(key, ""))
+            if not name:
+                continue
+            patch = snap / name
+            if not patch.is_file():
+                return "", f"the captured {label} baseline patch for {alias} is missing"
+            if not patch.stat().st_size:
+                continue
+            code, _, err = private_git(
+                env, path, "apply", "--cached", "--binary", "--whitespace=nowarn", str(patch),
             )
-    name = str(record.get("untracked_manifest", ""))
-    entries: dict[str, object] = {}
-    if name:
-        manifest = snap / name
-        if not manifest.is_file():
-            return "", f"the captured untracked manifest for {alias} is missing"
-        try:
-            entries = dict(json.loads(manifest.read_text()).get("entries", {}))
-        except (OSError, ValueError) as exc:
-            return "", f"the captured untracked manifest for {alias} is unreadable: {exc}"
-    records: list[bytes] = []
-    for relative, entry in sorted(entries.items()):
-        if not isinstance(entry, dict):
-            continue
-        mode = UNTRACKED_MODES.get(str(entry.get("kind", "")), "")
-        if not mode:
-            continue
-        if mode == "120000":
-            content = str(entry.get("target", "")).encode()
-            args = ("hash-object", "-w", "--no-filters", "--stdin")
-        else:
-            content = base64.b64decode(str(entry.get("content_base64", "")))
-            args = ("hash-object", "-w", "--path", relative, "--stdin")
-        code, out, _ = private_git(env, path, *args, stdin=content)
+            if code:
+                return "", (
+                    f"the captured {label} baseline patch for {alias} no longer applies: "
+                    f"{first_line(err)}"
+                )
+        name = str(record.get("untracked_manifest", ""))
+        entries: dict[str, object] = {}
+        if name:
+            manifest = snap / name
+            if not manifest.is_file():
+                return "", f"the captured untracked manifest for {alias} is missing"
+            try:
+                entries = dict(json.loads(manifest.read_text()).get("entries", {}))
+            except (OSError, ValueError) as exc:
+                return "", f"the captured untracked manifest for {alias} is unreadable: {exc}"
+        records: list[bytes] = []
+        for relative, entry in sorted(entries.items()):
+            if not isinstance(entry, dict):
+                continue
+            mode = UNTRACKED_MODES.get(str(entry.get("kind", "")), "")
+            if not mode:
+                continue
+            if mode == "120000":
+                content = str(entry.get("target", "")).encode()
+                args = ("hash-object", "-w", "--no-filters", "--stdin")
+            else:
+                content = base64.b64decode(str(entry.get("content_base64", "")))
+                args = ("hash-object", "-w", "--path", relative, "--stdin")
+            code, out, _ = private_git(env, path, *args, stdin=content)
+            if code:
+                return "", f"Git cannot store the captured untracked content of {alias}:{relative}"
+            line = f"{mode} {out.decode().strip()}\t{relative}"
+            records.append(line.encode("utf-8", "surrogateescape"))
+        if records:
+            code, _, err = private_git(
+                env, path, "update-index", "-z", "--index-info",
+                stdin=b"\0".join(records) + b"\0",
+            )
+            if code:
+                return "", f"Git cannot rebuild the captured untracked state of {alias}: {first_line(err)}"
+        problem = prune_index(env, path, [str(item) for item in record.get("embedded_checkouts") or []])
+        if problem:
+            return "", problem
+        code, out, _ = private_git(env, path, "write-tree")
         if code:
-            return "", f"Git cannot store the captured untracked content of {alias}:{relative}"
-        line = f"{mode} {out.decode().strip()}\t{relative}"
-        records.append(line.encode("utf-8", "surrogateescape"))
-    if records:
-        code, _, err = private_git(
-            env, path, "update-index", "-z", "--index-info",
-            stdin=b"\0".join(records) + b"\0",
-        )
-        if code:
-            return "", f"Git cannot rebuild the captured untracked state of {alias}: {first_line(err)}"
-    problem = prune_index(env, path, [str(item) for item in record.get("embedded_checkouts") or []])
-    if problem:
-        return "", problem
-    code, out, _ = private_git(env, path, "write-tree")
-    if code:
-        return "", f"Git cannot write the rebuilt baseline tree for {alias}"
-    return out.decode().strip(), ""
+            return "", f"Git cannot write the rebuilt baseline tree for {alias}"
+        return out.decode().strip(), ""
 
 
 def carry_hidden_flags(env: dict[str, str], path: Path) -> str:
@@ -325,43 +338,42 @@ def source_tree(
     identity = root_identity(path)
     if not identity:
         return {}, f"Git cannot identify the declared root {path}"
-    env = private_git_env(d, record, f"{owner}.{alias}.{slot}.index")
-    Path(env["GIT_INDEX_FILE"]).unlink(missing_ok=True)
-    head = identity["head"] or empty_tree(path)
-    code, _, _ = private_git(env, path, "read-tree", head)
-    if code:
-        return {}, f"Git cannot read the current HEAD of {alias}"
-    problem = carry_hidden_flags(env, path)
-    if problem:
-        return {}, problem
-    work = dict(env)
-    work["GIT_WORK_TREE"] = str(path)
-    # Docket's own state is pruned from the index either way. Excluding it up front
-    # keeps Git from hashing a run's accumulated evidence into the private store on
-    # every freeze - but only when it is not already ignored, because an exclude
-    # pathspec naming an ignored path makes `git add` refuse the whole invocation.
-    pathspecs: list[str] = []
-    state = state_prefix(path)
-    if state and private_git(work, path, "check-ignore", "-q", state)[0] != 0:
-        pathspecs = [
-            "--", ":/", f":(exclude,top){state}", f":(exclude,top,glob){state}/**",
-        ]
-    code, _, err = private_git(work, path, "add", "-A", *pathspecs)
-    if code:
-        return {}, f"Git cannot read the current state of {alias}: {first_line(err)}"
-    problem = prune_index(env, path, [str(item) for item in record.get("embedded_checkouts") or []])
-    if problem:
-        return {}, problem
-    code, out, _ = private_git(env, path, "write-tree")
-    if code:
-        return {}, f"Git cannot write the current source tree for {alias}"
-    return {
-        "alias": alias,
-        "path": str(path),
-        "tree": out.decode().strip(),
-        "head": identity["head"],
-        "branch": identity["branch"],
-    }, ""
+    with reconstruction_index(d, record, f"{owner}.{alias}.{slot}.index") as env:
+        head = identity["head"] or empty_tree(path)
+        code, _, err = private_git(env, path, "read-tree", head)
+        if code:
+            return {}, f"Git cannot read the current HEAD of {alias}: {first_line(err)}"
+        problem = carry_hidden_flags(env, path)
+        if problem:
+            return {}, problem
+        work = dict(env)
+        work["GIT_WORK_TREE"] = str(path)
+        # Docket's own state is pruned from the index either way. Excluding it up front
+        # keeps Git from hashing a run's accumulated evidence into the private store on
+        # every freeze - but only when it is not already ignored, because an exclude
+        # pathspec naming an ignored path makes `git add` refuse the whole invocation.
+        pathspecs: list[str] = []
+        state = state_prefix(path)
+        if state and private_git(work, path, "check-ignore", "-q", state)[0] != 0:
+            pathspecs = [
+                "--", ":/", f":(exclude,top){state}", f":(exclude,top,glob){state}/**",
+            ]
+        code, _, err = private_git(work, path, "add", "-A", *pathspecs)
+        if code:
+            return {}, f"Git cannot read the current state of {alias}: {first_line(err)}"
+        problem = prune_index(env, path, [str(item) for item in record.get("embedded_checkouts") or []])
+        if problem:
+            return {}, problem
+        code, out, err = private_git(env, path, "write-tree")
+        if code:
+            return {}, f"Git cannot write the current source tree for {alias}: {first_line(err)}"
+        return {
+            "alias": alias,
+            "path": str(path),
+            "tree": out.decode().strip(),
+            "head": identity["head"],
+            "branch": identity["branch"],
+        }, ""
 
 
 def retain_tree_objects(d: Path, record: dict[str, object], trees: tuple[str, ...]) -> str:
@@ -715,6 +727,30 @@ def publish_bundle(
 VERIFY_OUTPUT_KEYS = ("stdout_text", "stderr_text", "stdout_bytes", "stderr_bytes")
 
 
+def link_checkout_runtime(record: dict[str, object], output: Path) -> list[str]:
+    source = Path(str(record['path']))
+    linked = []
+    # Link only installed dependency environments, never arbitrary ignored data,
+    # credentials, .env files, or Docket state. No ignored content enters evidence.
+    for name in ('.venv', 'venv', 'node_modules'):
+        entry = source / name
+        target = output / name
+        if target.exists() or target.is_symlink() or not entry.is_dir():
+            continue
+        if git_text(source, 'check-ignore', '-q', '--', name) is None:
+            continue
+        resolved = entry.resolve()
+        state = (root() / STATE_DIR).resolve()
+        if (resolved == source.resolve() or resolved in source.resolve().parents
+                or resolved == state or state in resolved.parents
+                or any(part.startswith('.env') or part in (STATE_DIR, '.ssh', '.aws', 'secrets', 'credentials')
+                       for part in resolved.parts)):
+            continue
+        target.symlink_to(resolved, target_is_directory=True)
+        linked.append(f"{name} -> {resolved}")
+    return linked
+
+
 def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                             baseline: bool = False, rnd: int | None = None) -> None:
     """Export pinned trees through private indexes, never through the measured checkout."""
@@ -784,6 +820,7 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                 trees.append((record, str(source['baseline_tree'] if baseline else source['tree'])))
             if not trees:
                 die("frozen tree unavailable; documents-only evidence has no checkout")
+        linked = []
         stage = Path(tempfile.mkdtemp(prefix='.docket-checkout-', dir=destination.parent))
         try:
             for record, tree in trees:
@@ -792,10 +829,7 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                     die("DAMAGED: invalid root alias")
                 output = stage if len(trees) == 1 else stage / alias
                 output.mkdir(exist_ok=True)
-                env = private_git_env(d, record, f'checkout.{os.getpid()}.{alias}.index')
-                index = Path(env['GIT_INDEX_FILE'])
-                index.unlink(missing_ok=True)
-                try:
+                with reconstruction_index(d, record, f'checkout.{alias}.index') as env:
                     code, _, err = private_git(env, root(), 'read-tree', tree)
                     if not code:
                         code, entries, err = private_git(env, root(), 'ls-files', '--stage', '-z')
@@ -803,8 +837,7 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                         export_index_entries(env, output, entries)
                     if code:
                         die(f"frozen tree unavailable: {first_line(err)}")
-                finally:
-                    index.unlink(missing_ok=True)
+                linked.extend((str(record['alias']), name) for name in link_checkout_runtime(record, output))
             os.rename(stage, destination)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
@@ -813,6 +846,9 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
             shutil.rmtree(private_parent, ignore_errors=True)
         raise
     print(f"materialized {'baseline' if baseline else 'frozen bundle'} for {owner}: {destination}")
+    for alias, name in linked:
+        prefix = alias + "/" if len(trees) > 1 else ""
+        print(f"linked runtime: {prefix}{name}")
     if len(trees) > 1:
         print("roots: " + ', '.join(str(record['alias']) for record, _ in trees))
     print("Run the registered focused or milestone suite with this directory as cwd; "

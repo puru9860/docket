@@ -152,6 +152,9 @@ class PlanReview(unittest.TestCase):
         make = tempfile.mkdtemp
         def outside(*args, **kwargs):
             parent = Path(kwargs['dir']).resolve()
+            if kwargs.get('prefix') == 'index-':
+                self.assertEqual(self.mod.bundle_work(self.t.f.root / '.docket/runs/demo').resolve(), parent)
+                return make(*args, **kwargs)
             self.assertNotEqual(self.t.f.root, parent)
             self.assertNotIn(self.t.f.root, parent.parents)
             path = make(*args, **kwargs)

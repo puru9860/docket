@@ -76,7 +76,8 @@ Then end your turn.
 The conductor launches workers, runs ready milestone suites, and delivers worker wakes.
 Do not monitor panes, poll status, or relay healthy progress.
 
-Run fields accept init options with underscores replacing hyphens, plus `risks`, `out_of_scope`, and flat `policy` settings such as `premium_models`, `token_budget`, `review_reserve`, and `correction_limit`.
+Run fields accept init options with underscores replacing hyphens, plus `risks` and `out_of_scope` (a string or a list of strings), and flat `policy` settings such as `premium_models`, `token_budget`, `review_reserve`, and `correction_limit`.
+Task `risk` and `complexity` are `low` or `high`; a refusal names the plan path, such as `tasks[0].risk`.
 Roots are explicit `alias=path` strings; a checkout uses `evidence_mode: git`.
 Omitting roots declares only the enclosing checkout; name nested repositories and linked worktrees explicitly.
 Never commit, stash, or recapture user work to clean a baseline.
