@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .common import ACTING_ROLES, STATE_DIR, die, stamp
 from .frontmatter import checkbox_items, parse, render, sections, set_section
-from .paths import _ordered, decisions, handoffs, latest, owners, reports, root, scope_path
+from .paths import _ordered, decisions, handoffs, latest, owners, read_dispatch, reports, root, scope_path
 from .publication import publish, publish_json
 from .policy import authority_for, is_five_role, is_quick_milestone, is_tiered
 from .roots import declared_roots, resolve_scope, split_qualified
@@ -205,13 +205,26 @@ def scope_collisions(d: Path, owner: str, proposed: list[str]) -> list[str]:
     sequencing: the verifier settled it for dispatch while the milestone verdict
     still decides approval. A correction reopens with a fresh baseline and
     reclaims its scope the same way any dispatch does.
+
+    Under the quick milestone policy one implementor works a milestone's members
+    in turn, so only a sibling whose current draft round is dispatched writes.
+    Holding an idle sibling's scope deadlocked corrections of members sharing a file.
     """
     collisions: list[str] = []
     terminal = {"approved", "waived", "completed"}
     roots = declared_roots(d)
     mine = resolve_scope(roots, proposed)[0]
+    idle_siblings: set[str] = set()
+    if is_quick_milestone(d):
+        for batch in list_batches(d):
+            members = [str(m) for m in batch.get("members") or []]
+            if batch.get("milestone") and owner in members:
+                for member in members:
+                    rnd, status = state_of(d, member)
+                    if status != "draft" or str(read_dispatch(d, member).get("round", "")) != str(rnd):
+                        idle_siblings.add(member)
     for other in owners(d):
-        if other in (owner, "orch") or state_of(d, other)[1] in terminal:
+        if other in (owner, "orch") or other in idle_siblings or state_of(d, other)[1] in terminal:
             continue
         try:
             if _tiered_settled_local(d, other):

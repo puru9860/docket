@@ -136,6 +136,27 @@ class TokenCost(unittest.TestCase):
         self.assertIn('1 observation', feedback)
         self.assertIn('implementor', feedback)
 
+    def test_corrections_of_siblings_sharing_a_file_do_not_deadlock(self):
+        data = self.plan()
+        task = data['tasks'][0]
+        data['tasks'] = [dict(task, owner=o, title=f'Feature {o}') for o in ('T01', 'T02')]
+        data['milestones'][0]['members'] = ['T01', 'T02']
+        self.apply(data)
+        run = self.f.root / '.docket/runs/demo'
+        for owner in ('T01', 'T02'):
+            self.cli('dispatch', 'demo', owner, '--session', 'worker', '--register')
+            self.f.fill_scope(run / f'{owner}-scope.mdx')
+            self.cli('scope', 'demo', owner, '--submit')
+            self.f.fill_task_report(run / f'{owner}-report-01.mdx')
+            self.cli('submit', 'demo', owner, '--as', 'implementor', '--feedback', 'none')
+        for owner in ('T01', 'T02'):
+            self.cli('decide', 'demo', owner, '--changes', '--as', 'reviewer',
+                     '--change', '1. Correct the shared file.')
+
+        self.cli('dispatch', 'demo', 'T01', '--session', 'worker')
+        busy = self.cli('dispatch', 'demo', 'T02', '--session', 'other', ok=False)
+        self.assertIn('src/a.py overlaps T01', busy.stderr + busy.stdout)
+
     def test_completion_contains_verdicts_suite_and_finish_archives_disarms(self):
         run = self.ready()
         self.cli('arm', 'demo', '--role', 'planner')
