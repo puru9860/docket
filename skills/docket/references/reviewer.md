@@ -36,7 +36,8 @@ Challenge green-but-wrong evidence, including fixtures or expected values adjust
 Inspect preservation and error invariants, sibling sites, and side effects on pre-existing user data.
 Materialize the frozen source with `docket bundle <run> <owner> --checkout`.
 The export prints any linked ignored dependency environments, such as `.venv`, so registered commands can run from the printed directory.
-Use the printed fresh private directory for selective boundary and negative checks using the frozen focused command or packet milestone command as cwd-local shell commands.
+Use the printed private directory as cwd for focused boundary and negative checks that answer unresolved questions.
+Read the frozen command and its captured output before choosing extra checks.
 Multi-root exports put each checkout under its alias.
 A failure claim must inject the failure into the named component and detect an incorrect outcome.
 Use conditional baseline-red checks when needed to distinguish the claimed fix from an already-passing test.

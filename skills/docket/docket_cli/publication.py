@@ -45,7 +45,7 @@ def perturb(point: str) -> None:
 # bodies, frozen bundles, and the private object store. They can contain secrets, so
 # they are readable by their owner alone, which covers everything beneath them.
 PRIVATE_STATE_DIRS = (".snapshots", ".bundles", ".baselines", ".submit-jobs",
-                      ".instructions")
+                      ".instructions", ".checkouts")
 
 
 def keep_private(path: Path) -> None:

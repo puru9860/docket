@@ -901,14 +901,14 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
 
     report = f"{rel}/{owner}-report-{rnd:02d}.mdx"
     checkout = (f"For selective execution, run `docket bundle {run} {owner} --checkout`; "
-                "use the printed fresh private directory for the frozen contract's focused verify command "
-                "or the milestone command from the packet with the exported directory as cwd "
+                "use the printed private directory for selective boundary and negative checks "
+                "with the exported directory as cwd "
                 "(multi-root checkouts are under their aliases).")
     if role in ("reviewer", "verifier", "checker") and owner != 'orch':
         frozen, _problems = current_bundle(d, owner, rnd)
         command = str((frozen or {}).get('verification', {}).get('command', ''))
         if command:
-            checkout += f" Focused check: `cd PRINTED_CHECKOUT && ({command})`; replace PRINTED_CHECKOUT with the printed directory and apply its frozen declared environment."
+            checkout += f" Captured verify command: `{command}`. Do not routinely rerun it; use selective checks for unresolved questions in the printed directory with its frozen declared environment."
     decide_as = as_role("decide:approve")
     if role == "reviewer" and is_tiered(d) and owner != "orch":
         milestone = next((str(batch.get("batch")) for batch in list_batches(d)
@@ -1006,7 +1006,7 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         f"Fill `{report}`: summary, files changed (every path `docket diff {run} {owner}` lists, "
         "earlier rounds included), the acceptance boxes (criteria exactly as "
         "the task states them, each checked only when it genuinely passes), the registered "
-        "verify command and any observed output (or say submit will capture it), and decisions needed.",
+        "verify command with \"submit will capture it\", and decisions needed.",
         f"Run `docket submit {run} {owner} --check` until it passes: it lists exactly what the "
         "gate would refuse and changes nothing, so never read docket's own source to learn the "
         f"rules. Then submit with `docket submit {run} {owner}{submit_as} --feedback TEXT|none` "
@@ -1044,8 +1044,9 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
                f"`docket handoff {run} {owner} --submit`; a submitted round needs no handoff.")
     build = (f"Run `docket preflight {run} {owner}` when a before-change baseline matters, "
              "then implement only inside the accepted files. Submission runs and freezes "
-             "the registered final verify once in a fresh process each round; run extra "
-             "checks for failures or concrete risks. Compare old and new behavior with "
+             "the registered final verify once in a fresh process each round. While working, "
+             "run only focused tests for the change. Do not run the registered verify command "
+             "yourself before submitting: docket submit runs it and captures its output into the frozen bundle. Compare old and new behavior with "
              "the same method on both sides when that comparison "
              "is needed.")
     review = (

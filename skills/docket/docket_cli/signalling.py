@@ -17,6 +17,8 @@ from .paths import root, run_dir
 from .publication import fault, perturb, publish, publish_json
 from .policy import conductor_managed, fresh_context_resume, fresh_context_tool, need_run, plan_flag, require_preset_role
 from .baselines import evidence_mode
+from .bundles import cleanup_checkout_exports
+from .locks import owner_lock
 from .state import armed
 from .sessions import (
     calling_harness, codex_home, codex_stop_hook_installed, harness_session,
@@ -189,6 +191,12 @@ def cmd_arm(a: argparse.Namespace) -> None:
 
 
 def cmd_disarm(a: argparse.Namespace) -> None:
+    if a.role is None:
+        runs = ([run_dir(a.run)] if a.run else (root() / STATE_DIR / 'runs').glob('*'))
+        for d in runs:
+            if d.is_dir():
+                with owner_lock(d, 'checkout-exports'):
+                    cleanup_checkout_exports(d)
     conf = root() / STATE_DIR / "watch.conf"
     with watch_conf_lock():
         keep = [

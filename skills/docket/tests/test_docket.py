@@ -15495,16 +15495,16 @@ class DocketCLI(unittest.TestCase):
                                "--peek").stdout
         self.assertIn("batch:M1:verify-failed", orch_events)
 
-    def test_tiered_playbooks_assign_focused_verification(self) -> None:
-        """Planner, implementor, and verifier put the full suite at the milestone."""
+    def test_playbooks_assign_submission_verification_and_preserve_historical_verifier(self) -> None:
+        """Current workers leave verify to submit; historical verifiers avoid duplicate suites."""
         skill = Path(__file__).parents[1]
         planner = (skill / "references" / "planner.md").read_text()
         implementor = (skill / "references" / "implementor.md").read_text()
         verifier = (skill / "references" / "verifier.md").read_text()
-        self.assertIn("focused per-task verification", planner)
+        self.assertIn("focused per-task verification; reserve the full suite for the milestone command", planner)
         self.assertIn("docket batch", planner)
         self.assertIn("`docket submit` runs the registered `verify:` command", implementor)
-        self.assertIn("never in a task", implementor)
+        self.assertIn("Do not run the registered verify command yourself", implementor)
         self.assertIn("never rerun", verifier)
         self.assertIn("docket batch", verifier)
         self.assertIn("full suite", verifier)

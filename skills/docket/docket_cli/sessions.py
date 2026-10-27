@@ -902,24 +902,30 @@ def opencode_session_usage(rows: dict[str, object] | None, since: str = "",
 
 
 def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path], object]:
-    """Usage inside the session's run window, transcript files, and OpenCode rows."""
-    since = str(ref.get("first_seen", "") or "")
+    """Usage in the attributed window, with planner preparation labelled separately."""
+    since = str(ref.get("usage_since", ref.get("first_seen", "")) or "")
     until = str(ref.get("until", "") or "")
+    files, rows = [], None
     if ref.get("harness") == "opencode":
         rows = opencode_session_rows(str(ref.get("session_id", "")))
-        usage = opencode_session_usage(rows, since, until)
-        usage["found"] = rows is not None
-        usage["transcript"] = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
+        calls, times, cwd = opencode_calls(rows)
+        found = rows is not None
+        transcript = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
     else:
         files = session_transcripts(ref)
-        usage = (claude_session_usage if ref.get("harness") == "claude"
-                 else codex_session_usage)(files, since, until)
-        usage["found"] = bool(files)
-        usage["transcript"] = str(files[0]) if files else ""
-        return (usage if usage["found"] else {**usage, "telemetry": "missing"}), files, None
-    if not usage["found"]:
+        calls, times, cwd = (claude_calls if ref.get("harness") == "claude" else codex_calls)(files)
+        found = bool(files)
+        transcript = str(files[0]) if files else ""
+    usage = summarize_calls(calls, times, since, until)
+    usage.update(found=found, transcript=transcript, harness_cwd=cwd)
+    if "planner" in ref.get("roles", []):
+        joined = str(ref.get("first_seen", "") or "")
+        boundary = min((value for value in (joined, until) if value), key=_instant, default="")
+        usage["planning"] = summarize_calls(calls, times, since, boundary)
+        usage["run_work"] = summarize_calls(calls, times, joined, until)
+    if not found:
         usage["telemetry"] = "missing"
-    return usage, [], rows
+    return usage, files, rows
 
 
 def observed_session_models(ref: dict[str, object]) -> list[str]:
@@ -1026,6 +1032,27 @@ def session_until(d: Path, ref: dict[str, object]) -> str:
     return stamp(min(bounds)) if bounds else ""
 
 
+def session_since(d: Path, ref: dict[str, object]) -> str:
+    """Planner preparation starts after the last run that owned this same session."""
+    joined = str(ref.get('first_seen', '') or '')
+    joined_at = _instant(joined)
+    if 'planner' not in ref.get('roles', []) or joined_at is None:
+        return joined
+    bounds = []
+    for ledger in d.parent.glob(f'*/{HARNESS_SESSION_LEDGER}'):
+        if ledger.parent == d:
+            continue
+        for previous in run_harness_sessions(ledger.parent):
+            if (previous['harness'], previous['session_id']) != (ref['harness'], ref['session_id']):
+                continue
+            moment = _instant(str(previous.get('first_seen', '')))
+            if moment is not None and moment < joined_at:
+                end = _instant(session_until(ledger.parent, previous))
+                if end is not None:
+                    bounds.append(end.timestamp())
+    return stamp(min(joined_at.timestamp(), max(bounds))) if bounds else ""
+
+
 def opencode_export(sid: str) -> bytes | None:
     """`opencode export` of one session, or None when OpenCode cannot export it."""
     binary = shutil.which("opencode")
@@ -1100,7 +1127,7 @@ def collect_run_usage(d: Path, archive: bool) -> list[dict[str, object]]:
     """Usage per noted session; archiving also copies transcripts and logs usage."""
     out = []
     for ref in run_harness_sessions(d):
-        ref = {**ref, "until": session_until(d, ref)}
+        ref = {**ref, "usage_since": session_since(d, ref), "until": session_until(d, ref)}
         usage, files, rows = session_usage(ref)
         target = None
         if archive:
@@ -1156,6 +1183,15 @@ def cmd_usage(a: argparse.Namespace) -> None:
               f"{tokens_h(r['input']):>8} {tokens_h(r['cache_read']):>9} "
               f"{tokens_h(r['cache_write']):>9} {tokens_h(r['output']):>8} "
               f"{tokens_h(r['total']):>9}  {', '.join(r['models']) or '-'}")
+        if 'planning' in r:
+            planning, work = r['planning'], r['run_work']
+            spans = []
+            for label, span in (('planning', planning), ('run work', work)):
+                count = (f"{tokens_h(span['total'])} tokens, {span['calls']} calls"
+                         if span['telemetry'] == 'measured' else 'unknown (no call in span)')
+                spans.append(f"{label}: {count}")
+            print(f"    {spans[0]} ({planning['since'] or 'session start'} "
+                  f"to {planning['until'] or 'now'}); {spans[1]}")
     by_role: dict[str, list[int]] = {}
     for r in rows:
         by_role.setdefault("+".join(r["roles"]) or "unknown", []).append(int(r["total"]))

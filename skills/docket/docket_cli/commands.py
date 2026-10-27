@@ -1009,7 +1009,8 @@ def cmd_bundle(a: argparse.Namespace) -> None:
             problems = aggregate_bundle_problems(d, entry) if entry else ['no aggregate bundle']
             if problems:
                 die("DAMAGED: " + "; ".join(problems))
-        return materialize_bundle_tree(d, a.owner, Path(a.checkout) if a.checkout else None, baseline=a.baseline, rnd=a.round)
+        with owner_lock(d, 'checkout-exports'):
+            return materialize_bundle_tree(d, a.owner, Path(a.checkout) if a.checkout else None, baseline=a.baseline, rnd=a.round)
     if getattr(a, "baseline", False):
         die("--baseline requires --checkout [DIR]")
     entries = bundles_for(d, a.owner, a.round)
@@ -1594,6 +1595,24 @@ def cmd_plan_apply(a: argparse.Namespace) -> None:
             print(f"warning: every task's scope includes {path}; tasks sharing it take turns on it "
                   "and nothing shows which task owns a change there, so narrow it to the tasks "
                   "that need it")
+
+    by_owner = {task.owner: task for task in assignments}
+    for task in assignments:
+        if '&&' in task.verify or ';' in task.verify:
+            print(f"warning: {task.owner} verify chains commands; "
+                  "a task verify should be the focused tests only; the full suite runs once per milestone")
+    for milestone in milestones:
+        members = [by_owner[owner] for owner in milestone['members']]
+        suite = str(milestone.get('command', '')).strip()
+        for task in members:
+            if suite and task.verify.strip() == suite:
+                print(f"warning: {task.owner} verify equals milestone {milestone['id']} full-suite command; "
+                      "a task verify should be the focused tests only; the full suite runs once per milestone")
+        high = [task.owner for task in members if task.complexity == 'high']
+        if len(members) >= 3 and high:
+            print(f"warning: milestone {milestone['id']} mixes high-complexity task "
+                  f"{', '.join(high)} with two or more other tasks; give each its own milestone "
+                  "so corrections use a fresh implementor session")
 
 
 def cmd_launch(a: argparse.Namespace) -> None:

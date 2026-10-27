@@ -689,7 +689,12 @@ Implementor self-review includes a decisive negative control in an isolated copy
 Verifier prompts map criteria to independent observations, inspect changed tests for false positives, and run one or two decisive negative controls.
 The guidance budgets 2-3 minutes of model work plus declared check runtime, recording material gaps as uncertainty rather than a rushed pass and avoiding duplicate runs of an identical captured suite.
 Planner guidance defaults to one milestone and sizes each task by a checkable behavior with meaningful tests that fits one context.
-Additional milestones require a real intermediate approval checkpoint: a risky foundation, independently shippable parts, or work exceeding one implementor context.
+Additional milestones isolate a risky foundation, independently shippable parts, work exceeding one implementor context, or a high-complexity task likely to need correction rounds.
+Each high-complexity task gets its own milestone and a fresh visible implementor session.
+Task verify commands contain only focused tests for that task; the full suite runs once per milestone through `docket batch --verify`.
+Different focused verify commands within one milestone are expected.
+Plan application warns about chained task verify commands, task verify commands equal to their milestone suite, and high-complexity tasks grouped with at least two siblings.
+Implementors run focused tests while working and leave the registered final verification to submission, stating "submit will capture it" in the report.
 Shared discovery and invariants justify merging; independent acceptance or context overflow justify splitting.
 Acceptance states the failure model and explicitly excluded failure classes before implementation.
 `docket submit --check` runs the same structural checks a submission would and prints what they refuse, with no verify run, freeze, or write; live implementors otherwise read the gate's own source to learn the report rules. An unknown Evidence artifact is refused with the list of what an artifact can be and where to save a real run's output (`.docket/runs/<run>/evidence/`, outside every task diff).
@@ -734,7 +739,17 @@ A session is noted for one role per run, the first it speaks for.
 A supervisor routinely runs commands on another role's behalf, arming the verifier or handing off a stuck implementor's task, and noting those would attribute its tokens to roles it never played; a command whose role differs from the session's `DOCKET_ROLE` is not noted either.
 A command names its role by its own `--as`/`--role`, so a planner's `assign --as planner` is noted as the planner rather than falling into the new quick default of implementor.
 An explicit transport registration (`arm --session`, `session --register`, `dispatch --register`) made from the session noted for that same role also records the session's native and process identity (`native_harness`, `native_process`) in the registration, which is what lets the companion prove its terminal; a registration for another role, or one that already holds an identity, is never given the caller's.
-`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) as one record per model call and counts the calls inside the session's run window. The window opens when the role first joined this run and closes at the earlier of the run's end (its last decision plus a wrap-up allowance that also covers the run's own closing feedback) and the moment the same session was first noted by another run, so a TUI kept open or reused after `/clear` never inflates a closed run. Codex's cumulative counter becomes per-call deltas over every shard of the thread, the resumed `rollout-<time>-<sid>_<shard>.jsonl` continuation included once its own session_meta names the thread; a repeated reading is not another call. Each session also splits its totals by model call by call, so one OpenCode session that moved between three models no longer counts its whole total under each of them, and model scorecards use that split. A transcript with no call inside the window reports `telemetry: empty`, a gap rather than zero tokens. A command an OpenCode subagent runs is credited to its root session, whose usage already sums its subagents. `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the run-window usage there, and the final aggregate verdict archives automatically.
+`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) as one record per model call and counts the calls inside its attributed window.
+The window opens when the role first joined this run, except for the planner, whose planning counts from session start or the end of the previous run that noted the same session.
+Planner records label the extra span as `planning` and the ordinary joined window as `run_work`, with separate counts in JSON, archives, and human output.
+An unfinished previous run owns the session until this run joins, so its work is never attributed again as planning.
+The upper bound remains the earlier of the run's end (its last decision plus a wrap-up allowance that also covers the run's own closing feedback) and the moment the same session was first noted by another run.
+Codex's cumulative counter becomes per-call deltas over every shard of the thread, the resumed `rollout-<time>-<sid>_<shard>.jsonl` continuation included once its own session_meta names the thread; a repeated reading is not another call.
+Each session splits its totals by model call by call, so a mixed session never counts its whole total under each model.
+A transcript with no call inside the attributed window reports `telemetry: empty`, a gap rather than zero tokens.
+A command an OpenCode subagent runs is credited to its root session, whose usage already sums its subagents.
+`--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the attributed usage there.
+The final aggregate verdict archives automatically.
 Submission observes the latest model call from the exact dispatch-bound native session and registration generation, inside its noted run window.
 `submit --check` uses the observation without writing; submission records it in the report, task, and dispatch before capturing verification identity.
 Without an observation the actual-model refusal remains; launch requests never supply observations.
@@ -1148,7 +1163,15 @@ The address is `sha256` over the manifest, which itself carries a `sha256` of ev
 artifact beside it. So a bundle cannot be edited without changing its own name, and a
 later workspace edit, a later report edit, a retry, or a whole later round can only ever
 produce a *different* address. `docket bundle <run> <owner>` recomputes every artifact digest and reports `DAMAGED` rather than showing evidence it cannot vouch for.
-Its `--checkout [DIR]` variant exports frozen source trees outside every declared checkout and the workspace; omitting DIR allocates a fresh private directory and prints its path.
+Its `--checkout [DIR]` variant exports frozen source trees outside every declared checkout and the workspace; omitting DIR records a private temporary export under the run's `.checkouts/` and prints its path.
+An export for the same owner, bundle digest, and tree selection is reused when its metadata fingerprint matches.
+The fingerprint uses relative paths, lstat mode, size, mtime_ns, and symlink targets without reading file contents or following linked runtimes.
+A new managed export removes older exports for the same owner and kind (baseline or source), after successful reconstruction and under the export lock and ownership checks.
+Other owners, the other kind, and explicit destinations remain available.
+The export registry and ownership marker bind the created parent by path, device, inode, and random token.
+Finish, a whole-run disarm (including abandonment), and final aggregate completion remove only those owned parents; an explicit `--checkout DIR` is never recorded or removed.
+Role-only disarm keeps exports available to the remaining roles.
+Export and cleanup hold the same run-scoped export lock.
 `--baseline` exports the pinned baseline for a negative control.
 Before submission, the baseline variant rebuilds the captured snapshot; afterwards it uses the immutable bundle baseline, including an explicit `--round`.
 Exports use run-private Git indexes and object storage, read raw blobs without smudge filters, preserve symlinks and executable modes, and publish a complete destination with one rename.

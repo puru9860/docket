@@ -21,7 +21,7 @@ from .policy import (
     task_executor,
 )
 from .baselines import evidence_digest, evidence_mode, task_verify
-from .bundles import digest_of
+from .bundles import cleanup_checkout_exports, digest_of
 from .locks import owner_lock
 from .state import (
     applied_decision, batch_path, group_numbered_items, latest_verification, list_batches,
@@ -513,6 +513,8 @@ def announce_transition(a: argparse.Namespace, d: Path, rnd: int, verdict: str, 
     if verdict in ("approved", "waived"):
         print(f"{a.owner} round {rnd} {verdict} -> {dec.name}")
         if a.owner == "orch":
+            with owner_lock(d, "checkout-exports"):
+                cleanup_checkout_exports(d)
             # The run is settled: keep every role's conversation and token usage
             # before harness retention can delete them. Never blocks the verdict.
             try:

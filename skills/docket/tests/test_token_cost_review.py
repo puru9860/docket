@@ -113,7 +113,7 @@ class PlanReview(unittest.TestCase):
         self.assertTrue(path.parent.name.startswith("docket-checkout-"))
         self.assertEqual(Path(tempfile.gettempdir()).resolve(), path.parent.parent)
         self.assertEqual(0o700, path.parent.stat().st_mode & 0o777)
-        self.addCleanup(shutil.rmtree, path.parent)
+        self.addCleanup(shutil.rmtree, path.parent, True)
         self.assertFalse(self.t.f.root == path or self.t.f.root in path.parents)
         return path
 
@@ -124,6 +124,8 @@ class PlanReview(unittest.TestCase):
         self.cli('submit', 'demo', 'T01', '--as', 'implementor')
         first = self.export()
         first_baseline = self.export('--baseline')
+        self.assertEqual('round one\n', (first / 'src/a.py').read_text())
+        self.assertEqual('baseline\n', (first_baseline / 'src/a.py').read_text())
         self.cli('decide', 'demo', 'T01', '--changes', '--as', 'reviewer', '--change', 'Handle the second input.')
         self.cli('dispatch', 'demo', 'T01', '--session', 'worker')
         source.write_text('round two\n')
@@ -131,6 +133,9 @@ class PlanReview(unittest.TestCase):
         self.cli('submit', 'demo', 'T01', '--as', 'implementor')
         second = self.export()
         second_baseline = self.export('--baseline')
+        self.assertEqual('round two\n', (second / 'src/a.py').read_text())
+        self.assertFalse(first.parent.exists())
+        self.assertFalse(first_baseline.parent.exists())
         report = run / 'T01-report-02.mdx'
         report.write_text(report.read_text() + '\nAdditional observed evidence.\n')
         source.write_text('round two re-reviewed\n')
@@ -138,10 +143,9 @@ class PlanReview(unittest.TestCase):
                  '--change', 'Check the remaining input boundary.')
         reviewed = self.export('--round', '2')
         self.assertEqual(5, len({first, second, reviewed, first_baseline, second_baseline}))
-        self.assertEqual('round one\n', (first / 'src/a.py').read_text())
-        self.assertEqual('round two\n', (second / 'src/a.py').read_text())
+        self.assertFalse(second.parent.exists())
         self.assertEqual('round two re-reviewed\n', (reviewed / 'src/a.py').read_text())
-        self.assertEqual('baseline\n', (first_baseline / 'src/a.py').read_text())
+        self.assertEqual(3, len(self.mod.bundles_for(run, 'T01')))
         self.assertEqual('round one\n', (second_baseline / 'src/a.py').read_text())
         self.assertEqual('draft', self.mod.state_of(run, 'T01')[1])
 

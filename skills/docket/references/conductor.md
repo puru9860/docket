@@ -24,6 +24,8 @@ A continued reviewer also closes when it is no longer the reuse candidate, and e
 If a superseded reviewer is still busy, cleanup waits until it becomes idle and remains pending across later milestones.
 The conductor records pane IDs, agent names, requested assignments, launch times, and last deliveries under `.conductor/`.
 These are transport records, never observed models or lifecycle authority.
+Do not run task verify commands separately; `docket submit` captures each registered focused task command.
+The full suite runs once per milestone through `docket batch --verify`, never in task verification or as an extra manual shell run.
 Workers register themselves and acknowledge announcements with the pickup commands in their prompts.
 They end each turn instead of starting a watcher; see [signalling.md](signalling.md).
 

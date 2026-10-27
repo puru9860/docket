@@ -9,11 +9,15 @@ Carry the standing constraints they give into risks and out of scope.
 ## Size the work
 
 Default to one milestone for the whole change, delivering one demonstrable capability.
-Split only for a real intermediate approval checkpoint: later work builds on a risky foundation that must be approved first, parts are independently shippable, or the work exceeds one implementor's working context.
+Split for a real intermediate approval checkpoint: later work builds on a risky foundation that must be approved first, parts are independently shippable, or the work exceeds one implementor's working context.
+Put a `complexity: high` task, or one likely to need correction rounds, in its own milestone so corrections use a fresh implementor session without context accumulated across other tasks.
+Keep one fresh visible implementor session per milestone, without task subagents.
 Each task is one checkable behavior with meaningful tests that fits one working context.
 Prefer fewer, larger tasks with shared discovery or inseparable invariants.
 State the failure model and excluded failure classes without contradicting acceptance.
 Assign focused per-task verification; reserve the full suite for the milestone command.
+A task verify should contain only its focused tests, never a full suite chained after them.
+Focused verify commands differ by task; the full suite runs once per milestone through `docket batch --verify`.
 Name real-system boundary observations when mocks cannot prove a criterion.
 
 ## Apply the complete plan

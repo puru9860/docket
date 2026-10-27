@@ -17,7 +17,7 @@ from .paths import dispatch_path, latest, read_dispatch, reports, root, scope_pa
 from .publication import perturb, publish, publish_json
 from .policy import is_five_role, need_run, require_five_role, submit_op_for, topology
 from .baselines import baseline_path, evidence_mode, task_verify
-from .bundles import digest_of, source_identity
+from .bundles import cleanup_checkout_exports, digest_of, source_identity
 from .locks import owner_lock
 from .dependencies import dependency_problems, deps_path, deps_record_bytes
 from .freeze import freeze_task_bundle
@@ -422,6 +422,9 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
     else:
         meta["status"] = "submitted"
     publish(rep, render(meta, body))
+    if a.owner == "orch" and meta["status"] == "completed":
+        with owner_lock(d, "checkout-exports"):
+            cleanup_checkout_exports(d)
     if frozen:
         patch = frozen["patch"]
         kind = frozen.get("kind", "task-round")

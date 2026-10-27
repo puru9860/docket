@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -751,6 +752,64 @@ def link_checkout_runtime(record: dict[str, object], output: Path) -> list[str]:
     return linked
 
 
+def checkout_export_fingerprint(directory: Path) -> str:
+    """Check export metadata without reading payloads or following linked runtimes."""
+    entries = []
+    for parent, directories, files in os.walk(directory):
+        for name in sorted([*directories, *files]):
+            path = Path(parent) / name
+            info = path.lstat()
+            target = os.readlink(path) if stat.S_ISLNK(info.st_mode) else ''
+            entries.append((str(path.relative_to(directory)), info.st_mode, info.st_size,
+                            info.st_mtime_ns, target))
+    return digest_of(json.dumps(sorted(entries)).encode())
+
+
+def owned_checkout_export(d: Path, record: dict) -> Path | None:
+    """A path alone is never authority to delete a temporary directory."""
+    try:
+        parent = Path(record['parent'])
+        if not parent.is_absolute() or parent.is_symlink() or parent.resolve() != parent:
+            return None
+        if not parent.name.startswith('docket-checkout-'):
+            return None
+        surfaces = [root().resolve(), *(Path(str(r['path'])).resolve() for r in declared_roots(d))]
+        if any(parent == surface or surface in parent.parents or parent in surface.parents
+               for surface in surfaces):
+            return None
+        info = parent.stat()
+        if [info.st_dev, info.st_ino] != record['identity']:
+            return None
+        marker = parent / '.docket-export.json'
+        if marker.is_symlink():
+            return None
+        proof = json.loads(marker.read_text())
+        if proof != {'run': str(d.resolve()), 'token': record['token']}:
+            return None
+        return parent
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cleanup_checkout_exports(d: Path, *, owner: str = "", baseline: bool = False,
+                             keep: Path | None = None) -> None:
+    """Caller holds the checkout-exports lock, also used by materialization."""
+    for path in (d / '.checkouts').glob('*.json'):
+        if path == keep:
+            continue
+        try:
+            record = json.loads(path.read_text())
+            if owner and (record.get('owner') != owner or record.get('baseline') is not baseline):
+                continue
+            parent = owned_checkout_export(d, record)
+            if parent is not None:
+                shutil.rmtree(parent)
+            path.unlink()
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Keep a failed removal recorded so a later disarm can retry it.
+            continue
+
+
 def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                             baseline: bool = False, rnd: int | None = None) -> None:
     """Export pinned trees through private indexes, never through the measured checkout."""
@@ -759,31 +818,10 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
 
     roots = declared_roots(d)
     private_parent = None
-    if destination is None:
-        surfaces = [root().resolve(), *(Path(str(record['path'])).resolve() for record in roots)]
-        candidates = [Path(os.environ[key]).expanduser().resolve()
-                      for key in ('TMPDIR', 'TEMP', 'TMP') if os.environ.get(key)]
-        candidates.extend(Path(name) for name in ('/tmp', '/var/tmp', '/usr/tmp'))
-        parent = next((path for path in candidates if path.is_dir()
-                       and os.access(path, os.W_OK | os.X_OK)
-                       and all(path != surface and surface not in path.parents for surface in surfaces)), None)
-        if parent is None:
-            die("no temporary directory outside the checkout roots; use --checkout DIR")
-        private_parent = Path(tempfile.mkdtemp(prefix="docket-checkout-", dir=parent))
-        destination = private_parent / "tree"
-    else:
-        destination = destination.expanduser().resolve()
+    registry = None
+    export_record = None
+    linked = []
     try:
-        for record in roots:
-            checkout = Path(str(record['path'])).resolve()
-            if destination == checkout or checkout in destination.parents or destination in checkout.parents:
-                die("--checkout must be outside every declared checkout, including its ancestors")
-        if destination == root() or root() in destination.parents:
-            die("--checkout must be outside the workspace")
-        if destination.exists():
-            die(f"checkout destination already exists: {destination}")
-        if not destination.parent.is_dir():
-            die("checkout destination parent must exist")
         trees = []
         selected_round = rnd
         if baseline and rnd is None:
@@ -820,30 +858,80 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
                 trees.append((record, str(source['baseline_tree'] if baseline else source['tree'])))
             if not trees:
                 die("frozen tree unavailable; documents-only evidence has no checkout")
-        linked = []
-        stage = Path(tempfile.mkdtemp(prefix='.docket-checkout-', dir=destination.parent))
-        try:
-            for record, tree in trees:
-                alias = str(record['alias'])
-                if not alias or Path(alias).name != alias or alias in ('.', '..'):
-                    die("DAMAGED: invalid root alias")
-                output = stage if len(trees) == 1 else stage / alias
-                output.mkdir(exist_ok=True)
-                with reconstruction_index(d, record, f'checkout.{alias}.index') as env:
-                    code, _, err = private_git(env, root(), 'read-tree', tree)
-                    if not code:
-                        code, entries, err = private_git(env, root(), 'ls-files', '--stage', '-z')
-                    if not code:
-                        export_index_entries(env, output, entries)
-                    if code:
-                        die(f"frozen tree unavailable: {first_line(err)}")
-                linked.extend((str(record['alias']), name) for name in link_checkout_runtime(record, output))
-            os.rename(stage, destination)
-        finally:
-            shutil.rmtree(stage, ignore_errors=True)
+        if destination is None:
+            key = digest_of(json.dumps({'owner': owner, 'bundle': entry.get('digest') if entry else '',
+                'baseline': baseline, 'trees': [(r['alias'], r['path'], tree) for r, tree in trees]},
+                sort_keys=True).encode()).split(':')[1]
+            registry = d / '.checkouts' / f'{key}.json'
+            try:
+                export_record = json.loads(registry.read_text())
+            except (OSError, ValueError):
+                export_record = {}
+            cached = owned_checkout_export(d, export_record)
+            if cached is not None and not (cached / 'tree').is_symlink() and (cached / 'tree').is_dir():
+                if export_record.get('fingerprint') == checkout_export_fingerprint(cached / 'tree'):
+                    destination = cached / 'tree'
+                    linked = [tuple(item) for item in export_record.get('linked', [])]
+            if cached is not None and destination is None:
+                shutil.rmtree(cached)
+            if destination is None:
+                surfaces = [root().resolve(), *(Path(str(r['path'])).resolve() for r in roots)]
+                candidates = [Path(os.environ[key]).expanduser().resolve()
+                              for key in ('TMPDIR', 'TEMP', 'TMP') if os.environ.get(key)]
+                candidates.extend(Path(name).resolve() for name in ('/tmp', '/var/tmp', '/usr/tmp'))
+                parent = next((path for path in candidates if path.is_dir()
+                    and os.access(path, os.W_OK | os.X_OK)
+                    and all(path != surface and surface not in path.parents for surface in surfaces)), None)
+                if parent is None:
+                    die("no temporary directory outside the checkout roots; use --checkout DIR")
+                private_parent = Path(tempfile.mkdtemp(prefix='docket-checkout-', dir=parent))
+                destination = private_parent / 'tree'
+                info = private_parent.stat()
+                export_record = {'parent': str(private_parent), 'identity': [info.st_dev, info.st_ino],
+                                 'token': os.urandom(16).hex(), 'owner': owner, 'baseline': baseline}
+                publish_json(private_parent / '.docket-export.json',
+                             {'run': str(d.resolve()), 'token': export_record['token']})
+                publish_json(registry, export_record)
+        else:
+            destination = destination.expanduser().resolve()
+        for surface in [root().resolve(), *(Path(str(r['path'])).resolve() for r in roots)]:
+            if destination == surface or surface in destination.parents or destination in surface.parents:
+                die("--checkout must be outside the workspace and every declared checkout, including its ancestors")
+        reused = registry is not None and private_parent is None
+        if destination.exists() and not reused:
+            die(f"checkout destination already exists: {destination}")
+        if not destination.parent.is_dir():
+            die("checkout destination parent must exist")
+        if not reused:
+            stage = Path(tempfile.mkdtemp(prefix='.docket-checkout-', dir=destination.parent))
+            try:
+                for record, tree in trees:
+                    alias = str(record['alias'])
+                    if not alias or Path(alias).name != alias or alias in ('.', '..'):
+                        die("DAMAGED: invalid root alias")
+                    output = stage if len(trees) == 1 else stage / alias
+                    output.mkdir(exist_ok=True)
+                    with reconstruction_index(d, record, f'checkout.{alias}.index') as env:
+                        code, _, err = private_git(env, root(), 'read-tree', tree)
+                        if not code:
+                            code, entries, err = private_git(env, root(), 'ls-files', '--stage', '-z')
+                        if not code:
+                            export_index_entries(env, output, entries)
+                        if code:
+                            die(f"frozen tree unavailable: {first_line(err)}")
+                    linked.extend((str(record['alias']), name) for name in link_checkout_runtime(record, output))
+                os.rename(stage, destination)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
+            if registry is not None:
+                publish_json(registry, {**export_record, 'linked': linked,
+                    'fingerprint': checkout_export_fingerprint(destination)})
+                cleanup_checkout_exports(d, owner=owner, baseline=baseline, keep=registry)
     except BaseException:
         if private_parent is not None:
             shutil.rmtree(private_parent, ignore_errors=True)
+            if registry is not None:
+                registry.unlink(missing_ok=True)
         raise
     print(f"materialized {'baseline' if baseline else 'frozen bundle'} for {owner}: {destination}")
     for alias, name in linked:
@@ -851,8 +939,10 @@ def materialize_bundle_tree(d: Path, owner: str, destination: Path | None, *,
         print(f"linked runtime: {prefix}{name}")
     if len(trees) > 1:
         print("roots: " + ', '.join(str(record['alias']) for record, _ in trees))
-    print("Run the registered focused or milestone suite with this directory as cwd; "
-          "multi-root exports place each checkout under its alias.")
+    print("Use this directory as cwd for selective checks; read captured verification before rerunning it. "
+          "Multi-root exports place each checkout under its alias.")
+    if registry is not None:
+        print("Managed export: reused while unchanged; removed by docket finish or whole-run disarm.")
 
 
 def export_index_entries(env: dict[str, str], output: Path, entries: bytes) -> None:

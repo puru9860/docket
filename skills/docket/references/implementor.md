@@ -51,8 +51,11 @@ Use decisive negative controls in a disposable copy; prove a claimed failure was
 Rebuild the captured baseline with `docket bundle <run> <owner> --baseline --checkout` and run the same focused check in the printed fresh private directory.
 Never use `git stash` or mutate the measured checkout to run a negative control.
 `docket submit` runs the registered `verify:` command once against the final source and freezes its output.
-Run extra focused checks for debugging or concrete risk; an identical manual run before submission is unnecessary.
+While working, run only focused tests for the change.
+Do not run the registered verify command yourself before submitting, because `docket submit` runs it and captures its output into the frozen bundle.
+In the report, state the registered command and "submit will capture it".
 The full suite belongs once per milestone, never in a task round.
+Run it through `docket batch --verify`, automatically by the conductor in managed runs.
 Run preflight and submission with the longest available shell timeout.
 When the shell cap is shorter than the rendered allowance, use `docket submit <run> <owner> --background` with `--as implementor`.
 In conductor-managed sessions prefer foreground submit; if background submission is required, end your turn immediately and never sleep or poll its log.

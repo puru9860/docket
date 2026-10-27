@@ -335,15 +335,19 @@ docket help <role> --run R01 --owner T01              compact guidance for that 
 `owner` is a task id such as `T03`, or `orch` for the orchestrator's own report.
 A checkout export can reuse ignored `.venv`, `venv`, or `node_modules` directories through printed runtime links.
 Exports exclude arbitrary ignored data, `.env`-style entries, credentials, and Docket state.
+Without `DIR`, Docket reuses an export whose file metadata is unchanged for the same bundle and trees, and removes it at `finish` or whole-run `disarm`.
+A new automatic export replaces older exports for that owner and kind (baseline or source), keeping live-run disk use bounded.
+Use `docket disarm RUN` when abandoning a run to clean its automatic exports; role-only disarm keeps them.
+An explicit `--checkout DIR` remains yours and is never removed by Docket.
 
 The active help form uses the same canonical contract and command renderer as
 `docket prompt`, without writing a prompt record. The full playbook remains
 available through `docket help <role>`.
 
-Submission runs and freezes the registered final verification. Use preflight
-when a before-change result matters, and extra checks for debugging or specific
-risks. A routine identical manual verification immediately before submission
-is not required.
+Task verification contains only the focused tests for that task; the full suite runs once per milestone through `docket batch --verify`.
+Submission runs and freezes the registered focused verification.
+While working, run focused checks for debugging or specific risks; do not run the registered verify command yourself immediately before submission.
+Use preflight when a before-change result matters.
 
 `docket metrics R01` includes correction and resume counts, reported defects
 after acceptance, and measured token categories. Run tokens per accepted task
@@ -453,6 +457,7 @@ docket metrics R01            # corrections, first-round approvals, missed hando
 ```
 
 A role's window opens when it joins the run and closes when the run ends or when the same session joins another run, so a reused TUI never inflates a finished run.
+The planner also counts preparation from session start or the previous run's end for that same session, labelled separately as planning and run work.
 Subagents are counted under the session that started them, and a mixed-model session is split call by call.
 A transcript with no call in the window is reported as a gap, never as zero.
 

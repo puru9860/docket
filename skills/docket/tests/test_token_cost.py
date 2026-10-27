@@ -498,7 +498,8 @@ class ConductorTokenCost(unittest.TestCase):
         self.assertNotIn('docket help reviewer', first)
         self.assertIn('docket bundle demo T01 --checkout`', first)
         self.assertNotIn('/tmp/demo-T01-review', first)
-        self.assertIn('cd PRINTED_CHECKOUT && (true)', first)
+        self.assertIn('Captured verify command: `true`', first)
+        self.assertIn('Do not routinely rerun it', first)
         self.c.approve(); self.c.tick()
         task = self.c.run / 'T02-task.mdx'
         text = task.read_text().replace('## Out of scope\n',
