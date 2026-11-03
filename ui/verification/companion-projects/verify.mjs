@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// A real browser journey against two private companion processes. No provider or
+// Real browser journeys against private companion processes. No provider or
 // Herdr process is started, and no app route or persistence method is replaced.
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, readdir, lstat, realpath, rm, chmod, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, readdir, lstat, realpath, rm, chmod, access, rename } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -122,11 +122,20 @@ async function stopServer(server) {
   if (!record.stopped) throw new Error('Private companion did not exit during cleanup.');
 }
 
+async function addProject(page, directory, title) {
+  if (!(await page.locator('#project-menu').evaluate(menu => menu.open))) await page.click('#project-menu > summary');
+  await page.click('#add-project');
+  await page.fill('#project-path-input', directory);
+  await page.click('#project-submit');
+  await page.locator('#run-title').filter({ hasText: title }).waitFor();
+  assert.equal(await page.locator('#project-select option:checked').textContent(), path.basename(directory));
+}
+
 async function run(values, evidenceDir) {
   const invocation = randomUUID(), started = new Date().toISOString();
-  const doctor = { version: 1, invocation, started_at: started, runtime: { node: process.version,
+  const doctor = { version: 1, invocation, scenario: values.scenario, started_at: started, runtime: { node: process.version,
     platform: process.platform, arch: process.arch }, build: {}, prerequisites: [], instances: [], limits };
-  const result = { version: 1, invocation, started_at: started, status: 'failed', phase: 'prerequisites',
+  const result = { version: 1, invocation, scenario: values.scenario, started_at: started, status: 'failed', phase: 'prerequisites',
     negative_control: values['negative-control'] || null, checks: [], cleanup: {} };
   const servers = [];
   let root, browser, page, env;
@@ -175,8 +184,11 @@ async function run(values, evidenceDir) {
       throw new PrerequisiteError(`Chromium could not launch. Run cd ui && npx playwright install chromium; install system libraries if requested, or supply --browser-executable /absolute/path. ${error.message}`);
     }
     doctor.prerequisites.push({ name: 'chromium', available: true });
+    const removal = values.scenario === 'remove-projects';
     const initial = await fixture(root, 'startup', 'startup-run', 'Recipe startup');
-    const target = await fixture(root, 'added', 'added-run', 'Recipe added');
+    const targetName = removal ? 'removed' : 'added', targetTitle = removal ? 'Recipe removed' : 'Recipe added';
+    const target = await fixture(root, targetName, `${targetName}-run`, targetTitle);
+    const retained = removal ? await fixture(root, 'retained', 'retained-run', 'Recipe retained') : null;
     const unrelated = await fixture(root, 'unrelated', 'unrelated-run', 'Unrelated must stay absent');
     const unrelatedPrefs = path.join(root, 'unrelated-state/docket-ui/projects.json');
     await mkdir(path.dirname(unrelatedPrefs), { recursive: true });
@@ -192,50 +204,168 @@ async function run(values, evidenceDir) {
     await page.locator('#run-title').filter({ hasText: 'Recipe startup' }).waitFor();
     assert.deepEqual(await page.locator('#project-select option').allTextContents(), ['startup']);
     check('initial-isolation', { listed: ['startup'], unrelated_absent: true });
-    result.phase = 'browser-add';
-    await page.click('#project-menu > summary');
-    await page.click('#add-project');
-    await page.fill('#project-path-input', root);
-    await page.click('#project-submit');
-    await page.locator('#project-error').filter({ hasText: 'No .docket' }).waitFor();
-    assert.equal(await page.locator('#project-select option').count(), 1);
-    check('invalid-project-refused', { reason: 'No .docket', listed_count: 1 });
-    await page.fill('#project-path-input', target);
-    await page.click('#project-submit');
-    await page.locator('#run-title').filter({ hasText: 'Recipe added' }).waitFor();
-    assert.equal(await page.locator('#project-select option:checked').textContent(), 'added');
-    const persisted = JSON.parse(await readFile(preferences, 'utf8'));
-    assert.deepEqual(persisted, { version: 1, projects: [initial, target] });
-    check('browser-add-persisted', { selected: 'added', project_paths: ['startup', 'added'], preferences_sha256: hash(await readFile(preferences)) });
-    result.phase = 'restart';
-    await context.close(); page = null;
-    await stopServer(server);
-    if (values['negative-control']) {
-      await rm(preferences);
-      result.fault_injection = { kind: 'lose-projects', after_first_server_exit: true, removed: 'private-state/docket-ui/projects.json' };
+    if (removal) {
+      assert.equal(await page.locator('#remove-project').isDisabled(), true, 'Starting project must be protected');
+      const startupRemoval = await page.evaluate(async () => {
+        // Use this page's token for its real server request; return only the
+        // public rejection, never the token or authenticated request headers.
+        const response = await fetch('/api/projects/remove', { method: 'POST',
+          headers: { Authorization: `Bearer ${sessionStorage.getItem('docket-token')}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: document.getElementById('project-select').value }) });
+        return { status: response.status, error: (await response.json()).error };
+      });
+      assert.equal(startupRemoval.status, 400, 'Server must refuse startup removal');
+      assert.equal(startupRemoval.error, 'The project this companion started with stays in the list.');
+      check('starting-project-protected', { selected: 'startup', remove_disabled: true, server: startupRemoval });
+      result.phase = 'browser-add-removal-fixtures';
+      await addProject(page, target, targetTitle);
+      await addProject(page, retained, 'Recipe retained');
+      assert.deepEqual(JSON.parse(await readFile(preferences, 'utf8')), { version: 1, projects: [initial, target, retained] });
+      check('browser-add-removal-fixtures', { listed: ['startup', 'removed', 'retained'] });
+      result.phase = 'browser-remove';
+      await page.selectOption('#project-select', { label: 'removed' });
+      await page.locator('#run-title').filter({ hasText: targetTitle }).waitFor();
+      if (!(await page.locator('#project-menu').evaluate(menu => menu.open))) await page.click('#project-menu > summary');
+      assert.equal(await page.locator('#remove-project').isEnabled(), true, 'Added project must be removable');
+      await page.click('#remove-project');
+      await page.locator('#run-title').filter({ hasText: 'Recipe startup' }).waitFor();
+      assert.deepEqual(await page.locator('#project-select option').allTextContents(), ['startup', 'retained']);
+      assert.deepEqual(JSON.parse(await readFile(preferences, 'utf8')), { version: 1, projects: [initial, retained] });
+      check('browser-remove-persisted', { listed: ['startup', 'retained'], removed_absent: true,
+        preferences_sha256: hash(await readFile(preferences)) });
+
+      // Restart only processes this invocation owns. The optional fault changes
+      // just its saved membership, after the previous process has fully exited.
+      const restart = async (previousContext, retainRemoved = false) => {
+        await previousContext.close(); page = null;
+        await stopServer(server);
+        if (retainRemoved) {
+          const { validateProject } = await import('../../projects.mjs');
+          assert.equal(await validateProject(target), target, 'Removed fixture must still be a valid project');
+          const beforeText = await readFile(preferences, 'utf8');
+          const saved = JSON.parse(beforeText);
+          assert.deepEqual(saved.projects, [initial, retained]);
+          const mode = (await lstat(preferences)).mode & 0o777;
+          assert.equal(mode, 0o600, 'Saved preferences must remain private');
+          // Splice only an appended member into the JSON array. Leave all other
+          // bytes, fields and entry order intact, including whitespace.
+          const marker = /"projects"\s*:\s*\[/.exec(beforeText);
+          assert.ok(marker);
+          let quoted = false, escaped = false, closing = -1;
+          for (let i = marker.index + marker[0].length; i < beforeText.length; i++) {
+            const ch = beforeText[i];
+            if (quoted) {
+              if (escaped) escaped = false;
+              else if (ch === '\\') escaped = true;
+              else if (ch === '"') quoted = false;
+            } else if (ch === '"') quoted = true;
+            else if (ch === ']') { closing = i; break; }
+          }
+          assert.ok(closing >= 0);
+          const at = beforeText.slice(0, closing).trimEnd().length;
+          const insertion = `,\n    ${JSON.stringify(target)}`;
+          const afterText = beforeText.slice(0, at) + insertion + beforeText.slice(at);
+          assert.deepEqual(JSON.parse(afterText), { ...saved, projects: [...saved.projects, target] });
+          const temporary = `${preferences}.retain-removed-${invocation}.tmp`;
+          await writeFile(temporary, afterText, { flag: 'wx', mode });
+          await chmod(temporary, mode);
+          await rename(temporary, preferences);
+          const observedAfter = await readFile(preferences, 'utf8');
+          assert.equal(observedAfter, afterText);
+          assert.equal(observedAfter.slice(0, at) + observedAfter.slice(at + insertion.length), beforeText);
+          assert.equal((await lstat(preferences)).mode & 0o777, mode);
+          result.fault_injection = { kind: 'retain-removed', after_first_server_exit: true,
+            changed: 'private-state/docket-ui/projects.json', added_project: 'removed',
+            removed_fixture: { path: target, valid: true, validator: 'ui/projects.mjs:validateProject' },
+            pre_sha256: hash(beforeText), post_sha256: hash(observedAfter), mode_before: mode, mode_after: mode,
+            other_bytes_preserved: true, atomic: true };
+        }
+        server = await startServer(root, initial, env, doctor, servers);
+        assert.ok(servers.slice(0, -1).every(prior => prior.record.pid !== server.record.pid), 'Restart must launch a distinct companion process');
+        const fresh = await browser.newContext({ viewport: { width: 1440, height: 960 } });
+        page = await fresh.newPage(); page.setDefaultTimeout(10000);
+        await page.goto(server.privateUrl);
+        await page.locator('#run-title').filter({ hasText: 'Recipe startup' }).waitFor();
+        return fresh;
+      };
+      result.phase = 'removal-restart';
+      const afterRemoval = await restart(context, values['negative-control'] === 'retain-removed');
+      result.phase = 'removal-restart-readback';
+      const listed = await page.locator('#project-select option').allTextContents();
+      result.removal_restart_observation = { listed, fresh_browser_context: true, distinct_server_process: true };
+      if (listed.includes('removed')) throw new OutcomeError('REMOVAL_NOT_PERSISTED', 'The browser-removed project reappeared after a real companion restart.');
+      assert.deepEqual(listed, ['startup', 'retained']);
+      check('removal-restart-readback', { listed, removed_absent: true, fresh_browser_context: true });
+      await page.selectOption('#project-select', { label: 'retained' });
+      await page.locator('#run-title').filter({ hasText: 'Recipe retained' }).waitFor();
+      assert.equal(await page.locator('#project-select option:checked').textContent(), 'retained');
+      check('retained-project-readback', { selected: 'retained', run_title: await page.locator('#run-title').textContent() });
+
+      result.phase = 'browser-readd';
+      const beforeReadd = JSON.parse(await readFile(preferences, 'utf8')).projects;
+      assert.deepEqual(beforeReadd, [initial, retained]);
+      const expectedReadd = [...beforeReadd, target], expectedReaddNames = expectedReadd.map(project => path.basename(project));
+      await addProject(page, target, targetTitle);
+      assert.deepEqual(JSON.parse(await readFile(preferences, 'utf8')), { version: 1, projects: expectedReadd });
+      check('browser-readd-persisted', { selected: 'removed', listed: expectedReaddNames, order_rule: 'append to previously saved membership' });
+      result.phase = 'readd-restart';
+      await restart(afterRemoval);
+      result.phase = 'readd-restart-readback';
+      const readded = await page.locator('#project-select option').allTextContents();
+      result.readd_restart_observation = { listed: readded, fresh_browser_context: true, distinct_server_process: true };
+      assert.deepEqual(readded, expectedReaddNames);
+      assert.equal(await page.locator('#remove-project').isDisabled(), true, 'Starting project stays protected after restart');
+      await page.selectOption('#project-select', { label: 'removed' });
+      await page.locator('#run-title').filter({ hasText: targetTitle }).waitFor();
+      assert.equal(await page.locator('#project-select option:checked').textContent(), 'removed');
+      check('readd-restart-readback', { listed: readded, selected: 'removed', run_title: await page.locator('#run-title').textContent(),
+        fresh_browser_context: true, startup_remove_disabled: true });
+    } else {
+      result.phase = 'browser-add';
+      await page.click('#project-menu > summary');
+      await page.click('#add-project');
+      await page.fill('#project-path-input', root);
+      await page.click('#project-submit');
+      await page.locator('#project-error').filter({ hasText: 'No .docket' }).waitFor();
+      assert.equal(await page.locator('#project-select option').count(), 1);
+      check('invalid-project-refused', { reason: 'No .docket', listed_count: 1 });
+      await page.fill('#project-path-input', target);
+      await page.click('#project-submit');
+      await page.locator('#run-title').filter({ hasText: 'Recipe added' }).waitFor();
+      assert.equal(await page.locator('#project-select option:checked').textContent(), 'added');
+      const persisted = JSON.parse(await readFile(preferences, 'utf8'));
+      assert.deepEqual(persisted, { version: 1, projects: [initial, target] });
+      check('browser-add-persisted', { selected: 'added', project_paths: ['startup', 'added'], preferences_sha256: hash(await readFile(preferences)) });
+      result.phase = 'restart';
+      await context.close(); page = null;
+      await stopServer(server);
+      if (values['negative-control']) {
+        await rm(preferences);
+        result.fault_injection = { kind: 'lose-projects', after_first_server_exit: true, removed: 'private-state/docket-ui/projects.json' };
+      }
+      server = await startServer(root, initial, env, doctor, servers);
+      assert.notEqual(servers[0].record.pid, server.record.pid, 'Restart must launch a distinct companion process');
+      const fresh = await browser.newContext({ viewport: { width: 1440, height: 960 } });
+      page = await fresh.newPage(); page.setDefaultTimeout(10000);
+      await page.goto(server.privateUrl);
+      await page.locator('#run-title').filter({ hasText: 'Recipe startup' }).waitFor();
+      result.phase = 'restart-readback';
+      const listed = await page.locator('#project-select option').allTextContents();
+      result.restart_observation = { listed, fresh_browser_context: true, distinct_server_process: true };
+      if (!listed.includes('added')) throw new OutcomeError('PERSISTENCE_MISSING', 'The browser-added project is absent after a real companion restart.');
+      assert.deepEqual(listed, ['startup', 'added'], 'Only explicitly added projects may appear after restart');
+      await page.selectOption('#project-select', { label: 'added' });
+      await page.locator('#run-title').filter({ hasText: 'Recipe added' }).waitFor();
+      assert.equal(await page.locator('#project-select option:checked').textContent(), 'added');
+      check('restart-readback', { listed, selected: 'added', run_title: await page.locator('#run-title').textContent(), fresh_browser_context: true });
     }
-    server = await startServer(root, initial, env, doctor, servers);
-    assert.notEqual(servers[0].record.pid, server.record.pid, 'Restart must launch a distinct companion process');
-    const fresh = await browser.newContext({ viewport: { width: 1440, height: 960 } });
-    page = await fresh.newPage(); page.setDefaultTimeout(10000);
-    await page.goto(server.privateUrl);
-    await page.locator('#run-title').filter({ hasText: 'Recipe startup' }).waitFor();
-    result.phase = 'restart-readback';
-    const listed = await page.locator('#project-select option').allTextContents();
-    result.restart_observation = { listed, fresh_browser_context: true, distinct_server_process: true };
-    if (!listed.includes('added')) throw new OutcomeError('PERSISTENCE_MISSING', 'The browser-added project is absent after a real companion restart.');
-    assert.deepEqual(listed, ['startup', 'added'], 'Only explicitly added projects may appear after restart');
-    await page.selectOption('#project-select', { label: 'added' });
-    await page.locator('#run-title').filter({ hasText: 'Recipe added' }).waitFor();
-    assert.equal(await page.locator('#project-select option:checked').textContent(), 'added');
-    check('restart-readback', { listed, selected: 'added', run_title: await page.locator('#run-title').textContent(), fresh_browser_context: true });
     assert.equal(hash(await readFile(unrelatedPrefs)), unrelatedBefore, 'Unrelated state must not change');
     check('private-state-isolation', { unrelated_preferences_unchanged: true });
     assert.equal(await treeDigest(path.join(root, 'projects')), before, 'No project/run file may change');
     check('project-files-unchanged', { before_sha256: before, after_sha256: await treeDigest(path.join(root, 'projects')) });
     // Capture settled fixture content, rather than the loading placeholders that
     // precede the asynchronous document and empty-history reads.
-    const planHeading = page.locator('#document-rendered').getByRole('heading', { name: 'Plan: Recipe added', exact: true });
+    const planHeading = page.locator('#document-rendered').getByRole('heading', { name: `Plan: ${targetTitle}`, exact: true });
     await planHeading.waitFor();
     await page.locator('#document-rendered').filter({ hasText: 'Disposable recipe fixture. No agent sessions.' }).waitFor();
     await page.locator('#conversation[aria-busy="false"] .empty-state h2').filter({ hasText: 'No saved messages for this session' }).waitFor();
@@ -275,6 +405,17 @@ async function run(values, evidenceDir) {
     result.cleanup.errors = errors;
     if (errors.length) { result.status = 'failed'; result.error = { code: 'CLEANUP_FAILED', message: errors.join('; ') }; }
     result.finished_at = new Date().toISOString();
+    if (values.scenario === 'remove-projects' && result.status === 'passed') {
+      // Required only by removal.json. A successful default add run cannot
+      // satisfy the removal manifest accidentally using its generic proof files.
+      result.removal_proof = 'removal-proof.json';
+      await writeFile(path.join(evidenceDir, result.removal_proof), `${JSON.stringify({
+        version: 1, invocation, scenario: values.scenario, status: result.status,
+        removal: result.removal_restart_observation, readd: result.readd_restart_observation,
+        startup_removal: result.checks.find(check => check.name === 'starting-project-protected').observation,
+        cleanup: { servers_stopped: result.cleanup.servers_stopped, sandbox_removed: result.cleanup.sandbox_removed }
+      }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    }
     // Do not retain the private launch URL, token, environment, or child logs.
     for (const [name, value] of [['doctor.json', doctor], ['result.json', result]]) {
       await writeFile(path.join(evidenceDir, name), `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
@@ -287,13 +428,15 @@ async function run(values, evidenceDir) {
 async function main() {
   const { values } = parseArgs({ options: {
     'evidence-dir': { type: 'string' }, 'negative-control': { type: 'string' },
-    'browser-executable': { type: 'string' }, help: { type: 'boolean' }
+    'browser-executable': { type: 'string' }, scenario: { type: 'string', default: 'add-projects' }, help: { type: 'boolean' }
   } });
   if (values.help) {
-    console.log('Usage: node ui/verification/companion-projects/verify.mjs --evidence-dir /absolute/fresh/directory [--browser-executable /absolute/chromium] [--negative-control lose-projects]');
+    console.log('Usage: node ui/verification/companion-projects/verify.mjs --evidence-dir /absolute/fresh/directory [--scenario add-projects|remove-projects] [--browser-executable /absolute/chromium] [--negative-control lose-projects|retain-removed]');
     return;
   }
-  if (values['negative-control'] && values['negative-control'] !== 'lose-projects') throw new Error('The only negative control is lose-projects.');
+  if (!['add-projects', 'remove-projects'].includes(values.scenario)) throw new Error('--scenario must be add-projects or remove-projects.');
+  const negative = values.scenario === 'remove-projects' ? 'retain-removed' : 'lose-projects';
+  if (values['negative-control'] && values['negative-control'] !== negative) throw new Error(`The negative control for ${values.scenario} is ${negative}.`);
   if (values['browser-executable'] && !path.isAbsolute(values['browser-executable'])) throw new Error('--browser-executable must be absolute.');
   const evidenceDir = await outputDirectory(values['evidence-dir']);
   const result = await run(values, evidenceDir);

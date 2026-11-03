@@ -95,3 +95,60 @@ The last selected project is not promised across restart. Herdr stays offline;
 live-agent/send, terminal, history and provider request behavior need their own
 verification. A separately authorized paired trial is required before claiming
 cost/quality gains or promoting recipes to a default.
+
+## Explicit removal and re-add scenario
+
+A second opt-in selection checks removal persistence and retained-project usability:
+`ui/verification/companion-projects/removal.json`. The existing `recipe.json` and
+default helper command keep the add-persistence journey. Choose removal explicitly
+and pair it with the scenario flag in the task's registered verify command:
+
+```json
+{
+  "owner": "T02",
+  "title": "Preserve project removal across restart",
+  "goal": "Removing a project persists without affecting retained projects or project data.",
+  "criterion": [
+    "The removed project stays absent after restart while the retained project opens its own run.",
+    "The starting project stays protected and a removed project can be re-added and persisted."
+  ],
+  "file": ["ui/projects.mjs", "ui/public/app.js"],
+  "recipe": "ui/verification/companion-projects/removal.json",
+  "verify": "node ui/verification/companion-projects/verify.mjs --scenario remove-projects --evidence-dir \"$DOCKET_RECIPE_EVIDENCE_DIR\""
+}
+```
+
+From the repository root, standalone positive and negative invocations are:
+
+```sh
+node ui/verification/companion-projects/verify.mjs --scenario remove-projects --evidence-dir /absolute/fresh/removal-proof
+node ui/verification/companion-projects/verify.mjs --scenario remove-projects --evidence-dir /absolute/fresh/removal-negative --negative-control retain-removed
+```
+
+The real browser adds removable and retained projects, removes the selected one,
+requires saved absence, then checks absence and retained-project usability in a
+new companion process and fresh browser context. It re-adds the removed path and
+uses a third process/context to prove the addition persists. Startup stays
+protected in the UI and the real server returns its observed 400 removal refusal;
+unrelated preferences and all project/run files stay unchanged, and
+success capture waits for the final fixture plan and empty/offline DOM to settle.
+
+The negative control inserts only the helper-owned removed path into saved state
+after the first process exits, validating the removed directory and preserving
+other saved bytes, entry order and mode by atomic rename. Result records fixture
+validity and pre/post hashes. It must exit 1/`REMOVAL_NOT_PERSISTED` at removal
+read-back, retaining failed proof. Prerequisite failures remain exit 2, never
+skip/pass. Both scenarios share the doctor/result/screenshot contract and owned
+cleanup. The removal manifest also requires `removal-proof.json`, emitted only by
+a passing removal scenario after cleanup, so a default Add invocation cannot
+satisfy that manifest. Scenario/control pair errors are rejected before evidence
+creation. Removal of terminal bindings is unobserved because fixtures have none.
+For removal, inspect the intermediate absence observation in result;
+the final screenshot intentionally follows re-add.
+
+Read the [removal instructions](../ui/verification/companion-projects/removal.md)
+and [maintained feature map](verification-feature-map.md) for entry points,
+prerequisites, observations, limits and the reviewed maintenance workflow.
+The explicit browser test file covers both scenarios outside ordinary `npm test`.
+The M3 comparison remains pinned to `fe58b1a`, excluding this expansion and M1;
+no cost/quality improvement or default promotion is claimed.

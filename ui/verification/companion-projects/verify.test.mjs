@@ -29,8 +29,10 @@ async function invoke(evidence, args = [], env = process.env) {
   }
 }
 const json = async (dir, name) => JSON.parse(await readFile(path.join(dir, name), 'utf8'));
-async function retainedProof(dir, screenshot) {
-  assert.deepEqual((await readdir(dir)).sort(), screenshot ? ['doctor.json', 'journey.png', 'result.json'] : ['doctor.json', 'result.json']);
+async function retainedProof(dir, screenshot, removal = false) {
+  const expected = screenshot ? ['doctor.json', 'journey.png', 'result.json'] : ['doctor.json', 'result.json'];
+  if (removal) expected.push('removal-proof.json');
+  assert.deepEqual((await readdir(dir)).sort(), expected.sort());
   const doctor = await json(dir, 'doctor.json'), result = await json(dir, 'result.json');
   assert.equal(doctor.invocation, result.invocation);
   assert.ok(Date.parse(result.finished_at) >= Date.parse(result.started_at));
@@ -73,6 +75,8 @@ test('real browser add persists through a new companion process and fresh browse
   assert.equal(run.code, 0, run.stdout + run.stderr);
   const { doctor, result } = await retainedProof(evidence, true);
   assert.equal(result.status, 'passed');
+  assert.equal(result.scenario, 'add-projects');
+  assert.equal(doctor.scenario, 'add-projects');
   assert.equal(result.negative_control, null);
   assert.equal(result.cleanup.browser_closed, true);
   assert.equal(doctor.instances.length, 2);
@@ -181,4 +185,119 @@ test('core-shaped checkout/.docket evidence accepts a real positive journey and 
   assert.equal(stale.code, 2);
   assert.match(stale.stderr, /must be empty/);
   assert.equal(sha(await readFile(path.join(evidence, 'result.json'))), digest, 'a Docket-shaped old proof cannot be overwritten');
+});
+
+test('removal manifest declares its own instructions and the same explicit helper/proof contract', async () => {
+  const base = path.dirname(helper), manifest = await json(base, 'removal.json');
+  assert.deepEqual(manifest, { version: 1, name: 'companion-project-removal', instructions: 'removal.md',
+    helpers: ['verify.mjs'], evidence: ['doctor.json', 'result.json', 'journey.png', 'removal-proof.json'] });
+  assert.ok(!(await json(base, 'recipe.json')).evidence.includes('removal-proof.json'));
+  for (const file of [manifest.instructions, ...manifest.helpers]) {
+    assert.equal((await lstat(path.join(base, file))).isFile(), true);
+    assert.equal((await lstat(path.join(base, file))).isSymbolicLink(), false);
+  }
+});
+
+test('real browser removal survives restart, retained project stays usable, and re-add survives another restart', { timeout: 100000 }, async t => {
+  const evidence = path.join(await temporary(t), 'proof');
+  const run = await invoke(evidence, ['--scenario', 'remove-projects']);
+  assert.equal(run.code, 0, run.stdout + run.stderr);
+  const { doctor, result } = await retainedProof(evidence, true, true);
+  assert.equal(result.status, 'passed');
+  assert.equal(result.scenario, 'remove-projects');
+  assert.equal(doctor.scenario, 'remove-projects');
+  assert.equal(result.negative_control, null);
+  assert.equal(result.cleanup.browser_closed, true);
+  assert.equal(doctor.instances.length, 3);
+  assert.equal(new Set(doctor.instances.map(instance => instance.pid)).size, 3);
+  for (const instance of doctor.instances) {
+    assert.equal(instance.ready, true); assert.equal(instance.exit_code, 0); assert.equal(instance.forced_kill, undefined);
+  }
+  assert.deepEqual(result.removal_restart_observation, { listed: ['startup', 'retained'], fresh_browser_context: true, distinct_server_process: true });
+  assert.deepEqual(result.readd_restart_observation, { listed: ['startup', 'retained', 'removed'], fresh_browser_context: true, distinct_server_process: true });
+  assert.deepEqual(result.checks.map(check => check.name), ['initial-isolation', 'starting-project-protected',
+    'browser-add-removal-fixtures', 'browser-remove-persisted', 'removal-restart-readback',
+    'retained-project-readback', 'browser-readd-persisted', 'readd-restart-readback', 'private-state-isolation', 'project-files-unchanged']);
+  assert.ok(result.checks.every(check => check.passed));
+  const observation = name => result.checks.find(check => check.name === name).observation;
+  assert.deepEqual(observation('starting-project-protected').server, { status: 400,
+    error: 'The project this companion started with stays in the list.' });
+  assert.deepEqual(observation('browser-remove-persisted').listed, ['startup', 'retained']);
+  assert.equal(observation('retained-project-readback').run_title, 'Recipe retained');
+  assert.equal(observation('readd-restart-readback').run_title, 'Recipe removed');
+  assert.equal(observation('readd-restart-readback').startup_remove_disabled, true);
+  assert.equal(observation('private-state-isolation').unrelated_preferences_unchanged, true);
+  assert.equal(observation('project-files-unchanged').before_sha256, observation('project-files-unchanged').after_sha256);
+  assert.equal(result.screenshot_observation.plan_heading, 'Plan: Recipe removed');
+  assert.equal(result.screenshot_observation.fixture_rendered, true);
+  assert.equal(result.screenshot_observation.history_state, 'empty');
+  assert.equal(doctor.build.sha256['verification/companion-projects/verify.mjs'], sha(await readFile(helper)));
+  const proof = await json(evidence, 'removal-proof.json');
+  assert.equal(proof.invocation, result.invocation);
+  assert.equal(proof.scenario, 'remove-projects');
+  assert.equal(proof.status, 'passed');
+  assert.deepEqual(proof.removal.listed, ['startup', 'retained']);
+  assert.deepEqual(proof.readd.listed, ['startup', 'retained', 'removed']);
+  assert.equal(proof.startup_removal.server.status, 400);
+  assert.deepEqual(proof.cleanup, { servers_stopped: true, sandbox_removed: true });
+});
+
+test('controlled restored membership fails at removal read-back with private retained proof and cleanup', { timeout: 100000 }, async t => {
+  const evidence = path.join(await temporary(t), 'proof');
+  const run = await invoke(evidence, ['--scenario', 'remove-projects', '--negative-control', 'retain-removed']);
+  assert.equal(run.code, 1, run.stdout + run.stderr);
+  const { doctor, result } = await retainedProof(evidence, true);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.scenario, 'remove-projects');
+  assert.equal(result.phase, 'removal-restart-readback');
+  assert.equal(result.error.code, 'REMOVAL_NOT_PERSISTED');
+  assert.equal(result.negative_control, 'retain-removed');
+  const fault = result.fault_injection;
+  assert.equal(fault.kind, 'retain-removed');
+  assert.equal(fault.after_first_server_exit, true);
+  assert.equal(fault.changed, 'private-state/docket-ui/projects.json');
+  assert.equal(fault.added_project, 'removed');
+  assert.deepEqual(fault.removed_fixture, { path: path.join(result.cleanup.sandbox, 'projects/removed'),
+    valid: true, validator: 'ui/projects.mjs:validateProject' });
+  assert.equal(fault.pre_sha256, result.checks.find(check => check.name === 'browser-remove-persisted').observation.preferences_sha256);
+  assert.match(fault.post_sha256, /^[a-f0-9]{64}$/);
+  assert.notEqual(fault.post_sha256, fault.pre_sha256);
+  assert.equal(fault.mode_before, 0o600);
+  assert.equal(fault.mode_after, fault.mode_before);
+  assert.equal(fault.other_bytes_preserved, true);
+  assert.equal(fault.atomic, true);
+  assert.deepEqual(result.removal_restart_observation.listed, ['startup', 'retained', 'removed']);
+  assert.ok(result.checks.some(check => check.name === 'browser-remove-persisted'));
+  assert.ok(!result.checks.some(check => check.name === 'removal-restart-readback'));
+  assert.ok(!result.checks.some(check => check.name === 'browser-readd-persisted'));
+  assert.equal(result.cleanup.browser_closed, true);
+  assert.equal(doctor.instances.length, 2);
+});
+
+test('explicit removal scenario keeps an unavailable browser as a cleaned prerequisite non-success', { timeout: 30000 }, async t => {
+  const root = await temporary(t), evidence = path.join(root, 'proof');
+  const run = await invoke(evidence, ['--scenario', 'remove-projects', '--browser-executable', path.join(root, 'missing-chromium')]);
+  assert.equal(run.code, 2, run.stdout + run.stderr);
+  const { doctor, result } = await retainedProof(evidence, false);
+  assert.equal(result.status, 'prerequisite-failed');
+  assert.equal(result.scenario, 'remove-projects');
+  assert.equal(result.error.code, 'PREREQUISITE');
+  assert.match(result.error.message, /npx playwright install chromium/);
+  assert.equal(doctor.instances.length, 0);
+  assert.equal(result.cleanup.sandbox_removed, true);
+});
+
+test('invalid scenario/control pairs are usage errors before any evidence directory or runtime launch', async t => {
+  const root = await temporary(t);
+  for (const [index, args] of [
+    ['--negative-control', 'retain-removed'],
+    ['--scenario', 'remove-projects', '--negative-control', 'lose-projects'],
+    ['--scenario', 'unknown'],
+  ].entries()) {
+    const evidence = path.join(root, `proof-${index}`);
+    const run = await invoke(evidence, args);
+    assert.equal(run.code, 2);
+    assert.match(run.stderr, /negative control for|--scenario must be/);
+    await assert.rejects(access(evidence), { code: 'ENOENT' });
+  }
 });

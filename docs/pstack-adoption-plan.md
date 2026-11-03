@@ -54,7 +54,7 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | --- | --- | --- | --- |
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
 | M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; combined suite 814 passed, then 7 focused tests passed after final guidance refinements | Sol, Opus/coordinator review |
-| M2 | Broader recipe coverage and maintained feature map | One additional meaningful boundary plus a documented maintenance workflow | Sol implementation, Opus boundary review |
+| M2 | Broader recipe coverage and maintained feature map | Implemented and reviewed; 13 browser tests and real positive/wrong-scenario core integration passed | Sol implementation, Opus/coordinator boundary review |
 | M3 | Blinded recipe-only comparison with fixed model assignments | Preparation tested; correcting coverage mismatch before any candidate launch | Opus design/candidates, Sol bounded adjudication |
 | M4 | Focused refactor-equivalence and performance guidance | Small explicit work-type selection, when the relevant task needs it | Opus design, Sol mechanical integration |
 | M5 | Native group discussions | Integrated and regression-tested; live three-party pilot in progress | Opus, coordinator review |
@@ -93,6 +93,19 @@ submission froze doctor/result/screenshot proof and produced an intact bundle
 and review packet. That integration fixture used documents-only evidence; Git
 capture, tamper, multi-root and drift behavior are covered by CLI regression tests.
 No comparative cost or quality improvement is claimed.
+
+M2 adds an explicit [removal recipe](../ui/verification/companion-projects/removal.md)
+and [maintained feature map](verification-feature-map.md). A removed project
+stays absent across a real restart, retained membership remains usable, and
+re-addition survives another restart. It observes the starting project's server
+refusal and preserves unrelated state. A removal-only passing proof file prevents
+the default Add journey from accidentally satisfying the removal manifest.
+The named injected regression and unavailable-browser cases remain non-success.
+All 13 explicit browser tests passed, as did 43 UI Python and 104 UI Node tests.
+Real core preflight/submission froze all four required outputs in an intact
+bundle with distinct proof directories; a default Add verification against the
+removal manifest refused submission without changing the report or publishing a
+bundle. That integration fixture is documents-only, not a Git-freeze claim.
 
 ## M1 acceptance
 
@@ -228,3 +241,7 @@ an active run. Keep local model launch configuration outside Git.
   Opus and Sol. Delivery is manually initiated while the installed copy remains
   unchanged; direct participant identity and protocol execution are the pilot's
   scope, not an assertion that installed automatic hooks have been exercised.
+- 2026-11-03: M2 removal/re-add recipe and maintenance map integrated after Opus
+  boundary review. The scenario receipt, server refusal and atomic negative
+  control were exercised; all 13 browser tests and UI unit tests passed. Real
+  core freezing and wrong-scenario refusal passed before committing this step.
