@@ -55,6 +55,8 @@ A contradiction is a required change; intent ambiguity goes to the planner rathe
 Tie consequential outcome claims to evidence at the boundary where the outcome holds.
 Persistence requires read-back, deployment requires the effective launch, and process claims require the process table.
 Static inspection suffices only for presence claims, not for an asserted runtime or persistent outcome.
+For consequential runtime claims, retain the semantic classification and also name the proof type, execution conditions, and actual observed boundary in existing findings or the decision rationale.
+Distinguish static inspection, controlled tests, and real execution; state unverified conditions without treating observations as authority over user intent or proof that all interleavings are safe.
 At final review reread the original request, even if you helped settle an earlier oracle.
 
 ## Decide from exact evidence
@@ -85,6 +87,9 @@ Lead with affected criteria, previous numbered changes, prior/current bundle ide
 Retrieve full historical patches when the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or when it is unavailable.
 Missing or damaged prior evidence refuses the packet; do not silently change its review basis.
 Check every previous required change and preserve earlier fixes as regression assertions.
+Repeated criterion numbers are a signal to inspect, not proof of a shared premise.
+Use judgment to identify any common assumption and choose a discriminating probe when warranted; carry its result and evidence, or an explicit unrun state with the reason, into the existing decision or escalation.
+Preserve accepted criteria and correction budgets; only the recorded plan owner may grant more rounds (the planner in new quick runs).
 A new defect warrants changes only when it breaks acceptance as written; stronger hardening belongs under Notes for follow-up.
 Two local corrections after initial submission are the default budget; exhaustion escalates to the planner, never automatic approval or waiver.
 A `budget-granted` wake lets you apply the refused changes against the still-frozen submitted or blocked report.

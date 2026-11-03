@@ -2,6 +2,10 @@
 
 Updated 2026-11-03. Working branch: `audit-3-fixes`.
 
+**Paused by the user on 2026-11-03.** Automatic Opus resumption is cancelled.
+Do not continue until the user resumes. Read [the paused handoff](pstack-resume-handoff.md)
+for saved WIP branches, validation state and home-PC instructions.
+
 The user authorized continuous implementation, Opus 5.5 for heavy design and
 implementation, Sol for lighter work, and committing and pushing the plan and
 tested milestones so work can continue from a home PC. Do not stop at a plan or
@@ -49,11 +53,11 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | ID | Work | State | Main owner |
 | --- | --- | --- | --- |
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
-| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Ready to implement separately from the recipe-only treatment | Sol, Opus review |
+| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and focused-tested; full suite interrupted; paused checkpoint | Sol, coordinator review |
 | M2 | Broader recipe coverage and maintained feature map | One additional meaningful boundary plus a documented maintenance workflow | Sol implementation, Opus boundary review |
-| M3 | Blinded recipe-only comparison with fixed model assignments | Design, run, and report; a small result permits opt-in reuse only | Opus design/candidates, Sol bounded adjudication |
+| M3 | Blinded recipe-only comparison with fixed model assignments | Partial preparation saved on pstack-recipe-comparison; paused, no model trials run | Opus design/candidates, Sol bounded adjudication |
 | M4 | Focused refactor-equivalence and performance guidance | Small explicit work-type selection, when the relevant task needs it | Opus design, Sol mechanical integration |
-| M5 | Native group discussions | Design and assess actual relay friction; implement an opt-in versioned extension if justified | Opus |
+| M5 | Native group discussions | Partial opt-in design/implementation saved on pstack-group-discussions; paused, unvalidated | Opus |
 | M6 | Optional PR/CI babysitting | Assess existing tools, then implement a bounded deterministic adapter if useful | Opus |
 | M7 | Independent early oracle checks | Separate risk-triggered trial; retain three roles and final independent review | Opus |
 | M8 | Final review, installed-copy sync, commits, push, portable handoff | After corresponding checks and approvals | Coordinator |
@@ -200,3 +204,7 @@ an active run. Keep local model launch configuration outside Git.
   verified in separate Opus/Sol worktrees, then integrated without overlap.
 - 2026-11-03: User authorized continued work, heavy Opus/light Sol routing,
   pushing this plan and committing/pushing finished milestones for home-PC use.
+- 2026-11-03: Plan e4119fd and verified recipe checkpoint fe58b1a pushed.
+  M1 passed 41 focused checks; the full suite was interrupted for an explicit
+  user pause. Opus auto-resume was cancelled. Separate WIP group/comparison
+  branches and the tracked resume handoff preserve unfinished work.

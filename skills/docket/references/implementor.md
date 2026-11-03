@@ -29,6 +29,10 @@ If telemetry is unavailable, confirm the live model and use `docket set-model` b
 
 Fill `Txx-scope.mdx` with paths, verification, symbols, and discovery reasoning.
 Your proposed `verify:` adds to the assigned command; it never replaces a failing assigned check.
+In this existing discovery/scope turn after dispatch and before editing, identify any consequential safety fact the change relies on.
+When uncertainty warrants it, choose and run a discriminating probe at the relevant boundary that can distinguish competing explanations.
+Contain it within discovery constraints and safe private state; record the fact, result and evidence, or an explicit unrun state with the reason, in the existing scope reasoning.
+Use judgment; do not invent a probe without consequential uncertainty or add a routine model turn, supervisor approval, or new gate.
 
 ```bash
 docket scope <run> <owner> --submit
@@ -47,6 +51,9 @@ Independently derive important expectations; inspect changed tests for false pos
 Use different inputs and zero/one/many boundaries when relevant; a fake proves only logic when the criterion names a real system.
 Review your own patch for unrequested behavior, missing sibling sites, untested branches, flaky timing, stale docs, and overstated claims.
 For a correction, reproduce each required change, preserve earlier fixes as regression assertions, then cite the same check after the fix.
+Repeated criterion numbers are a signal to inspect, not proof that the failures share one premise.
+Use judgment to identify any common assumption and choose a discriminating probe when warranted; carry its result and evidence, or an explicit unrun state with the reason, into the existing correction report or escalation.
+Preserve accepted criteria and correction budgets; only the recorded plan owner may grant more rounds (the planner in new quick runs).
 Use decisive negative controls in a disposable copy; prove a claimed failure was injected into the named component and save the failing observation.
 Rebuild the captured baseline with `docket bundle <run> <owner> --baseline --checkout` and run the same focused check in the printed fresh private directory.
 Never use `git stash` or mutate the measured checkout to run a negative control.
@@ -76,6 +83,10 @@ Re-recording a pin is never reverification; see [recovery.md](recovery.md).
 Fill summary, every changed file, exact acceptance boxes, verification, and decisions needed.
 Keep criterion wording unchanged; check a box only when the result actually holds. [Evidence and report format](evidence.md) gives the optional stable-ID evidence table and model/environment provenance rules.
 Normal completion needs all required criteria met; missing evidence is a gap, never success.
+For consequential runtime claims, retain the semantic classification supported with a source, unresolved, or contradictory and add the proof type, execution conditions, and actual observed boundary in the existing report.
+Distinguish static inspection, controlled tests, and real execution; state unverified conditions.
+Runtime evidence does not override user intent or prove all interleavings safe.
+This adds reasoning guidance, not new report sections or a prerequisite for an honest block.
 
 ```bash
 docket submit <run> <owner> --check

@@ -60,6 +60,8 @@ def cmd_role_help(a: argparse.Namespace) -> None:
 # cannot silently fall outside the revision. Data files have separate revisions.
 RENDERER_SOURCE_FUNCTIONS = (
     "compose_prompt",
+    "runtime_reasoning",
+    "correction_reasoning",
     "workflow_authority",
     "derive_stage",
     "rendering_problem",
@@ -361,10 +363,44 @@ def decision_required_lines(d: Path, owner: str) -> tuple[Path | None, list[str]
     return decs[-1], group_numbered_items(lines)
 
 
+def correction_reasoning(record: str) -> str:
+    """Inspect recurring criteria within the existing correction and budget policy."""
+    return (
+        "Repeated criterion numbers are a signal to inspect, not proof of a shared premise. "
+        "Use judgment to identify any common assumption and choose a discriminating probe "
+        "when warranted. Carry its result and evidence, or an explicit unrun state with "
+        f"the reason, into the existing {record} or escalation. Preserve accepted "
+        "criteria and correction budgets; only the recorded plan owner may grant more rounds (the planner in new quick runs)."
+    )
+
+
+def runtime_reasoning(role: str) -> str:
+    """Required reasoning alongside the compact contract, outside optional budgets."""
+    record = "report" if role == "implementor" else "findings or decision rationale"
+    text = (
+        "# Runtime proof reasoning\n\n"
+        "For consequential runtime claims, retain the semantic classification supported "
+        "with a source, unresolved, or contradictory; also name the proof type, execution "
+        f"conditions, and actual observed boundary in the existing {record}. "
+        "Distinguish static inspection, controlled tests, and real execution; static "
+        "presence alone does not prove a runtime outcome. State unverified conditions. "
+        "Runtime evidence does not override user intent or prove all interleavings safe."
+    )
+    if role == "reviewer":
+        text += " Missing consequential evidence requires changes or an explicit qualified waiver, never an inferred pass."
+        text += "\n\nIn correction review: " + correction_reasoning("decision")
+    else:
+        text += " Block honestly when a consequential gap prevents completion."
+    return text
+
+
 def correction_checklist(d: Path, owner: str) -> list[str]:
     """Keep all applied correction requirements, including continuation lines."""
     rnd = state_of(d, owner)[0]
-    out = ["Preserve earlier fixes; earlier items are regression checks, not new requirements."]
+    out = [
+        "Preserve earlier fixes; earlier items are regression checks, not new requirements.",
+        correction_reasoning("correction report"),
+    ]
     for path in _ordered(d.glob(f"{owner}-decision-*.mdx")):
         meta, body = parse(path.read_text())
         if (meta.get("verdict") != "changes-requested" or meta.get("applied") != "yes"
@@ -679,6 +715,8 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         "\n".join(header_lines),
         "# Task contract\n\n" + "\n".join(contract_lines),
     ]
+    if role in ("implementor", "reviewer"):
+        parts.append(runtime_reasoning(role))
     if decision_lines:
         parts.append("# Latest decision\n\n" + "\n".join(decision_lines))
     if eff_stage == "correction" and role == "implementor":
@@ -1109,6 +1147,13 @@ def prompt_steps(d: Path, run: str, owner: str, role: str, stage: str) -> list[s
         ]
     return [
         f"Read `{rel}/{owner}-task.mdx`, then discover the code it touches.",
+        "During this existing discovery/scope turn after dispatch and before editing, "
+        "identify any consequential safety fact the change relies on. When uncertainty "
+        "warrants it, run a discriminating probe that distinguishes competing explanations "
+        "at the relevant boundary, contained within discovery constraints and safe private "
+        "state. Record the fact, probe result and evidence, or an explicit unrun state "
+        "with the reason, in the existing scope reasoning. Use judgment; do not invent "
+        "a probe when there is no consequential uncertainty.",
         f"Fill `{rel}/{owner}-scope.mdx` (proposed files, the exact verify command, relevant "
         f"symbols, reasoning) and run `docket scope {run} {owner} --submit` before editing; on a "
         "collision, stop and report it.",

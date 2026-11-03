@@ -16,6 +16,9 @@ Keep actual-output provenance separate from expected values; vary inputs when be
 For failure/concurrency claims, check each test injects that failure into the component the criterion names and every case starts from the state it claims.
 Check sibling sites, preservation of existing behavior with focused regression assertions, and side effects on pre-existing files, records, sessions, and user data.
 A happy path does not prove preservation.
+For consequential runtime claims, retain the semantic classification supported with a source, unresolved, or contradictory and name the proof type, execution conditions, and actual observed boundary in existing findings or rationale.
+Distinguish static inspection, controlled tests, and real execution; static presence alone cannot establish a runtime outcome.
+State unverified conditions: runtime evidence does not override user intent or prove all interleavings safe.
 Challenge green-but-wrong results with selective boundary and negative checks; use conditional baseline-red checks to establish that a test distinguishes the fix.
 
 ## offline-operation
