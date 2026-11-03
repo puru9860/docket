@@ -32,6 +32,19 @@ from .sessions import (harness_session, run_harness_sessions, session_transcript
                        _in_window, harness_process_ref, session_until)
 from .liveness import read_registration
 from .gate import gate_problems
+from .recipes import (
+    RECIPE_ENV, capture_recipe, collect_evidence, new_evidence_dir, recipe_drift,
+    recipe_not_run, recipe_reference,
+)
+
+
+def recipe_capture_for(d: Path, contract: str, verify: str) -> tuple[dict[str, object] | None, str]:
+    """The selected recipe captured once, before verify, or why it cannot run."""
+    reference = recipe_reference(contract)
+    if not verify:
+        return None, (f"the task selects verification recipe {reference} but registers no verify "
+                      "command, so the recipe would never run; register the command that invokes it")
+    return capture_recipe(d, reference)
 
 
 def submission_identity(d: Path, owner: str, rep: Path) -> dict[str, str]:
@@ -173,6 +186,11 @@ def check_submission(a: argparse.Namespace, d: Path) -> None:
             meta["actual_model"] = observed
     blocked = a.blocked or meta.get("status", "") == "blocked"
     problems = gate_problems(d, a.run, a.owner, rep, meta, body, blocked)
+    task = d / f"{a.owner}-task.mdx"
+    if not blocked and a.owner != "orch" and task.is_file() and recipe_reference(task.read_text()):
+        problem = recipe_capture_for(d, task.read_text(), task_verify(d, a.owner)[0])[1]
+        if problem:
+            problems.append(problem)
     if problems:
         print(f"{rep.name} would be refused:")
         for problem in problems:
@@ -316,6 +334,22 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
     elif verify and a.skip_verify:
         verification["status"] = "skipped"
         verification["skip_reason"] = a.skip_verify_reason.strip()
+    # The recipe is read from the contract bytes the verification describes, and its
+    # files are captured before the command runs, so the freeze holds what ran.
+    recipe_ref = ("" if a.owner == "orch" or contract_bytes is None
+                  else recipe_reference(contract_bytes.decode("utf-8", "replace")))
+    recipe: dict[str, object] | None = None
+    recipe_capture: dict[str, object] | None = None
+    if recipe_ref and blocked:
+        recipe = {"not_run": recipe_not_run(recipe_ref, "a blocked submission runs no verification")}
+    elif recipe_ref and verify and a.skip_verify:
+        recipe = {"not_run": recipe_not_run(recipe_ref, "verification was skipped")}
+    elif recipe_ref:
+        recipe_capture, problem = recipe_capture_for(
+            d, contract_bytes.decode("utf-8", "replace"), verify)
+        if problem:
+            problems.append(problem)
+        perturb("submit:after-recipe-capture")
     if verify and not blocked and not a.skip_verify and not problems:
         # The resulting source revision is pinned on both sides of the run, so a green
         # result can never be frozen against a checkout it did not describe. The
@@ -329,11 +363,15 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
     if verify and not blocked and not a.skip_verify and not problems:
         print(f"running verify: {verify}")
         task_requested = parse(task.read_text())[0].get("requested_model", "") if task.is_file() else ""
+        evidence_dir = new_evidence_dir(d, a.owner) if recipe_capture else None
+        if evidence_dir:
+            print(f"recipe evidence directory: {evidence_dir}")
         verification = run_verification(verify, verify_timeout,
                                         requested_model=task_requested,
                                         observed_model=meta.get("actual_model", ""),
                                         declared_env=task_env(d, a.owner),
-                                        slot=verify_slot_path(d, a.owner))
+                                        slot=verify_slot_path(d, a.owner),
+                                        docket_env={RECIPE_ENV: str(evidence_dir)} if evidence_dir else None)
         if verification["status"] == "timeout":
             problems.append(f"verify command timed out after {verify_timeout}s")
         elif verification["status"] == "failed":
@@ -353,6 +391,16 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
             )
         else:
             print("verify passed")
+        if recipe_capture and evidence_dir:
+            evidence, missing = collect_evidence(recipe_capture, evidence_dir)
+            if verification["status"] == "passed":
+                problems.extend(missing)
+            problems.extend(recipe_drift(recipe_capture))
+            recipe = {"capture": recipe_capture, "evidence": evidence, "where": evidence_dir}
+
+    if recipe_ref and recipe is None and not problems:
+        # A selected recipe is mandatory evidence: no path may freeze the round without it.
+        problems.append(f"the selected verification recipe {recipe_ref} produced no frozen record")
 
     # Recheck the documents the verification was taken to describe. Freezing binds a
     # captured result to a contract, a report, a scope, and a set of consumed inputs;
@@ -401,6 +449,7 @@ def submit_locked(a: argparse.Namespace, d: Path) -> None:
             verified_source=verified_source,
             require_patch=not blocked and evidence_mode(d) == "git",
             contract_bytes=contract_bytes, dependency_bytes=dependency_bytes,
+            recipe=recipe,
         )
         if problem:
             print(f"\nREJECTED: {rep.name} could not be frozen as review evidence\n", file=sys.stderr)

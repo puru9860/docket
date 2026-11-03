@@ -42,12 +42,16 @@ from .assignments import (
 )
 from .evidence import git_root
 from .roots import candidate_roots, declare_roots, read_roots, resolve_scope, root_identity
+from .recipes import (
+    RECIPE_ENV, RECIPE_KEY, capture_recipe, collect_evidence, new_evidence_dir,
+    normalize_recipe_reference, recipe_drift, recipe_reference,
+)
 from .baselines import (
     assignment_evidence, baseline_path, evidence_mode, output_fingerprint, require_baseline,
     snapshot_path, task_verify, update_snapshot_scope,
 )
 from .bundles import (
-    FINAL_STATES, PROVISIONAL_ALLOWED, bundle_dir, bundle_problems, bundles_for,
+    FINAL_STATES, PROVISIONAL_ALLOWED, bundle_dir, bundle_problems, bundles_for, digest_of,
     latest_bundle, load_bundle, source_identity, materialize_bundle_tree,
 )
 from .locks import owner_lock
@@ -315,6 +319,17 @@ def cmd_assign(a: argparse.Namespace) -> None:
         if "\n" in str(value or "") or "\r" in str(value or ""):
             die(f"{label} cannot contain a line break, since it becomes one frontmatter "
                 f"line: {str(value)!r}. Nothing was assigned")
+    recipe = ""
+    if (a.recipe or "").strip():
+        if a.owner == "orch" or a.executor != "implementor":
+            die("--recipe selects a task's verification recipe; the aggregate and "
+                "orchestrator-executed tasks take none. Nothing was assigned")
+        recipe, problem = normalize_recipe_reference(d, a.recipe)
+        if problem:
+            die(f"{problem}. Nothing was assigned")
+        if (d / f"{a.owner}-task.mdx").exists():
+            die(f"{a.owner}-task.mdx already exists, so --recipe would not reach its contract. "
+                "Nothing was assigned")
     criteria = [c.strip() for c in (a.criterion or []) if c.strip()]
     if a.owner != "orch" and criteria and is_tiered(d) and not a.no_default_criteria:
         criteria.extend(item for item in DEFAULT_REVIEW_CRITERIA if item not in criteria)
@@ -392,8 +407,17 @@ def cmd_assign(a: argparse.Namespace) -> None:
             meta["assignment_harness_explicit"] = "yes" if explicit_harness else "no"
             meta["assignment_model_explicit"] = "yes" if explicit_model else "no"
             text = render(meta, body)
+        if recipe:
+            meta, body = parse(text)
+            meta[RECIPE_KEY] = recipe
+            text = render(meta, body)
         publish(task, text)
         print(f"created {task.relative_to(root())}")
+        if recipe:
+            problem = capture_recipe(d, recipe)[1]
+            print(f"{a.owner} selects verification recipe {recipe}"
+                  + (f"; it cannot be read yet ({problem}), and normal submission refuses "
+                     "until it can" if problem else ""))
         if record_planned_task(d, a.owner, (a.title or "").strip().replace("|", "/"),
                                a.complexity, a.executor):
             print(f"listed {a.owner} in the plan's Tasks table")
@@ -1056,6 +1080,11 @@ def cmd_bundle(a: argparse.Namespace) -> None:
         f"  verification {verification.get('status')} exit {verification.get('returncode')}"
         f"  {verification.get('command') or '(none registered)'}"
     )
+    recipe = manifest.get("recipe")
+    if isinstance(recipe, dict):
+        print(f"  recipe {recipe.get('reference')} run {recipe.get('run')}"
+              + (f"  {len(recipe.get('evidence') or [])} evidence file(s)" if recipe.get("run") == "yes"
+                 else f"  ({recipe.get('reason')})"))
     if kind == "aggregate":
         pinned = manifest.get("constituents")
         pinned = pinned if isinstance(pinned, list) else []
@@ -1300,13 +1329,54 @@ def cmd_preflight(a: argparse.Namespace) -> None:
     timeout = a.verify_timeout or task_timeout
     declared = task_env(d, a.owner)
     run_env, effective = verification_run_env(declared)
+    task = d / f"{a.owner}-task.mdx"
+    recipe_ref = recipe_reference(task.read_text()) if a.owner != "orch" and task.is_file() else ""
     slot = verify_slot_path(d, a.owner)
     holder = claim_verify_slot(slot, verify)
     try:
         source_owner = "run" if a.owner == "orch" else a.owner
         current_source, source_problem = source_identity(d, source_owner, "preflight")
+        if recipe_ref:
+            capture, problem = capture_recipe(d, recipe_ref)
+            if problem:
+                # Recorded, not refused: the recipe may be this task's own work, and a
+                # baseline that cannot run it is a fact about the start, not a pass.
+                target = baseline_path(d, a.owner)
+                publish_json(target, {
+                    "command": verify, "status": "recipe-unavailable", "returncode": "not-run",
+                    "fingerprint": "", "output_tail": [], "declared_env": declared,
+                    "effective_env": effective, "source": current_source, "reused": False,
+                    "recipe": {"reference": recipe_ref, "problem": problem},
+                })
+                print(f"baseline recorded: recipe-unavailable ({problem}) -> "
+                      f"{target.relative_to(root())}")
+                return
+        attempts: list[dict[str, object]] = []
+
+        def attempt() -> tuple[int | None, bytes, bytes, bool]:
+            # Every executed attempt gets its own fresh directory; proof is never shared.
+            env = run_env
+            where = None
+            if recipe_ref:
+                where = new_evidence_dir(d, a.owner)
+                env = {**run_env, RECIPE_ENV: str(where)}
+            code, out, err = execute_verify(verify, timeout, env, holder=holder)
+            if where is not None:
+                evidence, missing = collect_evidence(capture, where)
+                drift = recipe_drift(capture)
+                if drift:
+                    die("the baseline cannot be recorded: " + "; ".join(drift))
+                attempts.append({
+                    "evidence_dir": str(where.relative_to(d)),
+                    "evidence": [{"name": name, "sha256": digest_of(data), "bytes": len(data)}
+                                 for name, data in evidence],
+                    "missing": missing if code == 0 else [],
+                })
+                return code, out, err, not missing
+            return code, out, err, True
+
         reusable = None
-        if not source_problem:
+        if not source_problem and not recipe_ref:
             reusable = latest_reusable_verification(
                 d, verify, declared, effective, current_source,
             )
@@ -1337,20 +1407,18 @@ def cmd_preflight(a: argparse.Namespace) -> None:
             return
 
         print(f"running baseline verify: {verify}")
-        code, out_bytes, err_bytes = execute_verify(
-            verify, timeout, run_env, holder=holder,
-        )
+        code, out_bytes, err_bytes, proved = attempt()
         stdout, stderr = out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
         status = classify_preflight(code, stdout, stderr)
+        if status == "passed" and not proved:
+            status = "recipe-proof-missing"
         # A failing baseline that passes on an immediate rerun is flaky, not
         # broken: record it as nondeterministic rather than as a clean failure.
-        if status in ("failed", "existing-failure"):
-            second, second_out, second_err = execute_verify(
-                verify, timeout, run_env, holder=holder,
-            )
+        if status in ("failed", "existing-failure", "recipe-proof-missing"):
+            second, second_out, second_err, second_proved = attempt()
             second_stdout = second_out.decode("utf-8", "replace")
             second_stderr = second_err.decode("utf-8", "replace")
-            if second is not None and second == 0:
+            if second is not None and second == 0 and second_proved:
                 status = "nondeterministic"
                 stdout, stderr = second_stdout, second_stderr
                 code = second
@@ -1365,10 +1433,18 @@ def cmd_preflight(a: argparse.Namespace) -> None:
             "source": current_source,
             "reused": False,
         }
+        if recipe_ref:
+            data["recipe"] = {
+                "reference": recipe_ref,
+                "files": {str(item["relative"]): digest_of(item["data"]) for item in capture["files"]},
+                "attempts": attempts,
+            }
         if code is None:
             outcome = f"timed out after {timeout}s"
         elif status == "passed":
             outcome = "passing"
+        elif status == "recipe-proof-missing":
+            outcome = "recipe-proof-missing (exit 0 without the recipe's declared evidence)"
         else:
             outcome = f"{status} (exit {code})"
         target = baseline_path(d, a.owner)

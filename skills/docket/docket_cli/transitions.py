@@ -21,7 +21,7 @@ from .policy import (
     task_executor,
 )
 from .baselines import evidence_digest, evidence_mode, task_verify
-from .bundles import cleanup_checkout_exports, digest_of
+from .bundles import cleanup_checkout_exports, digest_of, source_identity
 from .locks import owner_lock
 from .state import (
     applied_decision, batch_path, group_numbered_items, latest_verification, list_batches,
@@ -29,9 +29,14 @@ from .state import (
     seed_report_acceptance, transition_path, quick_submitted_pass,
 )
 from .dependencies import (
-    dependency_problems, provisional_dependencies, refreshed_inputs, read_deps,
+    deps_record_bytes, dependency_problems, provisional_dependencies, refreshed_inputs, read_deps,
 )
+from .submission import drifted_inputs, submission_identity
 from .freeze import current_bundle, freeze_task_bundle
+from .recipes import (
+    RECIPE_ENV, capture_recipe, collect_evidence, new_evidence_dir, recipe_approval_problem,
+    recipe_drift, recipe_not_run, recipe_reference,
+)
 from .aggregates import (
     current_aggregate, freeze_aggregate_bundle, require_aggregate, stale_aggregate,
 )
@@ -557,27 +562,61 @@ def reverify_changed_evidence(a: argparse.Namespace, d: Path, rep: Path) -> dict
             "    Have the implementor correct the report and resubmit it."
         )
     print("re-review passed the report gate")
+    task_file = d / f"{a.owner}-task.mdx"
+    recipe_ref = (recipe_reference(task_file.read_text())
+                  if a.owner != "orch" and task_file.is_file() else "")
     if blocked:
         print(
             f"{rep.name} is blocked, so re-review skips completion verification, exactly as "
             "submission does; decide the waiver on the changed body"
         )
-        return {"status": "blocked", "command": verify, "reverified": "blocked"}
+        record: dict[str, object] = {"status": "blocked", "command": verify, "reverified": "blocked"}
+        if recipe_ref:
+            record["_recipe"] = {"not_run": recipe_not_run(
+                recipe_ref, "a blocked submission runs no verification")}
+            record["_bind"] = {"contract_bytes": task_file.read_bytes(),
+                               "dependency_bytes": deps_record_bytes(d, a.owner),
+                               "report_body": parse(rep.read_text())[1]}
+        return record
 
     if not verify:
+        if recipe_ref:
+            die(f"the task selects verification recipe {recipe_ref} but registers no verify "
+                "command, so the re-reviewed report cannot be verified against it")
         print(f"{a.owner} has no registered verify command; recording the re-review without one")
         return {"status": "none", "command": "", "reverified": "unavailable"}
+    capture = None
+    bind: dict[str, object] = {}
+    if recipe_ref:
+        # The recipe path binds exactly what this verification describes, as submit does:
+        # documents, consumed inputs, and source are read before the command runs and
+        # rechecked after, and the freeze is handed those bytes, never a later re-read.
+        verified = submission_identity(d, a.owner, rep)
+        bind = {"contract_bytes": task_file.read_bytes(),
+                "dependency_bytes": deps_record_bytes(d, a.owner),
+                "report_body": parse(rep.read_text())[1]}
+        if evidence_mode(d) == "git":
+            pinned, unpinned = source_identity(d, a.owner, "verify")
+            if unpinned:
+                die(f"the source could not be pinned before re-verification: {unpinned}")
+            bind["verified_source"] = pinned
+        capture, problem = capture_recipe(d, recipe_ref)
+        if problem:
+            die(f"the re-reviewed report cannot be verified: {problem}")
     timeout = a.verify_timeout or task_timeout
     print(f"re-verifying changed evidence: {verify}")
     task_requested = ""
-    task_file = d / f"{a.owner}-task.mdx"
     if task_file.is_file():
         task_requested = parse(task_file.read_text())[0].get("requested_model", "")
     observed = parse(rep.read_text())[0].get("actual_model", "")
+    evidence_dir = new_evidence_dir(d, a.owner) if capture else None
+    if evidence_dir:
+        print(f"recipe evidence directory: {evidence_dir}")
     record = run_verification(verify, timeout, requested_model=task_requested,
                               observed_model=observed,
                               declared_env=task_env(d, a.owner),
-                              slot=verify_slot_path(d, a.owner))
+                              slot=verify_slot_path(d, a.owner),
+                              docket_env={RECIPE_ENV: str(evidence_dir)} if evidence_dir else None)
     if record["status"] == "timeout":
         die(f"re-verification timed out after {timeout}s; {rep.name} is not reviewable as it stands")
     if record["status"] == "failed":
@@ -586,6 +625,15 @@ def reverify_changed_evidence(a: argparse.Namespace, d: Path, rep: Path) -> dict
             f"re-verification failed (exit {record['returncode']}); the changed report cannot be "
             "decided:\n      " + "\n      ".join(tail)
         )
+    if capture and evidence_dir:
+        evidence, problems = collect_evidence(capture, evidence_dir)
+        problems.extend(recipe_drift(capture))
+        problems.extend(drifted_inputs(d, a.owner, rep, verified))
+        if problems:
+            die("the re-verified recipe evidence cannot be frozen, so the changed report "
+                "cannot be decided:\n      " + "\n      ".join(problems))
+        record["_recipe"] = {"capture": capture, "evidence": evidence, "where": evidence_dir}
+        record["_bind"] = bind
     print("re-verification passed")
     record["reverified"] = "yes"
     return record
@@ -947,6 +995,11 @@ def guard_accepting_verdict(
                 f"the task contract changed after round {rnd} was frozen: "
                 "the captured verification described different acceptance"
             )
+        if verdict == "approved" and task_file.is_file():
+            problem = recipe_approval_problem(frozen, recipe_reference(task_file.read_text()))
+            if problem:
+                die(f"{a.owner} round {rnd} cannot be approved: {problem}. A waiver may "
+                    "accept the gap explicitly")
         if is_five_role(d) and verdict == "approved":
             if is_quick_milestone(d):
                 if not quick_submitted_pass(d, a.owner, rnd):
@@ -1182,6 +1235,11 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
             )
         record = reverify_changed_evidence(a, d, rep)
         decision_meta["reverified"] = str(record.pop("reverified", ""))
+        recipe = record.pop("_recipe", None)
+        bind = record.pop("_bind", {})
+        if bind and evidence_digest(str(bind["report_body"])) != digest:
+            die(f"{rep.name} changed between the re-review check and its verification; "
+                "nothing was frozen. Repeat the decision on the settled report")
         if binding:
             # The re-reviewed body is new evidence, so it is frozen as its own bundle.
             # The superseded one keeps its own address and its own bytes.
@@ -1194,6 +1252,10 @@ def decide_locked(a: argparse.Namespace, d: Path) -> None:
                 refrozen, problem = freeze_task_bundle(
                     d, a.run, a.owner, rep, report_body, record, "re-review",
                     require_patch=report_meta.get("status") != "blocked" and evidence_mode(d) == "git",
+                    verified_source=bind.get("verified_source"),
+                    contract_bytes=bind.get("contract_bytes"),
+                    dependency_bytes=bind.get("dependency_bytes"),
+                    recipe=recipe,
                 )
             if problem:
                 die(f"the re-reviewed evidence could not be frozen, so it cannot be decided: {problem}")

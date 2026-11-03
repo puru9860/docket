@@ -208,8 +208,13 @@ def skipped_approval_problem(owner: str, rnd: int, run: str) -> str:
 def run_verification(command: str, timeout: int, requested_model: str = "",
                      observed_model: str = "",
                      declared_env: list[str] | None = None,
-                     slot: Path | None = None) -> dict[str, object]:
-    """Execute the registered verification and capture what it actually did."""
+                     slot: Path | None = None,
+                     docket_env: dict[str, str] | None = None) -> dict[str, object]:
+    """Execute the registered verification and capture what it actually did.
+
+    `docket_env` is set by Docket itself, after declared inputs, so a task cannot
+    point a recipe at an evidence directory of its own choosing.
+    """
     started = time.time()
     if observed_model:
         model_source = "observed"
@@ -228,7 +233,10 @@ def run_verification(command: str, timeout: int, requested_model: str = "",
         "declared_env": list(declared_env or []),
     }
     run_env, effective = verification_run_env(list(declared_env or []))
+    run_env.update(docket_env or {})
     record["effective_env"] = effective
+    if docket_env:
+        record["docket_env"] = sorted(docket_env)
     code, out_bytes, err_bytes = execute_verify(command, timeout, run_env, slot)
     stdout, stderr = out_bytes.decode("utf-8", "replace"), err_bytes.decode("utf-8", "replace")
     record["status"] = "timeout" if code is None else ("passed" if code == 0 else "failed")

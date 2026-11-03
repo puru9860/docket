@@ -1293,6 +1293,26 @@ The shared `milestone_dependency_problem` check is used by dispatch readiness an
 Historical suite validation permits later milestones to edit the checkout without invalidating earlier approval, while moved member evidence still closes the barrier.
 Ungrouped tasks retain their recorded integration policy; planners put approval-dependent tasks in separate milestones or merge them to avoid deadlock.
 
+### Verification recipes
+
+A task may select one project-local verification recipe with `docket assign --recipe PATH` or the plan task key `recipe`.
+The selection is the flat task frontmatter `verification_recipe:`, unqualified in a single-root run and `<alias>:<path>` in a multi-root one.
+Tasks without a selection keep their previous frontmatter, prompts, and bundle manifests byte for byte.
+The recipe is a strict v1 JSON manifest (`version`, `name`, `instructions`, `helpers`, `evidence`); an unknown key is refused rather than ignored.
+Every reference is a relative path to a regular file under the manifest's directory, and `..`, absolute paths, duplicates, and symlinked components are refused.
+The selection is revalidated at capture, not trusted from assign, because frontmatter can be amended by hand, and an unreadable `roots.json` refuses capture rather than falling back to the workspace root.
+
+The recipe does not replace the verify floor; the task's own verify command runs it.
+A normal submission captures the manifest, instructions, and helper bytes once before the command runs, gives it a fresh, empty, owner-only directory under `<run>/.recipe-evidence/<owner>/` through `DOCKET_RECIPE_EVIDENCE_DIR` (set after declared inputs, so a task cannot redirect it), and afterwards requires every declared evidence file there.
+Missing proof, a recipe file that changed or vanished while the command ran, or a selection with no verify command refuses the submission and freezes nothing.
+The freeze stores the pre-verify recipe bytes and the evidence bytes as digested artifacts, so `bundle_problems` reports a tampered or missing one as damage.
+The bundle's `recipe.changed_in_patch` names recipe files the round's own patch edits; the review packet presents them as a changed oracle.
+A blocked or skipped submission records the selection with `run: no` and its reason, captures nothing, and claims no evidence; approval of a contract that selects a recipe requires a frozen run of exactly that recipe, while a waiver may accept the gap.
+A recipe re-review binds the contract, report, scope, consumed inputs, and source before its verify command, rechecks them after, and freezes the pre-verify bytes, the same rule submission follows.
+`docket preflight` runs a recipe task's verify command the same way: each executed attempt, including the nondeterminism retry, gets its own fresh evidence directory, a zero exit without the declared proof records `recipe-proof-missing`, recipe drift refuses the baseline, an uncapturable recipe records `recipe-unavailable`, and a recipe task never reuses another bundle's passing result.
+The recipe drives a real boundary; it is not an oracle.
+The reviewer prompt and packet say so, and require at least one independent material boundary or negative case.
+
 ### Provisional dependencies
 
 A task may consume another task's frozen evidence with
@@ -1729,6 +1749,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `roots` | `root_identity`, `linked_worktrees`, `nested_checkouts`, `candidate_roots`, `build_root_records`, `declare_roots`, `read_roots`, `declared_roots`, `resolve_scope`, `split_qualified` |
 | `baselines` | `snapshot_assignment`, `require_baseline`, `capture_root_baseline`, `capture_untracked`, `discard_capture`, `update_snapshot_scope`, `evidence_mode`, `root_changes`, `legacy_evidence`, `assignment_evidence`, `evidence_digest`, `task_verify` |
 | `bundles` | `private_git_env`, `private_git`, `prune_index`, `baseline_tree`, `source_tree`, `tree_patch`, `source_identity`, `read_ledger`, `manifest_files`, `pinned_trees`, `tree_problems`, `bundle_problems`, `latest_bundle`, `publish_bundle` |
+| `recipes` | `normalize_recipe_reference`, `recipe_location`, `read_regular`, `capture_recipe`, `recipe_drift`, `new_evidence_dir`, `collect_evidence`, `recipe_section`, `recipe_approval_problem` |
 | `locks` | `owner_lock`, `owner_lock_held`, `run_lock` |
 | `state` | `state_of`, `handoff_state`, `scope_state`, `scope_collisions`, `read_transition`, `unfinished_decision`, `decide_as`, `reopen_epoch`, `armed`, `list_batches`, `list_incidents`, `latest_verification`, `derive_stage`, `task_depends_on`, `list_amendments` |
 | `profiles` | `read_profile`, `list_cards`, `profile_revision`, `match_model_profile`, `normalized_model`, `model_aliases` |

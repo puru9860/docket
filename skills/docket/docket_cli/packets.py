@@ -169,6 +169,33 @@ def packet_acceptance_lines(owner: str, contract: str, report: str,
     return out
 
 
+def packet_recipe_lines(owner: str, manifest: dict, base: str) -> list[str]:
+    """The frozen recipe and its evidence, as immutable pointers. Never shortened."""
+    recipe = manifest.get("recipe")
+    if not isinstance(recipe, dict):
+        return []
+    lines = [f"  verification recipe {recipe.get('reference')} for {owner}: run {recipe.get('run')}"]
+    if recipe.get("run") != "yes":
+        lines.append(f"    not run: {recipe.get('reason', 'no reason recorded')}")
+        return lines
+    files = [recipe.get("manifest"), recipe.get("instructions"), *(recipe.get("helpers") or [])]
+    for item in [f for f in files if isinstance(f, dict)]:
+        lines.append(f"    recipe file {item.get('path')}: {base}/{item.get('file')}")
+    for item in recipe.get("evidence") or []:
+        if isinstance(item, dict):
+            lines.append(f"    evidence {item.get('name')} ({item.get('bytes')} bytes): "
+                         f"{base}/{item.get('file')}")
+    lines.append("    The recipe drives the check; it is not an oracle. Derive expected behavior "
+                 "from the objective and approved contract, and check at least one material "
+                 "boundary or negative case of your own.")
+    changed = recipe.get("changed_in_patch") or []
+    if changed:
+        lines.append(f"    changed oracle: this round's patch edits recipe file(s) {', '.join(changed)}; "
+                     "review each changed expectation against an independent derivation, as the "
+                     "changed-oracle obligation requires.")
+    return lines
+
+
 def correction_basis(d: Path, owner: str, rnd: int, manifest: dict) -> tuple[dict | None, dict]:
     """Resolve the reviewed predecessor, never infer it from ledger adjacency."""
     delta = manifest.get("delta") or {}
@@ -682,6 +709,12 @@ def cmd_review_packet(a: argparse.Namespace) -> None:
             lines.extend(block)
             mandatory_blocks.append("\n".join(block))
             required_reading.extend((contract_ref, report_ref))
+        if where:
+            recipe_block = packet_recipe_lines(owner, load_bundle(d, owner, frozen_entry) or {},
+                                               str(where.relative_to(d)))
+            lines.extend(recipe_block)
+            if recipe_block:
+                mandatory_blocks.append("\n".join(recipe_block))
         if rnd and rnd > 1:
             # Each fresh review used to find a new, rarer edge, so corrections never converged.
             rule = (f"  correction round {rnd}: judge it against the required changes in "

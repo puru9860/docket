@@ -228,6 +228,27 @@ npm run test:browser
 
 `npm test` runs the Python inspector and history tests and every Node test: provider history formats, exact session isolation, the project registry and its validation, project-scoped routes, binding pinning, the send and stop transport against a real subprocess, request adapters against a real loopback HTTP server and real process discovery, and the inert Markdown renderer.
 
+The opt-in [verification recipe pilot](../docs/verification-recipe-pilot.md)
+checks browser-added project persistence across a real companion restart,
+invalid-path rejection and isolation from unrelated project data. It needs no
+Herdr or model calls. From the repository root, run:
+
+```sh
+node ui/verification/companion-projects/verify.mjs --evidence-dir /absolute/fresh/private-proof
+node --test ui/verification/companion-projects/verify.test.mjs
+```
+
+These explicit recipe tests require Playwright Chromium and are separate from
+`npm test`, whose default prerequisites are unchanged. When the recipe is invoked,
+missing prerequisites fail explicitly.
+
+The helper starts and stops only its own private instances and removes their
+synthetic fixtures. Doctor, result and screenshot remain in the requested
+directory. Use a fresh directory each time; private `.docket/` state is allowed,
+and other checkout paths are refused. The
+[recipe instructions](verification/companion-projects/recipe.md) explain the
+controlled persistence-loss negative case and explicit prerequisite failures.
+
 `npm run test:browser` needs Herdr and Chromium.
 Two suites run on a named disposable Herdr server with its own temporary config, state and workspaces and ordinary shells, and remove only that server afterwards.
 No agent runs and no provider is called.

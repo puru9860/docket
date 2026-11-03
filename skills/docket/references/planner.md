@@ -89,6 +89,7 @@ Omitting roots declares only the enclosing checkout; name nested repositories an
 Never commit, stash, or recapture user work to clean a baseline.
 Default review criteria cover sibling sites, regressions, and side effects; `no_default_criteria` corresponds to `--no-default-criteria` and is appropriate only when those checks do not apply.
 Tasks accept assign fields: `harness`, `model`, and `effort` are optional requests in addition to the fields shown.
+A task may name one project-local verification recipe manifest with `recipe`; its `verify` must run that recipe, and submission refuses the round without the recipe's declared evidence.
 Milestones also accept `depends_on` edges such as `["T02:T01"]`, `implementor_harness`, `implementor_model`, and corresponding `reviewer`, `planner`, and `test_author` fields.
 Each assignment override needs `assignment_reason` and must respect user allow-lists and pins.
 All tasks inherit their milestone's implementor assignment; omit task model/harness requests unless they agree.

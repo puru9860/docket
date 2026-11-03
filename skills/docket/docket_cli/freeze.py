@@ -16,6 +16,7 @@ from .bundles import (
     retain_tree_objects, source_tree, tree_patch,
 )
 from .dependencies import deps_record_bytes, parse_deps
+from .recipes import recipe_section
 
 
 def frozen_baseline_root(
@@ -66,6 +67,7 @@ def freeze_task_bundle(
     verification: dict[str, object], trigger: str,
     verified_source: list[dict[str, str]] | None = None, require_patch: bool = False,
     contract_bytes: bytes | None = None, dependency_bytes: bytes | None = None,
+    recipe: dict[str, object] | None = None,
 ) -> tuple[dict[str, object] | None, str]:
     """Freeze one task round into an immutable, content-addressed evidence bundle.
 
@@ -75,6 +77,9 @@ def freeze_task_bundle(
     record of the inputs it consumed, the report body as submitted, and the
     verification as captured. Nothing that happens afterwards can reach back into it,
     because the address is the content.
+
+    `recipe` is either a pre-verify capture with the evidence collected after it, or a
+    not-run record; a task that selects no recipe freezes exactly what it did before.
     """
     match = re.search(r"-report-(\d+)\.mdx$", rep.name)
     rnd = int(match.group(1)) if match else 1
@@ -269,6 +274,10 @@ def freeze_task_bundle(
         "digest": "",
         **artifact_policy_fields(d),
     }
+    if recipe is not None:
+        manifest["recipe"] = (dict(recipe["not_run"]) if "not_run" in recipe else
+                              recipe_section(recipe["capture"], recipe["evidence"],
+                                             recipe.get("where"), d, store, changed))
     entry, where, problems = publish_bundle(
         d, owner, manifest, artifacts, validate=lambda e: bundle_problems(d, owner, e))
     if problems:

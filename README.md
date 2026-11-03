@@ -585,6 +585,15 @@ lock through verification, evidence freeze, and report publication. In conductor
 For manual recovery, read the log or `docket status` for the outcome. Repeating the background command while it
 is running reports the existing job instead of starting another verify.
 
+## Verification recipes
+
+A task can select one project-local verification recipe: `docket assign ... --recipe PATH`, or `"recipe": "PATH"` on a task in `plan.json`.
+The recipe is a JSON manifest of version 1 naming its instructions, helpers, and the evidence files it must produce.
+The task's own verify command runs the recipe; `docket submit` gives that command a fresh private directory in `DOCKET_RECIPE_EVIDENCE_DIR`, refuses the round unless every declared evidence file appears there, and freezes the recipe bytes and the evidence into the bundle.
+A blocked submission stays lightweight and claims no recipe evidence.
+The reviewer still derives expected behavior from the objective and contract; a recipe is a driver for a real boundary, not an oracle.
+This is an opt-in pilot, not a default and not a measured quality or cost improvement.
+
 ## License
 
 MIT

@@ -200,6 +200,8 @@ def main() -> None:
     q.add_argument("--verify-timeout", type=int, default=900)
     q.add_argument("--env", action="append", default=[], metavar="NAME=value",
                    help="declared environment input for verification; repeat per input")
+    q.add_argument("--recipe", default="", metavar="PATH",
+                   help="project-local verification recipe manifest the task's verify command runs")
     q.add_argument("--depends-on", action="append", default=[], metavar="TASK",
                    type=task_ids_argument,
                    help="task that must be approved first; repeat per dependency")

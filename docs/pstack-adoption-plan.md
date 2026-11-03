@@ -48,7 +48,7 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 
 | ID | Work | State | Main owner |
 | --- | --- | --- | --- |
-| M0 | Verification-recipe infrastructure and one real companion recipe | Implemented and verified; checkpoint commit next | Opus core, Sol UI |
+| M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
 | M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Ready to implement separately from the recipe-only treatment | Sol, Opus review |
 | M2 | Broader recipe coverage and maintained feature map | One additional meaningful boundary plus a documented maintenance workflow | Sol implementation, Opus boundary review |
 | M3 | Blinded recipe-only comparison with fixed model assignments | Design, run, and report; a small result permits opt-in reuse only | Opus design/candidates, Sol bounded adjudication |

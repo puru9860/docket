@@ -25,6 +25,7 @@ from .policy import (
     verifier_correction_allowed, workflow_of,
 )
 from .bundles import digest_of
+from .recipes import RECIPE_ENV, RECIPE_KEY
 from .state import (
     derive_stage, group_numbered_items, latest_checkpoint, latest_verification, list_batches,
     raw_checkbox_lines, ready_handoff, state_of,
@@ -93,6 +94,8 @@ RENDERER_SOURCE_CONSTANTS = (
     "VERIFICATION_OBLIGATION_TRIGGERS",
     "PROMPT_STAGES",
     "PROFILE_TOKEN_BUDGET",
+    "RECIPE_ENV",
+    "RECIPE_KEY",
 )
 
 
@@ -517,6 +520,19 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
             *(f"{label}: {value.strip()}" for label, value in optional_fields
               if value.strip() and value.strip().lower() not in ("none", "none stated")),
         ]
+        recipe = str(task_meta.get(RECIPE_KEY, "") or "").strip()
+        if recipe and role == "implementor":
+            contract_lines.append(
+                f"verification recipe: {recipe} (required). The registered verify command runs it "
+                f"with {RECIPE_ENV} set to a fresh private directory; submit freezes the recipe and "
+                "refuses unless every evidence file it declares is produced there. A missing "
+                "prerequisite is an honest block, never a weakened recipe.")
+        elif recipe:
+            contract_lines.append(
+                f"verification recipe: {recipe} (frozen with its evidence in the bundle). It drives "
+                "the real boundary but is not an oracle: derive expected behavior from the objective "
+                "and approved contract, and check at least one material boundary or negative case "
+                "the recipe does not. A recipe file changed by the patch is changed-oracle work.")
         if risk == "high" and role in ("verifier", "checker"):
             strong = high_risk_verifier_model(d)
             if strong:

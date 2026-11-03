@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "name": "companion-projects",
+  "instructions": "recipe.md",
+  "helpers": ["verify.mjs"],
+  "evidence": ["doctor.json", "result.json", "journey.png"]
+}
