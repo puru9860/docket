@@ -130,6 +130,9 @@ class ReasoningGuidance(unittest.TestCase):
         text, record = self.prompt(run, "reviewer")
         self.assertEqual("review", record["stage"])
         self.assert_runtime_guidance(text)
+        self.assertEqual(1, text.count("For consequential runtime claims"),
+                         "shared duties must not duplicate mandatory runtime reasoning")
+        self.assertNotIn("# Correction reasoning", text, "initial review has no corrections to inspect")
         self.assertNotIn("replace semantic classification", text)
         self.assertIn("criterion-to-observation map", text)
         self.assertIn("persistence read-back", text)
@@ -157,6 +160,8 @@ class ReasoningGuidance(unittest.TestCase):
         self.assertIn("Repeated criterion numbers are a signal to inspect, not proof of a shared premise", text)
         self.assertIn("explicit unrun state", text)
         self.assertIn("existing decision or escalation", text)
+        self.assertIn("disposable copy or private state", text)
+        self.assertIn("never the measured checkout", text)
         self.assertIn("only the recorded plan owner may grant more rounds", text)
         self.assertIn("Criterion A1: exercise actual read-back at restart.", text)
         self.assertIn("Probe result: a new process can lose the saved list", text)
@@ -167,26 +172,30 @@ class ReasoningGuidance(unittest.TestCase):
         run = self.start()
         self.ready(run)
         self.cli("submit", "demo", "T01", "--as", "implementor")
-        base, record = self.prompt(run, "reviewer")
-        again, repeated = self.prompt(run, "reviewer")
-        self.assertEqual(base, again)
-        self.assertEqual(record["renderer_revision"], repeated["renderer_revision"])
+        self.cli("decide", "demo", "T01", "--changes", "--as", "reviewer",
+                 "--change", "1. Criterion A1: verify persistence after restart.")
+        self.ready(run, 2)
+        self.cli("submit", "demo", "T01", "--as", "implementor")
         mod = fixtures.load_cli("reasoning_revision_tests")
         edits = (
-            ("runtime_reasoning", '"For consequential runtime claims, retain the semantic classification supported "',
+            ("implementor", "runtime_reasoning", '"For consequential runtime claims, retain the semantic classification supported "',
              '"For consequential runtime claims, retain the existing semantic classification supported "',
              "retain the existing semantic classification"),
-            ("correction_reasoning", '"Repeated criterion numbers are a signal to inspect, not proof of a shared premise. "',
+            ("reviewer", "correction_reasoning", '"Repeated criterion numbers are a signal to inspect, not proof of a shared premise. "',
              '"Repeated criterion numbers only signal inspection; they do not prove a shared premise. "',
              "Repeated criterion numbers only signal inspection"),
         )
-        for helper, old, new, rendered in edits:
+        for role, helper, old, new, rendered in edits:
             with self.subTest(helper=helper):
+                base, record = self.prompt(run, role)
+                again, repeated = self.prompt(run, role)
+                self.assertEqual(base, again)
+                self.assertEqual(record["renderer_revision"], repeated["renderer_revision"])
                 self.assertIn(helper, mod.RENDERER_SOURCE_FUNCTIONS)
                 # Each disposable build edits only this helper's wording. The
                 # compose/checklist callers and canonical contracts stay fixed.
                 binary = self.f._stage_patched_bin(f"changed-{helper}", old, new)
-                output = self.f._prompt_with_bin(binary, "T01", "reviewer")
+                output = self.f._prompt_with_bin(binary, "T01", role)
                 self.assertIn(rendered, output)
                 self.assertNotEqual(self.f._renderer_of(base), self.f._renderer_of(output))
 
@@ -201,6 +210,9 @@ class ReasoningGuidance(unittest.TestCase):
         self.cli("batch", "demo", "--approve", "M1", "--as", "reviewer", "--reason", "Existing contract is met.")
         self.assertIn(f"- [x] {CRITERION}", report.read_text())
         self.assertIn("status: approved", report.read_text())
+        text, _ = self.prompt(run, "reviewer")
+        self.assertNotIn("# Correction reasoning", text,
+                         "an approving decision is not a changes-requested correction")
 
     def test_honest_block_needs_no_probe_or_runtime_proof_fields(self):
         run = self.start()

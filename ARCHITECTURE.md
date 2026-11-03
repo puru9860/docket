@@ -96,6 +96,31 @@ harnesses without native hooks and retain the minimum useful wait window.
 Canonical launch and exchange guidance lives in `references/discussion.md`,
 available through `docket help discussion`.
 
+### Group discussions
+
+`--start --peer NAME:HARNESS[:MODEL]`, given two to four times, writes protocol `discussion-group-v1` instead of `discussion-v1`.
+Every reader dispatches on `protocol`, so neither protocol parses the other's transcript, and two-party documents, prompts, wakes, and refusals are unchanged.
+`discussion.mdx` holds an immutable roster (`roster: invoker,astra,opus`) with flat `<name>_harness` and `<name>_model` request keys.
+Reserved names keep a roster member from rendering as the user, the invoker, or Docket.
+`participants/<name>.mdx` binds each member with the same session, generation, and native process proof as two-party participants, and no two members may share one.
+
+`discussion_groups` holds the rules as pure functions over parsed records; `discussions` keeps files, locks, and delivery.
+The floor, pending proposal, and outcome are replayed from the chained transcript and never stored separately.
+Agents speak in roster order, starting each phase with the first peer, and a turn written off the floor reads as `DAMAGED`.
+`--accept N` and `--dissent N` bind to one pending proposal and its digest.
+When the last required member answers, the message records `outcome` (`unanimous`, `dissent`, or `declined`), `accepted_by`, and `dissenters`; only the first two conclude.
+A later message, human input, pause, continue, close, or `generation` event withdraws a pending proposal.
+
+A pending proposal also counts only while every author's recorded session and generation equal that member's current registration.
+Replacement publishes the new registration, then appends a `generation` event, so the stale writer is refused at once.
+An interruption between the two writes therefore cannot leave old-generation acceptance valid, even with no event on disk.
+Rerunning the same join records the missing event once, and a member whose replacement event is missing is refused until it does.
+
+Each member has its own generation-bound receipt and announcement lease.
+Pickup prints every unread message from others.
+A wake goes only to the floor holder, or to the invoker after a conclusion or a turn-limit pause.
+A replacement event is bookkeeping and wakes nobody unless it records `withdrew: N`, a live proposal it withdrew; even then only the member who must act next is woken, such as the invoker reporting a cap pause.
+
 ## Data model
 
 ```
@@ -1761,6 +1786,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `feedback` | `feedback_log_path`, `log_feedback`, `machine_feedback` |
 | `hook_config` | shared defensive Stop-hook recognition, local Codex JSON/TOML configuration, runtime skill-copy comparison |
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
+| `discussion_groups` | group roster and name validation, floor and proposal replay, generation-bound pending acceptance, outcome settlement, wake ownership, group prompt text |
 | `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |
 | `models` | `record_outcome`, `task_model`, `model_scorecard`, `pending_reviews`, `model_review_packet`, `adopt_model_profile`, `cmd_models`, `cmd_feedback`, `import_operational_feedback` |
 | `assignments` | strict flat JSON config ingestion, recorded role resolution and sources, milestone overrides, draft inheritance and recovery, `cmd_config` |

@@ -1,115 +1,100 @@
-# Paused pstack work: resume handoff
+# Pstack continuation handoff
 
-Paused at the user's explicit request on 2026-11-03, around 16:55 Nepal time.
-This pause supersedes the earlier instruction to work continuously. Do not
-resume implementation or re-arm model timers until the user asks to continue.
+The user resumed on 2026-11-03 around 21:55 Nepal time after the earlier graceful
+pause. Continuous implementation, heavy Opus/light Sol routing, disjoint
+worktrees, commits and pushes remain authorized. The working branch is
+`audit-3-fixes`; read [the adoption plan](pstack-adoption-plan.md) for scope.
 
-All three worker sessions were stopped. Both Opus automatic quota-reset
-continuations were cancelled, and Sol's active turn was interrupted. The
-coordinator's in-flight M1 full suite received SIGINT and exited 130 through its
-worker-cleanup path. The interruption is not a passing test result.
+## Source and validation
 
-## Saved Git checkpoints
+- `e4119fd`: portable adoption plan.
+- `fe58b1a`: verified recipe infrastructure and real companion Add-project recipe.
+- `42a406a`: preserved M1 draft and graceful pause handoff.
+- The continuation checkpoint containing this file integrates M1 reasoning
+  guidance, the recipe-path fix and native opt-in group discussions.
 
-| Branch / checkpoint | State |
-| --- | --- |
-| `audit-3-fixes`, `e4119fd` | Portable adoption/continuation plan |
-| `audit-3-fixes`, `fe58b1a` | Last fully verified milestone: recipe infrastructure and real companion recipe |
-| `audit-3-fixes`, this handoff checkpoint | M1 reasoning guidance, independently reviewed and focused-tested; full regression suite still pending |
-| `pstack-group-discussions`, `e23dda0` | WIP native group-discussion design and partial implementation; unfinished and unvalidated |
-| `pstack-recipe-comparison`, `9f66fbe` | WIP hidden checker and two task definitions; preparation/runner/protocol/tests unfinished |
+The combined CLI suite passed 814 tests. The earlier attempt exposed duplicate
+mandatory reviewer prose exceeding the existing 6000-character limit. That was
+fixed by sharing runtime reasoning and limiting correction advice to relevant
+reviews, with no raised limit. Independent Opus review subsequently tightened
+probe isolation and restricted correction advice to changes-requested decisions;
+all 7 guidance tests passed after those final refinements. Run the final combined
+suite after the next source milestone before final completion.
 
-The WIP branches are separate from the continuation branch. They are preservation
-checkpoints, not approved implementations. No comparison candidates ran and no
-experimental results or default promotion exist.
+The recipe-path fix has 7 passing integration tests: real assign, plan, prompt,
+submit, bundle and qualified-root behavior with spaces, hashes and quotes. The
+field alone uses a JSON string codec; ordinary references and global flat
+frontmatter behavior retain their existing bytes. Old truncated fields cannot
+recover missing suffixes automatically. Bug assertions failed before the fix.
 
-## Completed and checked
+Group discussions have 11 new tests plus 31 unchanged existing bilateral tests.
+The protocol is opt-in with two to four named peers, a serialized floor, explicit
+proposal-bound acceptance or named dissent, per-recipient delivery, whole-group
+user pause, honest caps and retry-safe generation replacement. Both interrupted
+replacement and withdrawal-at-cap wake regressions were reproduced before their
+fixes. See [the design](group-discussion-design.md). G05 is the real three-party
+pilot, with manually initiated delivery until the installed copy is synced.
+Its conclusion is design advice, never coding approval or a passing test.
 
-The recipe milestone adds explicit `--recipe` / plan-task selection, strict
-manifest/path/root validation, fresh private proof for preflight/submission/
-re-review, exact input and output freezing, drift and missing-proof refusals,
-lightweight honest blocks, immutable review pointers and changed-oracle duties.
-The companion recipe exercises actual browser project persistence across a real
-server restart, with negative/prerequisite controls and owned-instance cleanup.
+M0's existing checks passed 789 CLI tests, 43 UI Python tests, 104 UI Node tests,
+and 8 explicit browser tests. Real preflight/submission used distinct proof
+folders and froze an intact doctor/result/screenshot bundle. That integration
+fixture used documents-only evidence; Git freezing, multi-root, drift and tamper
+cases are covered by the CLI suite. No comparative cost/quality gain is claimed.
 
-Verified recipe checkpoint: 789 CLI tests, 43 UI Python tests, 104 UI Node tests,
-and 8 explicit browser recipe tests passed. Real preflight and submission used
-distinct proof directories and froze an intact doctor/result/screenshot bundle.
-That integration fixture used documents-only evidence; Git freezing, multi-root,
-drift and tamper cases are exercised by the CLI suite.
+## Active disjoint work
 
-M1 adds conditional discovery safety facts/probes, runtime proof type/conditions/
-observed boundary alongside existing semantic classifications, and judgment-based
-shared-premise inspection during correction. It adds no role, required report
-field, gate, automatic budget grant or routine model turn. Renderer fingerprints
-include the new guidance helpers. Seven new tests and 34 related existing tests
-passed (41 focused tests). Baseline assertions failed on the old implementation
-as expected. The combined full suite was interrupted by the user's pause.
+M2: Sol is extending the companion helper with an explicit removal scenario and
+separate manifest. The real browser must remove a project, restart a distinct
+server with a fresh context, preserve other projects, and permit re-addition.
+Independent review requires a scenario-specific proof filename so the default
+Add journey cannot accidentally satisfy the removal contract, a named injected
+failure, actual startup-removal refusal, private cleanup, and an honest feature
+map. Source is not approved merely because an early positive run succeeded.
 
-## Work still in progress
+M3: Opus is preparing the narrow blinded procedure on `pstack-recipe-comparison`.
+Its WIP preservation checkpoint is `9f66fbe`; it is not the latest reviewed code.
+Preparation and sensitivity tests ran, but no model candidates have run.
+The first two seeds escaped the original Add-project helper because they concern
+adjacent behavior. Before launches, replace one with a covered server-main
+saved-list wiring defect. Independently prove reference/alternate repairs pass,
+the seed escapes existing tests, and the original helper fails for the intended
+persistence outcome. Keep one adjacent task and label its applicability honestly.
+Pin `fe58b1a` and identical Opus implementor/Sol reviewer assignments in both arms;
+exclude M1 and M2 to isolate the first treatment. Freeze source/tasks/checks/rubric
+before candidates, keep private mapping/checks outside candidate directories,
+and require actual independent approvals and measured identity/usage. Unknown
+telemetry remains unknown. Two pairs permit directional opt-in findings only.
 
-### Group discussions: heavy Opus lane
+M4: Opus recommends an explicit existing `--decision` / plan-task `decision`
+selection plus `docket help task-methods` for refactor-equivalence/performance.
+There is no `--constraint` flag. Preserve acceptance, historical compatibility,
+mandatory contract rendering and final review; do not add automatic inference,
+extra roles/turns or a new schema just to load guidance. Sol's implementation
+follows the group design discussion and coordinator review.
 
-Read `docs/group-discussion-design.md` on `pstack-group-discussions`.
-The opt-in protocol must preserve `discussion-v1`, distinct identities/generations,
-serialized turns, append-only chained messages, per-recipient delivery, explicit
-proposal-bound responses, named dissent, whole-group user pause, honest caps and
-recovery. Silence and timeouts never mean agreement. No harness launch, coding
-mode change or automatic external communication is authorized by this feature.
+M6/M7: Opus recommends deferring forge babysitting and extra early-oracle turns.
+There is no current CI/PR waiting problem in this repository. An early-review
+retrospective found only a subset of corrections knowable before code, and all
+sampled rejected tasks also had later implementation defects. Treat these as
+bounded design assessments, not measured counterfactual savings or a global
+rejection. Revisit on concrete forge friction or material residual oracle errors
+after the discovery/recipe guidance has been used.
 
-The draft introduces `discussion_groups.py` and starts routing the existing I/O
-layer to it. It is incomplete. A review finding must be resolved before use:
-participant replacement writes registration and a generation event separately.
-An interruption must not leave old-generation acceptance valid, and retry must
-recover one replacement without duplicate effects. Verify actual generation
-identity as well as the event. Complete the handlers/CLI integration and add
-real interruption, stale proposal, identity, delivery, dissent and convergence
-tests. Run all existing bilateral tests unchanged.
+## Continue from another machine
 
-### Comparison preparation: heavy Opus lane
+Fetch origin, switch to `audit-3-fixes`, and fast-forward only. Read this file,
+`docs/pstack-adoption-plan.md`, `AGENTS.md` and `ARCHITECTURE.md` in a fresh
+session. All approved source and lasting intent belong in Git. Local worktrees,
+private evidence, pane identities and transcripts are not portable requirements.
+The older `pstack-group-discussions` checkpoint `e23dda0` preserves the original
+partial draft; use the integrated continuation branch for current group code.
 
-The WIP branch contains only task JSON and `tools/recipe-comparison/hidden/check.mjs`.
-Finish the narrow portable procedure described in M3 of the adoption plan.
-Use the pinned recipe-only source `fe58b1a`, fixed Opus implementor and Sol
-reviewer assignments, real Docket contracts/registered verification/submission/
-review packets, and separate ordinary-looking task directories. Keep hidden
-checks and variant mapping outside candidate directories. Exclude the adoption
-plan itself from both snapshots because it exposes the rubric; record exclusions
-and resulting hashes honestly. Preserve operational instructions and real tests.
+Use the existing `codex` alias launch settings without adding competing approval
+or sandbox flags. Use source Docket during development. Heavy work uses Opus 5.5,
+light work Sol; do not silently substitute a weaker model at a usage limit.
 
-Prove seeded defects fail independent checks and correct behavior passes before
-running candidates. Do not restore the retired Docket evaluation subsystem or
-claim quality/cost gains from setup. Two pairs permit directional opt-in findings
-only. Raw proof and transcripts stay private; publish sanitized summaries.
-
-### Recipe-path round-trip bug: light Sol follow-up
-
-Reproduced before the pause: selecting
-`recipes/project #1/recipe.json` records `recipes/project` after flat frontmatter
-comment parsing. The new worktree for this follow-up had no source edits when
-stopped, so no additional draft branch is needed to recover it.
-
-Fix this field's encode/decode narrowly, retaining ordinary unquoted paths and
-the global flat-frontmatter convention. Cover CLI assign, JSON plan, submission,
-and a qualified-root path with red-before/green-after tests. Source ownership was
-`recipes.py`, `commands.py`, and new `test_recipe_paths.py`; coordinate the small
-renderer decoding change in `prompts.py` with M1 rather than overwriting it.
-
-## Resume from the home PC
-
-Fetch origin, switch to `audit-3-fixes`, and fast-forward only. Read this handoff,
-`docs/pstack-adoption-plan.md`, `AGENTS.md`, and `ARCHITECTURE.md` in a fresh
-session. Resume only on the user's instruction. Opus 5.5 owns heavy work and Sol
-owns light work; use the existing `codex` alias launch settings without adding
-competing approval/sandbox flags.
-
-Finish the M1 regression run before calling it complete. Recreate isolated
-worktrees from the continuation branch and inspect/cherry-pick the corresponding
-WIP commit for each heavy lane. Keep their ownership disjoint. All needed source
-and intent are in Git; no first-machine `/tmp` directory, pane, transcript or
-private `.docket` report is required.
-
-Relevant checks:
+Required final checks:
 
 ```sh
 tests/test.sh
@@ -118,13 +103,12 @@ node --test ui/verification/companion-projects/verify.test.mjs
 git diff --check
 ```
 
-For focused M1 work, set `PYTHONPYCACHEPREFIX` outside the skill and run
-`python3 -m unittest discover -s skills/docket/tests -p test_reasoning_guidance.py`.
-Install the locked UI dependencies and Playwright Chromium/system libraries only
-when running the explicit browser suite. The `no-mistakes` CLI was unavailable;
-it was not run. Use repository checks and independent review.
+Python test commands need `PYTHONPYCACHEPREFIX` outside the skill. Explicit browser
+checks need locked UI dependencies and Playwright Chromium/system libraries;
+ordinary `npm test` retains its existing prerequisites. The `no-mistakes` CLI was
+unavailable and was not run; use repository checks and independent review.
 
-The installed skill was not synced. Do not install the WIP group/comparison
-drafts. Sync only approved source according to `AGENTS.md`, excluding bytecode
-and avoiding changes underneath active Docket runs. The pre-existing unrelated
-`reasonix.toml` remains local, untracked and untouched.
+The installed skill has not been synced. Sync only approved source according to
+`AGENTS.md`, excluding bytecode and avoiding changes underneath active runs.
+Keep raw local proof/transcripts out of Git. The unrelated pre-existing
+`reasonix.toml` remains untracked and untouched.

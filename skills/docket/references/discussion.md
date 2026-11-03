@@ -175,3 +175,47 @@ The files live under `.docket/conversations/<id>/` with private directory
 permissions, because briefings and replies can contain private context. The
 flat document frontmatter holds lifecycle state; receipt and announcement JSON
 hold only transport evidence. Earlier messages are never rewritten by Docket.
+
+## Group discussions
+
+Use a group only when the user asks for more than one peer at once.
+A single peer stays on the two-party flow above.
+Name every peer with its requested harness and model:
+
+```bash
+docket discuss G01 --start --topic "Adopt pstack ideas?" --message-file briefing.md \
+  --peer astra:codex:gpt-6-astra --peer opus:claude:claude-opus-5-5
+```
+
+The roster is the invoker plus two to four named peers, fixed for the life of the discussion.
+Names such as `human`, `user-*`, `docket`, `invoker`, and `peer` are refused, so a peer can never render as the user or as Docket.
+Start writes one prompt per peer under `.prompts/<name>.txt`; start each peer in its own visible session and send it that file.
+Each peer joins with `--as <name>` and its own session; no two members may share a session or harness process.
+
+Agents speak one at a time in roster order, and each phase starts with the first peer.
+`--read --json` shows `floor`, the member allowed to write next, and any `pending` proposal with `accepted`, `dissented`, and `missing` members.
+Docket refuses a write from anyone off the floor and any reply that does not name the latest sequence.
+Only the floor holder is woken; the others read every message at their next pickup.
+The invoker is also woken when the group concludes or reaches its turn limit, so it can report to the user.
+
+A proposal needs an explicit answer from every other member, each on its own floor:
+
+```bash
+docket discuss G01 --accept 5 --as opus --session opus
+docket discuss G01 --dissent 5 --as astra --session astra --message-file dissent.md
+```
+
+All accepting concludes with `outcome: unanimous`.
+Some accepting and the rest dissenting concludes with `outcome: dissent` and names the dissenters.
+If nobody but the proposer accepts, the outcome is `declined` and the discussion continues.
+A later reply, a user message, a pause, or a replaced session withdraws the pending proposal; propose again after it.
+Silence, a timeout, a read, a pickup, and the turn limit are never agreement.
+
+Pause, continue, and close work as in the two-party flow, and only the invoker or the user may use them.
+A pause stops the whole group and withdraws any pending proposal, including at the turn limit.
+`--continue` returns the floor to the first peer.
+
+To recover a member, join its replacement with `--join --replace`.
+Docket records the replacement in the transcript, and any acceptance from the old session no longer counts.
+A replacement that withdraws a pending proposal wakes only the member who must act next, such as the invoker at the turn limit; other replacements wake nobody.
+If that join was interrupted, rerun the same `--join` command; it records the replacement once.

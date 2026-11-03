@@ -25,7 +25,7 @@ from .policy import (
     verifier_correction_allowed, workflow_of,
 )
 from .bundles import digest_of
-from .recipes import RECIPE_ENV, RECIPE_KEY
+from .recipes import RECIPE_ENV, RECIPE_KEY, decode_recipe_reference
 from .state import (
     derive_stage, group_numbered_items, latest_checkpoint, latest_verification, list_batches,
     raw_checkbox_lines, ready_handoff, state_of,
@@ -368,7 +368,8 @@ def correction_reasoning(record: str) -> str:
     return (
         "Repeated criterion numbers are a signal to inspect, not proof of a shared premise. "
         "Use judgment to identify any common assumption and choose a discriminating probe "
-        "when warranted. Carry its result and evidence, or an explicit unrun state with "
+        "when warranted, in a disposable copy or private state, never the measured checkout. "
+        "Carry its result and evidence, or an explicit unrun state with "
         f"the reason, into the existing {record} or escalation. Preserve accepted "
         "criteria and correction budgets; only the recorded plan owner may grant more rounds (the planner in new quick runs)."
     )
@@ -388,7 +389,6 @@ def runtime_reasoning(role: str) -> str:
     )
     if role == "reviewer":
         text += " Missing consequential evidence requires changes or an explicit qualified waiver, never an inferred pass."
-        text += "\n\nIn correction review: " + correction_reasoning("decision")
     else:
         text += " Block honestly when a consequential gap prevents completion."
     return text
@@ -556,7 +556,7 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
             *(f"{label}: {value.strip()}" for label, value in optional_fields
               if value.strip() and value.strip().lower() not in ("none", "none stated")),
         ]
-        recipe = str(task_meta.get(RECIPE_KEY, "") or "").strip()
+        recipe = decode_recipe_reference(task_meta.get(RECIPE_KEY, ""))
         if recipe and role == "implementor":
             contract_lines.append(
                 f"verification recipe: {recipe} (required). The registered verify command runs it "
@@ -715,17 +715,22 @@ def compose_prompt(d: Path, run: str, owner: str, role: str, model: str = "",
         "\n".join(header_lines),
         "# Task contract\n\n" + "\n".join(contract_lines),
     ]
-    if role in ("implementor", "reviewer"):
+    shared_obligations = (role == "verifier" or (role == "checker" and eff_stage == "verification")
+                          or (role == "reviewer" and is_quick_milestone(d)))
+    # Quick reviewers already receive runtime reasoning in the mandatory shared
+    # obligations. Repeat neither those duties nor correction advice on initial review.
+    if role == "implementor" or (role == "reviewer" and not shared_obligations):
         parts.append(runtime_reasoning(role))
     if decision_lines:
         parts.append("# Latest decision\n\n" + "\n".join(decision_lines))
+        if role == "reviewer" and dmeta.get("verdict") == "changes-requested":
+            parts.append("# Correction reasoning\n\n" + correction_reasoning("decision"))
     if eff_stage == "correction" and role == "implementor":
         parts.append("# Running correction checklist\n\n" + "\n".join(correction_checklist(d, owner)))
     obligations_revision = ""
     report_revision = ""
     # Quick review owns evidence checks without a separate verification verdict.
-    if (role == "verifier" or (role == "checker" and eff_stage == "verification")
-            or (role == "reviewer" and is_quick_milestone(d))):
+    if shared_obligations:
         latest_report = latest(reports(d, owner))
         if latest_report is not None:
             try:

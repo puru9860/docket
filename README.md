@@ -229,6 +229,19 @@ replacement session uses `--join --replace` and reads the saved history. Request
 model metadata is not proof of the model that ran. Docket renders the launch
 prompt; the invoking agent or operator starts the visible peer harness.
 
+To consult several peers at once, start an opt-in group with two to four named peers:
+
+```bash
+docket discuss G01 --start --topic "Adopt pstack ideas?" --message-file briefing.md \
+  --peer astra:codex:gpt-6-astra --peer opus:claude:claude-opus-5-5
+```
+
+Agents take turns in roster order, and only the member whose turn it is gets woken.
+A proposal concludes only when every other member answers it with `--accept N` or `--dissent N`.
+The result is recorded as unanimous or with named dissenters.
+A later message, a pause, or a replaced session withdraws the proposal.
+The two-party protocol is unchanged.
+
 See `docket help discussion` for the full launch, exchange, wake, and recovery flow.
 
 ## Layout of a run

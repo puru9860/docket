@@ -44,7 +44,7 @@ from .evidence import git_root
 from .roots import candidate_roots, declare_roots, read_roots, resolve_scope, root_identity
 from .recipes import (
     RECIPE_ENV, RECIPE_KEY, capture_recipe, collect_evidence, new_evidence_dir,
-    normalize_recipe_reference, recipe_drift, recipe_reference,
+    encode_recipe_reference, normalize_recipe_reference, recipe_drift, recipe_reference,
 )
 from .baselines import (
     assignment_evidence, baseline_path, evidence_mode, output_fingerprint, require_baseline,
@@ -409,7 +409,7 @@ def cmd_assign(a: argparse.Namespace) -> None:
             text = render(meta, body)
         if recipe:
             meta, body = parse(text)
-            meta[RECIPE_KEY] = recipe
+            meta[RECIPE_KEY] = encode_recipe_reference(recipe)
             text = render(meta, body)
         publish(task, text)
         print(f"created {task.relative_to(root())}")

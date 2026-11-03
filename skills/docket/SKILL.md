@@ -11,6 +11,7 @@ Choose coding work or a peer discussion from the request.
 For a discussion, read `docket help discussion`; remain the invoker and start one visible peer on the requested harness and model.
 Use `docket discuss` for attributed replies, conclusions, and user interruptions; do not create a coding run for discussion.
 Use `docket discuss --list` to find an existing discussion.
+For several peers at once, use the group flow in `docket help discussion`.
 
 ## Quick coding flow
 

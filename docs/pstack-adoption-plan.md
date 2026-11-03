@@ -2,8 +2,8 @@
 
 Updated 2026-11-03. Working branch: `audit-3-fixes`.
 
-**Paused by the user on 2026-11-03.** Automatic Opus resumption is cancelled.
-Do not continue until the user resumes. Read [the paused handoff](pstack-resume-handoff.md)
+**Resumed by the user on 2026-11-03.** The existing disjoint Opus and Sol
+lanes are active again. Read [the continuation handoff](pstack-resume-handoff.md)
 for saved WIP branches, validation state and home-PC instructions.
 
 The user authorized continuous implementation, Opus 5.5 for heavy design and
@@ -53,11 +53,11 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | ID | Work | State | Main owner |
 | --- | --- | --- | --- |
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
-| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and focused-tested; full suite interrupted; paused checkpoint | Sol, coordinator review |
+| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; combined suite 814 passed, then 7 focused tests passed after final guidance refinements | Sol, Opus/coordinator review |
 | M2 | Broader recipe coverage and maintained feature map | One additional meaningful boundary plus a documented maintenance workflow | Sol implementation, Opus boundary review |
-| M3 | Blinded recipe-only comparison with fixed model assignments | Partial preparation saved on pstack-recipe-comparison; paused, no model trials run | Opus design/candidates, Sol bounded adjudication |
+| M3 | Blinded recipe-only comparison with fixed model assignments | Preparation tested; correcting coverage mismatch before any candidate launch | Opus design/candidates, Sol bounded adjudication |
 | M4 | Focused refactor-equivalence and performance guidance | Small explicit work-type selection, when the relevant task needs it | Opus design, Sol mechanical integration |
-| M5 | Native group discussions | Partial opt-in design/implementation saved on pstack-group-discussions; paused, unvalidated | Opus |
+| M5 | Native group discussions | Integrated and regression-tested; live three-party pilot in progress | Opus, coordinator review |
 | M6 | Optional PR/CI babysitting | Assess existing tools, then implement a bounded deterministic adapter if useful | Opus |
 | M7 | Independent early oracle checks | Separate risk-triggered trial; retain three roles and final independent review | Opus |
 | M8 | Final review, installed-copy sync, commits, push, portable handoff | After corresponding checks and approvals | Coordinator |
@@ -208,3 +208,23 @@ an active run. Keep local model launch configuration outside Git.
   M1 passed 41 focused checks; the full suite was interrupted for an explicit
   user pause. Opus auto-resume was cancelled. Separate WIP group/comparison
   branches and the tracked resume handoff preserve unfinished work.
+- 2026-11-03: User explicitly resumed. The existing two Opus lanes and Sol
+  follow-up resumed in their isolated worktrees; the coordinator restarted the
+  interrupted M1 regression suite. No model substitution or installed-copy sync.
+- 2026-11-03: Integrated the recipe-path round-trip fix (7 tests) and opt-in
+  group discussions (11 new tests, 31 existing bilateral tests unchanged).
+  Combined CLI suite passed 814 tests. Its first attempt caught a reviewer
+  prompt-size regression; duplicated mandatory reasoning was removed without
+  raising the existing limit. Independent Opus review then tightened correction
+  probe isolation and omitted correction advice after accepting decisions;
+  all 7 guidance tests passed after those refinements. A final combined suite
+  remains due after the next source milestone.
+- 2026-11-03: M3 sensitivity proof showed both original seeded defects escaped
+  the Add-project helper because they concern adjacent behavior. No candidates
+  ran. Before launches, replace one task with a covered server-startup wiring
+  defect and independently prove helper sensitivity; retain an adjacent task
+  to measure preservation value. No quality/cost result or default promotion.
+- 2026-11-03: Started G05 using the new group protocol with the coordinator,
+  Opus and Sol. Delivery is manually initiated while the installed copy remains
+  unchanged; direct participant identity and protocol execution are the pilot's
+  scope, not an assertion that installed automatic hooks have been exercised.

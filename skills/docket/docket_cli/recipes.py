@@ -24,9 +24,33 @@ RECIPE_ENV = "DOCKET_RECIPE_EVIDENCE_DIR"
 RECIPE_MANIFEST_KEYS = ("version", "name", "instructions", "helpers", "evidence")
 
 
+def encode_recipe_reference(reference: str) -> str:
+    """Protect this field from flat-frontmatter quoting/comments; keep plain paths plain."""
+    if not any(ch.isspace() or ch in "#\"'" for ch in reference):
+        return reference
+    # parse() tracks quotes but deliberately does not interpret backslash escapes.
+    # A literal \" inside a JSON string would end its quoted region there, exposing
+    # a later whitespace-# as a comment. Unicode escapes contain no quote to toggle.
+    return json.dumps(reference, ensure_ascii=True).replace(r'\"', r'\u0022')
+
+
+def decode_recipe_reference(value: object) -> str:
+    """Decode only verification_recipe; other frontmatter values retain their semantics."""
+    text = str(value or "").strip()
+    if text.startswith('"'):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            pass  # A legacy raw path may begin with a literal, unmatched quote.
+        else:
+            if isinstance(decoded, str):
+                return decoded
+    return text
+
+
 def recipe_reference(contract_text: str) -> str:
     """The recipe a contract selects, or empty."""
-    return str(parse(contract_text)[0].get(RECIPE_KEY, "") or "").strip()
+    return decode_recipe_reference(parse(contract_text)[0].get(RECIPE_KEY, ""))
 
 
 def relative_reference_problem(value: object, label: str) -> str:
