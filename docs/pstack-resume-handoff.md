@@ -1,16 +1,19 @@
 # Pstack continuation handoff
 
-**Paused at the user's request on 2026-11-04.** All three visible agents are
-idle and the comparison test/proof processes have stopped. Wait for an explicit
-continue before resuming work. No comparison candidates have been launched.
+**Resumed at the user's request on 2026-11-04.** The previous graceful pause
+is preserved in `161cf6a`. Continuous work, disjoint Opus/Sol lanes, commits and
+pushes are authorized again. No comparison candidates have been launched.
 The working branch is `audit-3-fixes`; read
 [the adoption plan](pstack-adoption-plan.md) for scope.
 
-Verified implementation is pushed through `b1a6fbe`. The comparison lane is
-preserved separately at `acb9cd1` on `pstack-recipe-comparison`; its latest
-review fixes are WIP. Its final test/proof run was interrupted at this pause,
-so do not treat the latest draft as validated. The installed skill remains
-unchanged.
+Verified implementation is pushed through `b1a6fbe`. The comparison lane's
+latest saved checkpoint is `acb9cd1` on `pstack-recipe-comparison`, with further
+uncommitted review fixes in that worktree. Its pre-pause final verification was
+interrupted. Fresh independent Opus and Sol probes found false positive CLI
+provenance, process-only requests counted as defects, an unreachable failed
+recipe evidence shape, and missing Claude effort checks. Fix and verify these
+before candidates. A separate no-model qualification is running the exact full
+milestone under the clean conductor PATH. The installed skill remains unchanged.
 
 ## Source and validation
 
@@ -95,15 +98,16 @@ after the discovery/recipe guidance has been used.
 
 ## Continue from another machine
 
-Resume only after the user explicitly continues. On this machine, untracked
+On this machine, untracked
 `docs/recipe-comparison-protocol.md` and `tools/` in the main checkout contain an
 older comparison integration that passed 40 tests, not the latest paused draft.
 Do not stage those stale copies as the current comparison implementation.
 The authoritative draft is the `pstack-recipe-comparison` branch at `acb9cd1`.
 Preserve unrelated files when replacing the older integration on resume.
 
-Remaining comparison work includes independent review of the launch/provenance,
-frozen-tree grading and scoring fixes, final toolkit tests and sensitivity proof,
+Remaining comparison work includes closing the new independent provenance/scoring
+findings, checking observed effort for both harnesses, qualifying the full milestone,
+final toolkit tests and sensitivity proof,
 and actual launch qualification before any candidates. A real conductor with
 fake Herdr is useful plumbing evidence but cannot establish that model commands
 use the pinned CLI. Candidate traces must prove that separately. Do not change
