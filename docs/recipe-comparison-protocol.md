@@ -12,10 +12,15 @@ Preparation does not run candidates and produces no experimental result.
 - Source: one pinned revision, sanitized identically for both arms of a pair.
 - Docket CLI: the pinned revision's own `skills/docket`, copied beside each project; never the installed global copy. A copy alone is not provenance; see "CLI provenance".
 - Contract: the same run objective, approach, task goal, criteria, files, out-of-scope notes and operational notes.
-  Each contract also carries one mandatory existing decision naming that candidate's own absolute pinned launcher for every Docket command, including the conductor's startup register, pickup and instruct commands and any bare example; the two arms differ there only in that per-candidate path.
+  Each contract also carries one mandatory existing decision naming that candidate's own absolute pinned launcher: "Run every Docket command through `<launcher>`, including the startup and obligation commands above that name docket without a path; never invoke docket by bare name."
+  The wording never puts `docket` after a backtick, after ": " or at a line start, so the pinned renderer's bare-command rewrite leaves it verbatim; `prepare` asserts it appears verbatim in both the implementor and the reviewer contract.
+  The two arms differ there only in that per-candidate path.
 - Models: implementor Claude `claude-opus-5-5` and reviewer Codex `gpt-6.1-sol`, both at effort `high`, recorded as milestone assignments in the plan.
 - Lifecycle: the normal quick milestone path driven by the pinned conductor with `round_context: shared`: one fresh visible implementor and one independent fresh visible reviewer per candidate, no subagents.
-  The implementor submits through `submit`, the reviewer decides on the frozen bundle, and the milestone command is `DOCKET_TEST_JOBS=8 tests/test.sh && (cd ui && npm test)`, the exported repository's own finish gate, which the conductor runs once per case.
+  The implementor submits through `submit`, the reviewer decides on the frozen bundle, and the milestone command runs `DOCKET_TEST_JOBS=8 tests/test.sh && (cd ui && npm test)`, the exported repository's own finish gate, which the conductor runs once per case.
+  It runs as `env -u DOCKET_SESSION_CAPTURE PATH=<candidate>/tools/bin:<clean conductor PATH> /bin/sh -c '...'`: the suite gets session capture back and finds the candidate's own pinned `docket` first, as its tests expect, while the conductor itself keeps capture off and no `docket` on its PATH.
+  Only the candidate path differs between arms.
+  Before any candidate, this exact wrapped suite must pass once without models on a candidate-shaped sanitized `fe58b1a` tree, within the conductor's 900 s suite timeout and leaving the tree clean; that evidence lives in the private research notes, not here.
 
 The only difference is the verification floor.
 The control task's registered `verify` is `node --test ui/tests/projects.test.mjs`.
@@ -99,16 +104,26 @@ The core conductor, `~/.local/bin/docket`, user configuration and permission or 
 
 Grading decides provenance from actual execution.
 Runtime renderer revisions come only from the run's `.prompts` directory: dispatch and resume prompt files, and any `prompt` record JSON (`renderer_revision`) that was not present at preparation.
-Execution evidence comes only from tool-call command inputs in the explicitly supplied transcripts: Claude `tool_use` inputs and Codex `function_call` arguments, `local_shell_call` actions and freeform `exec` calls.
-Codex's freeform `exec` tool (`custom_tool_call` records) wraps calls in JavaScript; only a literal string `cmd` of `tools.exec_command` or `chars` of `tools.write_stdin` is read, without evaluating anything.
-Any other mention of those tools, such as a variable argument or an alias, is counted as an opaque call, and wrapper text outside those literals is not execution.
-Tool outputs and quoted documentation, such as a `cat README.md` result that names the installed CLI path, are counted as mentions and never as execution; a transcript with no parseable records gives no execution evidence.
-Any bare `docket <subcommand>` execution, for every subcommand of the pinned parser, is counted.
-A bare execution is accepted only when the same transcript ran exactly `readlink -f "$(command -v docket)"` as its own tool call and the paired tool output names the pinned launcher; a pane `PATH` attestation is recorded but never sufficient.
-- `foreign` when a runtime renderer revision differs from the pinned one, an executed command invokes the installed CLI path, or a transcript with bare executions resolved `docket` elsewhere.
-- `pinned` only when runtime renderer revisions exist, all match and all were readable, every transcript parsed with no opaque call, at least one pinned-launcher execution occurred, and every bare execution is proven pinned.
+Execution evidence comes only from the explicitly supplied transcripts, and only from records of execution.
+- Claude: the `command` input of a `Bash` tool call, which Claude Code runs as written; a command-carrying call to any other tool is opaque.
+- Codex: the harness's own `CommandExecution` records (`event_msg` `item_completed`), whose `command` argv and `status` say what actually ran, and for older formats `function_call` exec arguments and `local_shell_call` actions.
+  The model's freeform `exec` JavaScript (`custom_tool_call`) is never read for commands and never evaluated.
+  It is only checked for coverage: every native record must start inside exactly one freeform call's window (call record to its output, or to the next call when a turn aborted), every call that names `tools.exec_command` must have at least one such record, and a call may name tools only literally from a known set (`exec_command`, `write_stdin`, `apply_patch`, `view_image`, `web__run`, `clock__*`).
+  An alias, a computed or interpolated tool reference, another tool name, an uncovered call, or a record in two windows is opaque.
+  A native record outside every window, such as a command the user typed into the pane, is still classified from its real command.
+- Stdin a model writes to a running process is not execution; starting an interactive shell or interpreter that could read commands from stdin is ambiguous.
+
+Each executed script is classified by a narrow recognizer, not a shell parser.
+It tokenizes twice, as written and with quoted strings and escapes masked, so a quoted `&&` is never an operator.
+A Docket execution counts as pinned or foreign only at a command position that certainly runs: the first command, or one reached only through `cd DIR &&`, after assignments and the supported `env` options (`-i`, `-u NAME`).
+A Docket path or name anywhere else is ambiguous: a later or conditional command, a control structure, a substitution, a here-document, an interpreter, an unknown command's arguments, an unsupported `env` option, or syntax the recognizer cannot tokenize.
+Data commands such as `cat`, `printf` or `grep` may name the launcher without executing it, and tool outputs and quoted documentation are counted as mentions only.
+Any bare `docket <subcommand>` execution, for every subcommand of the pinned parser, is counted and leaves provenance `unknown`: neither a pane `PATH` attestation nor an earlier `readlink` shows what a later bare command resolved.
+- `foreign` when a runtime renderer revision differs from the pinned one, or a certainly executed command runs a Docket path other than the pinned launcher.
+- `pinned` only when runtime renderer revisions exist, all match and all were readable, every transcript parsed, no call is opaque, no Docket command is ambiguous or bare, and at least one pinned-launcher execution occurred.
 - `unknown` otherwise.
 Anything but `pinned` makes the report inconclusive.
+The conductor's own startup register, pickup and obligation commands are built outside the contract and stay bare at the pinned revision; only the decision tells roles to run them through the launcher, so the first live case must show compliance in actual tool calls.
 Reads of the installed skill's documents are counted and reported separately.
 
 ## Running candidates
@@ -116,20 +131,24 @@ Reads of the installed skill's documents are counted and reported separately.
 Follow `schedule.md`, one label at a time, in its counterbalanced order: the second pair reverses the first pair's arm order.
 For each label:
 1. Unseal it.
-2. Prestart both roles under the conductor's expected worker names, so the conductor adopts them instead of starting its own: a Herdr pane with cwd in the project and the same `DOCKET_RUN`, `DOCKET_ROLE` and `DOCKET_SESSION` environment the conductor would set, then `herdr agent start NAME --kind HARNESS --pane PANE -- ARGS`.
-   Herdr runs the operator's existing harness alias; `ARGS` carry only the model and effort (`--model claude-opus-5-5 --effort high` for Claude, `-m gpt-6.1-sol -c model_reasoning_effort=high` for Codex).
-3. Start the pinned conductor in the foreground in its own pane: `DOCKET_SESSION_CAPTURE=off /abs/pinned/launcher conduct RUN`.
+2. Prestart both roles under the conductor's exact worker names, which `prepare` computes with the pinned `agent_name` from the resolved run path, so the conductor adopts them instead of starting its own.
+   Each role gets its own Herdr pane, shared with nothing else, with cwd in the project and the environment the conductor would set: `DOCKET_RUN`, `DOCKET_ROLE`, and `DOCKET_SESSION` equal to that exact worker name.
+   Then `herdr agent start NAME --kind HARNESS --pane PANE -- ARGS`: Herdr runs the operator's existing harness alias, and `ARGS` carry only the model and effort (`--model claude-opus-5-5 --effort high` for Claude, `-m gpt-6.1-sol -c model_reasoning_effort=high` for Codex), never approval or sandbox flags.
+   Before the conductor starts, `herdr agent list` must show both exact names, each with `agent` equal to its harness, idle at the prompt; an unnamed or misnamed agent is not adopted, and the conductor would start a second session for that role.
+3. Start the pinned conductor in the foreground in its own pane: `env PATH=CLEAN DOCKET_SESSION_CAPTURE=off /abs/pinned/launcher conduct RUN`.
+   `CLEAN` is the `conductor_path` that `prepare` records: a neutral `tools-bin` directory under the candidate root holding only `herdr` and `uv` links, the real Node directory with `npm`, `/usr/bin` and `/bin`.
+   `prepare` refuses one that would resolve any `docket`, so the conductor renders every contract command with the absolute launcher, and the milestone suite it runs still finds Node, npm, `uv` and the system `python3`.
    Never run `launch`, and never hand a prompt to a role: the conductor delivers every obligation, including the first.
 4. Let the normal lifecycle reach an approval or an honest block, then end both role sessions within 900 s of the final decision so their transcripts stay inside the run's recorded end.
 
 A setup intervention is a trust prompt or hook-review keypress before the conductor's first delivery to a role.
 A human intervention is any text typed into a role pane outside the conductor after that.
+Both counts are typed by an operator who holds the mapping, so they are reported and never scored.
 Afterwards, save `DOCKET_SESSION_CAPTURE=off /abs/pinned/launcher usage RUN --json` and write an observations file:
 
 ```json
 {"setup_interventions": 1, "human_interventions": 0, "process_overhead": "text",
- "operational_saving": "text, listed but never scored",
- "defects_caught_before_approval": [".bundles/T01/01/<id>/recipe/evidence/result.json", "T01-decision-01.mdx"]}
+ "operational_saving": "text, listed but never scored"}
 ```
 
 Routine model turns are not typed: grade counts the conductor's successful deliveries (`delivered` records in `.delivery/<role>/log.jsonl`), and a missing log leaves turns unknown.
@@ -174,8 +193,11 @@ An approval is `intact` only when those readers report an approved current round
 On top of an intact approval, the frozen recipe `result.json` must match its `sha256:` artifact digest and record a passing, non-negative-control run whose recipe files the patch did not edit; Docket's own gate only requires the evidence to exist.
 Rounds and verdicts are read from the frozen files for display only.
 It counts recipe and private markers in the run state and in explicitly named transcripts, without copying transcript content; a transcript supplied twice is counted once, and the control's recipe-helper use counts only executed commands, never reading.
-A cited caught defect counts only when the cited file is in the graded run state and is either a frozen recipe `result.json` that its bundle records unaltered, with status `failed`, no negative control, a non-empty patch and a round before the approved one, or a `changes-requested` decision bound to a bundle, from an earlier round, with a non-empty `Required changes` section.
-Free-text notes, baseline failures and deliberate negative controls never count; rejected citations are listed with their reason.
+Caught defects are reported, never scored.
+At the pinned revision a failing recipe helper refuses the submission, so its evidence stays unfrozen in `.recipe-evidence`.
+Grade lists every helper run there and places it mechanically: its `result.json` and `doctor.json` must share an invocation, and the helper's own `build.sha256` of the UI sources is compared with the prepared seed (`baseline`), the approved tree (`approved-source`) or neither (`intermediate-edit`), with its start time before or after the approved freeze and whether the helper itself was unchanged.
+Change requests in both arms are listed with their required-change counts.
+Neither can be attributed to the recipe from one arm's evidence, so neither is a saving.
 Grade refuses if any frozen tool input changed since preparation, and refuses to grade a label twice.
 
 An independent adjudicator reviews `blind/<label>/` (source patch and behavior results, without arm, model or recipe labels) and writes `adjudication/<label>.json` as `{"escaped_defects": [], "notes": ""}`.
@@ -187,12 +209,13 @@ tools/recipe-comparison/compare.py report --private-root /abs/private
 ```
 
 The rubric in `tools/recipe-comparison/rubric.json` is frozen at preparation.
-The report is inconclusive when a pair lacks an intact approval in either arm, the treatment was not actually recipe-verified, the control selected the recipe, an observed model or Codex effort from the proven full sessions differs from the request or is unknown, dependencies or the runtime changed, or hidden checks, rubric or mapping reached a candidate.
+The report is inconclusive when a pair lacks an intact approval in either arm, the treatment was not actually recipe-verified, the control selected the recipe, an observed model or effort from the proven full sessions (Codex per turn context, Claude per assistant record) differs from the request or is unknown, dependencies or the runtime changed, or hidden checks, rubric or mapping reached a candidate.
 When the treatment's recipe correctly blocks a broken fix and no approval follows, the pair is inconclusive rather than a win; the report says so.
 It is not supported on an observed treatment regression, an extra routine model turn, or a median execution-token overhead above 15%, a budget choice rather than a quality threshold.
 Unknown regression, turns or tokens keep it inconclusive.
 Usage is measured only when exactly one measured session exists per required role and every token category is present; otherwise every total is unknown, never zero.
-A tie without a concrete saving (an escaped failure only the control shows, fewer correction rounds, fewer human interventions) or a validated caught defect does not promote.
+Promotion needs a measured saving: a hidden-check, pinned-test or adjudicated failure only the control shows, or fewer correction rounds in the treatment.
+Recipe helper runs, change requests, intervention counts and free-text notes are reported but never scored, and a tie without a measured saving does not promote.
 Authoring and maintenance effort, from an optional `maintenance.json`, is reported separately from execution cost.
 Raw tokens are not money.
 

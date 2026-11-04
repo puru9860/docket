@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -62,6 +63,26 @@ class Temp(unittest.TestCase):
             for name in dirs:
                 os.chmod(os.path.join(root, name), 0o700)
         self._tmp.cleanup()
+
+
+class ConductorPathTest(Temp):
+    def tool(self, directory: str, *names: str) -> Path:
+        base = self.tmp / directory
+        base.mkdir(exist_ok=True)
+        for name in names:
+            (base / name).write_text("#!/bin/sh\n")
+            (base / name).chmod(0o755)
+        return base
+
+    def test_clean_path_has_node_npm_herdr_and_uv_but_never_docket(self) -> None:
+        local, node = self.tool("local", "herdr", "uv", "docket"), self.tool("node", "node", "npm")
+        dirs = compare.conductor_path(self.tmp / "shim", f"{local}:{node}")
+        self.assertEqual([str(self.tmp / "shim"), str(node), "/usr/bin", "/bin"], dirs)
+        self.assertEqual(str(local / "herdr"), os.readlink(self.tmp / "shim" / "herdr"))
+        with self.assertRaises(SystemExit):
+            compare.conductor_path(self.tmp / "shim2", f"{local}:{self.tool('withdocket', 'node', 'npm', 'docket')}")
+        with self.assertRaises(SystemExit):
+            compare.conductor_path(self.tmp / "shim3", f"{local}:{self.tool('nonpm', 'node')}")
 
 
 class ExportTest(Temp):
@@ -150,11 +171,11 @@ class PrepareTest(Temp):
             self.assertEqual(t["commit"], c["commit"])
             self.assertEqual(t["project_digest"], c["project_digest"])
             self.assertEqual(t["cli_digest"], c["cli_digest"])
-            # Only each candidate's own launcher path differs in the plumbing; normalize exactly that.
+            # Only each candidate's own directory differs in the plumbing; normalize exactly that.
             plans = {a: json.loads((self.private / "launch" / l / "plan.json").read_text().replace(
-                self.study["candidates"][l]["pinned_launcher"], "/LAUNCHER")) for a, l in arms.items()}
+                str(self.candidates / l), "/CANDIDATE")) for a, l in arms.items()}
             treatment, control = plans["treatment"]["tasks"][0], plans["control"]["tasks"][0]
-            self.assertEqual(compare.cli_decision("/LAUNCHER"), control["decision"][0])
+            self.assertEqual(compare.cli_decision("/CANDIDATE/tools/docket/bin/docket"), control["decision"][0])
             self.assertEqual("ui/verification/companion-projects/recipe.json", treatment.pop("recipe"))
             self.assertNotIn("recipe", control)
             self.assertIn("verify.mjs", treatment.pop("verify"))
@@ -163,8 +184,10 @@ class PrepareTest(Temp):
             self.assertEqual(plans["treatment"]["milestones"], plans["control"]["milestones"])
             self.assertEqual("gpt-6.1-sol", plans["control"]["milestones"][0]["reviewer_model"])
             self.assertEqual("claude-opus-5-5", plans["control"]["milestones"][0]["implementor_model"])
-            self.assertEqual("DOCKET_TEST_JOBS=8 tests/test.sh && (cd ui && npm test)", plans["control"]["milestones"][0]["command"],
-                             "the repository's own finish gate, once per case, identical in both arms")
+            path = ":".join(["/CANDIDATE/tools/bin", *self.study["conductor_path"]])
+            self.assertEqual(f"env -u DOCKET_SESSION_CAPTURE PATH={path} /bin/sh -c "
+                             "'DOCKET_TEST_JOBS=8 tests/test.sh && (cd ui && npm test)'", plans["control"]["milestones"][0]["command"],
+                             "the repository's own finish gate, once per case, identical in both arms but for the path")
 
     def test_runs_are_real_docket_contracts_with_baselines_and_no_noted_session(self) -> None:
         for label, c in self.study["candidates"].items():
@@ -190,7 +213,9 @@ class PrepareTest(Temp):
             for role, suffix in (("implementor", "impl"), ("reviewer", "review")):
                 address = hashlib.sha256(f"{run.resolve()}:M1:{role}".encode()).hexdigest()[:16]
                 self.assertEqual(f"docket-{address}-{suffix}", c["agent_names"][role], "the conductor's own worker name")
-            self.assertEqual(["T01-implementor-01.json"], list(c["prepared_prompt_records"]))
+            self.assertEqual(["T01-implementor-01.json", "T01-reviewer-01.json"], list(c["prepared_prompt_records"]))
+            review = json.loads((run / ".prompts" / "T01-reviewer-01.json").read_text())["prompt"]
+            self.assertIn(compare.cli_decision(launcher), review, "the reviewer contract carries it verbatim too")
 
     def test_schedule_drives_the_pinned_conductor_with_absolute_commands_only(self) -> None:
         text = (self.private / "schedule.md").read_text()
@@ -198,13 +223,27 @@ class PrepareTest(Temp):
         self.assertNotIn(" launch ", text)
         for label, c in self.study["candidates"].items():
             cli = f"DOCKET_SESSION_CAPTURE=off {c['pinned_launcher']}"
-            self.assertIn(f"{cli} conduct {c['run']}`", text)
+            self.assertIn(f"env PATH={':'.join(self.study['conductor_path'])} {cli} conduct {c['run']}`", text)
+            self.assertIn(f"--env DOCKET_SESSION={c['agent_names']['reviewer']}`", text)
             self.assertIn(f"{cli} usage {c['run']} --json", text)
             self.assertIn(f"herdr agent start {c['agent_names']['implementor']} --kind claude --pane PANE -- "
                           "--model claude-opus-5-5 --effort high`", text)
             self.assertIn(f"herdr agent start {c['agent_names']['reviewer']} --kind codex --pane PANE -- "
                           "-m gpt-6.1-sol -c model_reasoning_effort=high`", text)
         self.assertIn("Setup interventions are trust or hook-review keypresses", text)
+        shim = Path(self.study["conductor_path"][0])
+        self.assertEqual(self.candidates / "tools-bin", shim)
+        self.assertEqual(["herdr", "uv"], sorted(p.name for p in shim.iterdir()))
+        self.assertNotIn(str(self.private), ":".join(self.study["conductor_path"]))
+        for directory in self.study["conductor_path"]:
+            self.assertFalse(os.access(os.path.join(directory, "docket"), os.X_OK), directory)
+
+    def test_decision_wording_is_untouched_by_the_renderer_rewrite(self) -> None:
+        decision = compare.cli_decision("/w/w1/tools/docket/bin/docket")
+        self.assertEqual("Run every Docket command through `/w/w1/tools/docket/bin/docket`, including the startup and "
+                         "obligation commands above that name docket without a path; never invoke docket by bare name.", decision)
+        pinned_rewrite = r"(?<=`)docket(?= )|^([ \t]*)docket(?= )|(?<=: )docket(?= )"
+        self.assertIsNone(re.search(pinned_rewrite, decision, flags=re.M))
 
     def test_candidates_carry_no_mapping_rubric_or_private_path(self) -> None:
         forbidden = [str(self.private), "hidden/check.mjs", "recipe-comparison", "rubric.json"]
@@ -243,8 +282,7 @@ class PrepareTest(Temp):
         usage = self.tmp / "usage.json"
         usage.write_text(json.dumps([row("implementor"), row("reviewer")]))
         observations = self.tmp / "observations.json"
-        observations.write_text(json.dumps({"defects_caught_before_approval": ["the recipe exposed a lost project"],
-                                            "operational_saving": "faster"}))
+        observations.write_text(json.dumps({"human_interventions": 0, "operational_saving": "faster"}))
         args = ["grade", "--private-root", str(self.private), "--candidate-root", str(self.candidates),
                 "--label", label, "--transcript", str(transcript), "--transcript", str(transcript),
                 "--usage", str(usage), "--observations", str(observations)]
@@ -268,7 +306,7 @@ class PrepareTest(Temp):
         self.assertEqual(("live", None), (g["graded_tree"], g["live_drift"]), "nothing approved to materialize")
         self.assertEqual("not materialized (approval not-approved)", g["materialized"]["status"])
         self.assertEqual({"by_role": {"implementor": None, "reviewer": None}, "total": None}, g["turns"])
-        self.assertEqual([], g["caught_defects"]["counted"], "free text is never a caught defect")
+        self.assertEqual(([], []), (g["recipe_evidence"], g["change_requests"]), "nothing ran or was requested")
         self.assertTrue(g["node_modules_unchanged"])
         self.assertTrue(g["runtime_matches_proof"])
         self.assertEqual(200, g["usage"]["total"])
@@ -336,7 +374,7 @@ class PrepareTest(Temp):
             json.dumps({"harness": "claude", "session_id": "aaa", "role": "implementor", "owner": "T01", "at": "2099-01-01T00:00:05Z"}) + "\n"
             + json.dumps({"harness": "codex", "session_id": "bbb", "role": "reviewer", "owner": "T01", "at": "2099-01-01T00:10:05Z"}) + "\n")
         claude = self.tmp / "aaa.jsonl"
-        claude.write_text(json.dumps({"type": "assistant", "timestamp": "2099-01-01T00:00:01.5Z", "cwd": str(project),
+        claude.write_text(json.dumps({"type": "assistant", "timestamp": "2099-01-01T00:00:01.5Z", "cwd": str(project), "effort": "high",
                                       "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {
                                           "input_tokens": 10, "cache_creation_input_tokens": 5,
                                           "cache_read_input_tokens": 100, "output_tokens": 20}}}) + "\n")
@@ -361,6 +399,7 @@ class PrepareTest(Temp):
         self.assertEqual((11, 5, 100, 22, 138, ["claude-opus-5-5"], 2),
                          (impl["input"], impl["cache_write"], impl["cache_read"], impl["output"], impl["total"], impl["models"],
                           impl["files"]), "unexpected delegated work is still counted")
+        self.assertEqual(["high"], impl["efforts"], "Claude records its effort per assistant record")
         self.assertEqual((1, 0, 1), (impl["delegated_transcripts"], rev["delegated_transcripts"],
                                      compare.delegated(result)), "and flagged as a deviation")
         self.assertEqual((50, 150, 30, 12, 230, ["gpt-6.1-sol"], ["high"]),
@@ -497,6 +536,77 @@ def real_round(base: Path, cli: list[str], env: dict[str, str], *, status: str =
     return repo
 
 
+CATCH_HELPER = """import hashlib, json, os, pathlib, sys, uuid, datetime
+out = pathlib.Path(os.environ["DOCKET_RECIPE_EVIDENCE_DIR"])
+source = pathlib.Path("ui/server.mjs").read_bytes()
+status = "passed" if source == b"v = 3\\n" else "failed"
+invocation, started = str(uuid.uuid4()), datetime.datetime.now(datetime.timezone.utc).isoformat()
+build = {"server.mjs": hashlib.sha256(source).hexdigest(),
+         "verification/companion-projects/verify.mjs": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()}
+(out / "doctor.json").write_text(json.dumps({"invocation": invocation, "started_at": started, "build": {"sha256": build}}))
+(out / "result.json").write_text(json.dumps({"invocation": invocation, "started_at": started, "status": status,
+                                             "phase": "complete" if status == "passed" else "restart-readback",
+                                             "negative_control": None, "checks": [], "cleanup": {}}))
+sys.exit(0 if status == "passed" else 1)
+"""
+
+
+def real_catch(base: Path, cli: list[str], env: dict[str, str]) -> tuple[Path, dict]:
+    """A real round where the helper exits 1 on an intermediate edit, submission is refused, and a fix is approved."""
+    repo = base / "proj"
+    (repo / "ui").mkdir(parents=True)
+    (repo / "ui" / "server.mjs").write_text("v = 1\n")
+    recipe = repo / "recipes" / "demo"
+    recipe.mkdir(parents=True)
+    (repo / ".gitignore").write_text(".docket/\n")
+    (recipe / "recipe.json").write_text(json.dumps({"version": 1, "name": "demo", "instructions": "recipe.md",
+                                                    "helpers": ["verify.py"], "evidence": ["result.json", "doctor.json"]}))
+    (recipe / "recipe.md").write_text("Run the helper.\n")
+    (recipe / "verify.py").write_text(CATCH_HELPER)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "x")
+    docket = lambda *args, check=True: subprocess.run([*cli, *args], cwd=repo, env=env, check=check, capture_output=True, text=True)
+
+    def fill(path: Path, pairs: dict[str, str]) -> None:
+        text = path.read_text()
+        for old, new in pairs.items():
+            text = text.replace(old, new)
+        path.write_text(text)
+
+    run = repo / ".docket" / "runs" / "rr"
+    docket("init", "rr", "--evidence-mode", "git")
+    docket("assign", "rr", "T01", "--file", "ui/server.mjs", "--verify", "python3 recipes/demo/verify.py",
+           "--recipe", "recipes/demo/recipe.json", "--as", "planner")
+    fill(run / "T01-task.mdx", {"# Task T01: <title>": "# Task T01: Feature",
+                                "<!-- TODO: one paragraph. What must be true when this is done. -->": "Implement it.",
+                                "- [ ] <!-- TODO -->": "- [ ] The feature works."})
+    docket("batch", "rr", "--create", "M1", "--members", "T01", "--milestone", "--command", "true", "--as", "planner")
+    docket("batch", "rr", "--close", "M1", "--as", "planner")
+    fill(run / "T01-scope.mdx", {
+        "<!-- TODO: what you inspected and why this is enough context to implement. -->": "Read it.",
+        "<!-- TODO: explain every proposed path in frontmatter `files:`. -->": "`ui/server.mjs` changes.",
+        "<!-- TODO: useful paths and symbols for implementation and later recovery. -->": "- `ui/server.mjs` - entry.",
+        "<!-- TODO: explain the exact frontmatter `verify:` command and what it proves. -->": "Runs the recipe.",
+        '<!-- TODO: unresolved discovery uncertainty, or "none". -->': "none"})
+    docket("scope", "rr", "T01", "--submit")
+    fill(run / "T01-report-01.mdx", {
+        "<!-- TODO: what you actually did, 2-4 sentences. No plans, only past tense. -->": "Implemented it.",
+        '<!-- TODO: one bullet per change as `path/to/file.py:120` plus a short note. Write "none" if nothing changed. -->':
+            "- `ui/server.mjs:1` - implemented it.",
+        "- [ ] <!-- TODO -->": "- [x] The feature works.", "- [ ] ": "- [x] ",
+        "<!-- TODO: name the registered command and any checks already run. If submit will run\n"
+        "     the final command, state that its output will be captured in the frozen bundle.\n"
+        "     Never claim a result you did not see. -->": "Command: `python3 recipes/demo/verify.py`; submit captures it."})
+    (repo / "ui" / "server.mjs").write_text("v = 2\n")
+    refused = docket("submit", "rr", "T01", "--as", "implementor", check=False).returncode
+    (repo / "ui" / "server.mjs").write_text("v = 3\n")
+    docket("submit", "rr", "T01", "--as", "implementor")
+    docket("batch", "rr", "--verify", "M1", "--as", "implementor")
+    docket("batch", "rr", "--approve", "M1", "--as", "reviewer", "--reason", "Checked.")
+    return repo, {"refused": refused}
+
+
 class RealArtifactTest(unittest.TestCase):
     """Approval and recipe proof read from rounds the pinned fe58b1a CLI really froze."""
 
@@ -578,28 +688,35 @@ class RealArtifactTest(unittest.TestCase):
             self.assertEqual("failed", failed["status"])
         self.assertEqual(before, compare.manifest(repo, everything=True), "export state lands in a private copy")
 
-    def test_only_cited_post_edit_failures_or_change_requests_before_approval_count(self) -> None:
-        failed = self.repos["failed-result"] / ".docket" / "runs" / "rr"
-        result = next(failed.glob(".bundles/T01/01/*/recipe/evidence/result.json")).relative_to(failed).as_posix()
-        self.assertEqual({"counted": [result], "rejected": []}, compare.caught_defects(failed, [result], 2))
-        same_round = compare.caught_defects(failed, [{"evidence": result}], 1)["rejected"][0]["reason"]
-        self.assertIn("not from a round before the approved one", same_round)
-        passed = self.repos["intact"] / ".docket" / "runs" / "rr"
-        ok = next(passed.glob(".bundles/T01/01/*/recipe/evidence/result.json")).relative_to(passed).as_posix()
-        self.assertIn("recipe result passed", compare.caught_defects(passed, [ok], 2)["rejected"][0]["reason"])
+    def test_change_requests_are_listed_from_real_decisions(self) -> None:
         changes = self.repos["changes"] / ".docket" / "runs" / "rr"
-        self.assertEqual(["T01-decision-01.mdx"], compare.caught_defects(changes, ["T01-decision-01.mdx"], 2)["counted"])
-        approval = self.repos["intact"] / ".docket" / "runs" / "rr"
-        decision = sorted(p.name for p in approval.glob("T01-decision-*.mdx"))[-1]
-        cases = {"no intact approval": (changes, "T01-decision-01.mdx", None),
-                 "not a change request": (approval, decision, 2),
-                 "not a path inside": (changes, "../../../etc/passwd", 2),
-                 "not in the graded run state": (changes, "free text about a lost project", 2),
-                 "not a frozen recipe result": (changes, "T01-task.mdx", 2)}
-        for reason, (run, cited, rnd) in cases.items():
-            got = compare.caught_defects(run, [cited], rnd)
-            self.assertEqual([], got["counted"], reason)
-            self.assertIn(reason, got["rejected"][0]["reason"])
+        self.assertEqual([{"decision": "T01-decision-01.mdx", "round": "1", "required_changes": 1}],
+                         compare.change_requests(changes))
+        self.assertEqual([], compare.change_requests(self.repos["intact"] / ".docket" / "runs" / "rr"))
+
+    def test_a_failing_helper_is_refused_and_its_unfrozen_evidence_is_placed_not_scored(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="work-") as base:
+            repo, runs = real_catch(Path(base), [sys.executable, str(self.tools / "bin" / "docket")], self.env)
+            self.assertEqual(1, runs["refused"], "at the pinned revision a failing verify refuses the submission")
+            run = repo / ".docket" / "runs" / "rr"
+            self.assertFalse(list(run.glob(".bundles/T01/*/*/recipe/evidence/result.json"))[1:], "only the approved round froze")
+            integrity = compare.approval_integrity(self.tools, self.cli_digest, repo, "rr", self.env)
+            self.assertEqual("intact", integrity["status"])
+            frozen_at = json.loads((run / integrity["bundle_path"] / "bundle.json").read_text())["frozen_at"]
+            digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+            helper = digest((repo / "recipes" / "demo" / "verify.py").read_text())
+            prepared = {"ui/server.mjs": digest("v = 1\n"), "ui/verification/companion-projects/verify.mjs": helper}
+            approved = {**prepared, "ui/server.mjs": digest("v = 3\n")}
+            found = compare.recipe_evidence(run, prepared, approved, "2000-01-01T00:00:00Z", frozen_at)
+            self.assertEqual([("failed", "intermediate-edit", "before-approval", True), ("passed", "approved-source", "before-approval", True)],
+                             sorted((e["status"], e["source"], e["timing"], e["helper_unchanged"]) for e in found))
+            as_seed = compare.recipe_evidence(run, {**prepared, "ui/server.mjs": digest("v = 2\n")}, approved,
+                                              "2000-01-01T00:00:00Z", frozen_at)
+            self.assertIn(("failed", "baseline"), [(e["status"], e["source"]) for e in as_seed], "failing on the seed itself")
+            late = compare.recipe_evidence(run, prepared, approved, "2000-01-01T00:00:00Z", "2000-01-02T00:00:00Z")
+            self.assertEqual({"after-approval"}, {e["timing"] for e in late})
+            next(run.glob(".recipe-evidence/T01/*/doctor.json")).unlink()
+            self.assertIn("unknown", [e["source"] for e in compare.recipe_evidence(run, prepared, approved, "2000-01-01T00:00:00Z", frozen_at)])
 
 
 def wire_bundle(root: Path, *, selected: str = "ui/x/recipe.json", status: str = "passed", negative: str | None = None,
@@ -631,32 +748,6 @@ class RecipeVerificationTest(Temp):
             r = compare.recipe_verification(bundle, manifest, "ui/x/recipe.json" if selected is None else selected)
             self.assertFalse(r["verified"], reason)
             self.assertIn(reason, r["reason"])
-
-
-class DefectEvidenceTest(Temp):
-    def bundle(self, n: int, *, status: str = "failed", negative: str | None = None, paths: list | None = None,
-               tamper: bool = False) -> str:
-        b = self.tmp / ".bundles" / "T01" / "01" / f"b{n}"
-        (b / "recipe" / "evidence").mkdir(parents=True)
-        data = json.dumps({"status": status, "negative_control": negative}).encode()
-        (b / "recipe" / "evidence" / "result.json").write_bytes(data + (b" " if tamper else b""))
-        (b / "bundle.json").write_text(json.dumps({
-            "round": 1, "patch": {"roots": [{"paths": ["ui/server.mjs"] if paths is None else paths}]},
-            "recipe": {"evidence": [{"name": "result.json", "file": "recipe/evidence/result.json",
-                                     "sha256": "sha256:" + hashlib.sha256(data).hexdigest()}]}}))
-        return f".bundles/T01/01/b{n}/recipe/evidence/result.json"
-
-    def test_negative_controls_baseline_failures_and_altered_results_never_count(self) -> None:
-        valid = self.bundle(0)
-        self.assertEqual({"counted": [valid], "rejected": []}, compare.caught_defects(self.tmp, [valid], 2))
-        cases = {"deliberate negative control": self.bundle(1, negative="lose-projects"),
-                 "baseline failure": self.bundle(2, paths=[]),
-                 "not recorded unaltered": self.bundle(3, tamper=True),
-                 "not a behavioral failure": self.bundle(4, status="prerequisite-failed")}
-        for reason, cited in cases.items():
-            got = compare.caught_defects(self.tmp, [cited], 2)
-            self.assertEqual([], got["counted"], reason)
-            self.assertIn(reason, got["rejected"][0]["reason"])
 
 
 class RoutineTurnTest(Temp):
@@ -720,27 +811,40 @@ def codex_output(text: str) -> dict:
     return {"type": "response_item", "payload": {"type": "function_call_output", "output": text}}
 
 
-def codex_wrapped(source: object, call_id: str = "call_1") -> dict:
+def stamp(ms: int) -> str:
+    return compare.datetime.fromtimestamp(ms / 1000, compare.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def codex_wrapped(source: object, call_id: str = "call_1", at: int = 1_000) -> dict:
     """Codex freeform `exec` call, shaped from the record schema of a real session."""
-    return {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "status": "completed",
-                                                 "call_id": call_id, "input": source}}
+    return {"timestamp": stamp(at), "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "status": "completed", "call_id": call_id,
+                        "input": source}}
 
 
-def codex_wrapped_output(text: str, call_id: str = "call_1") -> dict:
-    return {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": call_id,
-                                                 "output": [{"type": "input_text", "text": text}]}}
+def codex_wrapped_output(text: str, call_id: str = "call_1", at: int = 3_000) -> dict:
+    return {"timestamp": stamp(at), "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": call_id, "output": [{"type": "input_text", "text": text}]}}
 
 
-RESOLVE = 'readlink -f "$(command -v docket)"'
+
+def codex_native(command: str, status: str = "completed", started: int = 2_000, source: str = "unified_exec_startup") -> dict:
+    """The harness's record of a command Codex executed, with every field of the real native schema."""
+    return {"timestamp": stamp(started + 50), "type": "event_msg", "payload": {
+        "type": "item_completed", "thread_id": "th", "turn_id": "tu", "started_at_ms": started, "completed_at_ms": started + 50,
+        "item": {"type": "CommandExecution", "id": "item-1", "process_id": "4242", "command": ["/usr/bin/zsh", "-lc", command],
+                 "cwd": "/w", "parsed_cmd": [{"type": "unknown", "cmd": command}], "source": source, "status": status,
+                 "aggregated_output": "", "exit_code": 0, "duration": {"secs": 0, "nanos": 5}}}}
 
 
 class ProvenanceTest(Temp):
     LAUNCHER = "/work/w1/tools/docket/bin/docket"
+    FOREIGN = "/home/u/.local/bin/docket"
     README = ("Install: ln -s ~/.agents/skills/docket/bin/docket ~/.local/bin/docket\n"
               "Then run ~/.local/bin/docket help and ~/.agents/skills/docket/bin/docket status.\n")
 
     def classify(self, records: list[dict] | str | None, renderer: str = "derived-aaa", runtime_json: str = "",
-                 prepared_json: str = "", extra: list[list[dict]] = (), **observations) -> dict:
+                 prepared_json: str = "", **observations) -> dict:
         prompts = self.tmp / f"prompts-{len(list(self.tmp.iterdir()))}"
         prompts.mkdir()
         if renderer:
@@ -752,58 +856,174 @@ class ProvenanceTest(Temp):
             (prompts / "T01-implementor-01.json").write_text(prepared_json)
             prepared = {"T01-implementor-01.json": hashlib.sha256(prepared_json.encode()).hexdigest()}
         files = []
-        for transcript in ([] if records is None else [records]) + list(extra):
-            files.append(self.tmp / f"t-{len(list(self.tmp.iterdir()))}.jsonl")
-            files[-1].write_text(transcript if isinstance(transcript, str) else "\n".join(json.dumps(r) for r in transcript))
+        if records is not None:
+            files = [self.tmp / f"t-{len(list(self.tmp.iterdir()))}.jsonl"]
+            files[0].write_text(records if isinstance(records, str) else "\n".join(json.dumps(r) for r in records))
         return compare.provenance(prompts, prepared, files, "derived-aaa", self.LAUNCHER, observations, compare.design())
+
+    def status(self, records: list[dict], **kw) -> str:
+        return self.classify(records, **kw)["status"]
 
     def test_quoted_documentation_in_tool_output_is_not_foreign_execution(self) -> None:
         result = self.classify([codex_exec("cat README.md"), codex_output(self.README),
-                                codex_exec(f"{self.LAUNCHER} submit r T01 --as implementor")], pane_path_verified=True)
+                                codex_native(f"{self.LAUNCHER} submit r T01 --as implementor")])
         self.assertEqual(("pinned", 0, 4), (result["status"], result["foreign_cli_executions"], result["foreign_cli_doc_mentions"]))
 
     def test_an_actual_foreign_cli_command_is_flagged(self) -> None:
-        for record in (claude_bash("~/.local/bin/docket submit r T01 --as implementor"),
-                       codex_exec("/home/u/.agents/skills/docket/bin/docket status r")):
-            result = self.classify([record], pane_path_verified=True)
+        for record in (claude_bash(f"{self.FOREIGN} submit r T01 --as implementor"),
+                       codex_exec("~/.agents/skills/docket/bin/docket status r"),
+                       codex_native(f"cd /w && {self.FOREIGN} status r 2>&1 | tail -5"),
+                       claude_bash("/work/w2/tools/docket/bin/docket status r")):
+            result = self.classify([record, codex_native(f"{self.LAUNCHER} status r")])
             self.assertEqual(("foreign", 1), (result["status"], result["foreign_cli_executions"]), record)
 
-    def test_an_actual_pinned_command_is_recognized_without_path_attestation(self) -> None:
+    def test_an_actual_pinned_command_is_recognized_at_a_command_position(self) -> None:
         for record in (claude_bash(f"{self.LAUNCHER} submit r T01 --as implementor"),
+                       claude_bash(f"cd /work/w1/docket && {self.LAUNCHER} feedback r --body \"a; b\" 2>&1 | tail -3"),
+                       claude_bash(f"python3 {self.LAUNCHER} status r"),
+                       claude_bash("DOCKET_X=1 /work/w1/tools/bin/docket status r"),
                        {"type": "response_item", "payload": {"type": "local_shell_call",
-                                                             "action": {"command": ["bash", "-lc", f"{self.LAUNCHER} status r"]}}}):
+                                                             "action": {"command": ["bash", "-lc", f"{self.LAUNCHER} status r"]}}},
+                       codex_native(f"{self.LAUNCHER} status r")):
             result = self.classify([record, codex_output(self.README)])
             self.assertEqual(("pinned", 1, 0), (result["status"], result["pinned_cli_executions"], result["bare_invocations"]), record)
 
-    def test_unresolved_or_unparsed_evidence_stays_unknown(self) -> None:
-        pinned = claude_bash(f"{self.LAUNCHER} help implementor")
-        self.assertEqual("unknown", self.classify([pinned, claude_bash("docket submit r T01")])["status"], "bare command, PATH unproven")
-        attested = self.classify([pinned, claude_bash("docket submit r T01")], pane_path_verified=True)
-        self.assertEqual(("unknown", True), (attested["status"], attested["pane_path_verified"]),
-                         "a pane's PATH does not decide what a harness tool shell resolves")
-        self.assertEqual("unknown", self.classify(f"$ {self.LAUNCHER} submit r T01\n")["status"], "plain text is not parsed execution")
-        self.assertEqual("unknown", self.classify(None)["status"], "a copied CLI alone proves nothing")
-        self.assertEqual("unknown", self.classify([pinned], renderer="")["status"], "no runtime prompt was rendered")
+    def test_shell_data_comments_and_unexecuted_branches_are_never_execution(self) -> None:
+        for command, ambiguous in ((f'printf "%s\\n" "{self.LAUNCHER} status r"', 0), (f"true # {self.LAUNCHER} status r", 0),
+                                   (f"cat {self.LAUNCHER}", 0), (f"if false; then {self.LAUNCHER} status r; fi", 1),
+                                   (f"false && {self.LAUNCHER} status r", 1), (f"cat <<EOF\n{self.LAUNCHER} status r\nEOF", 1),
+                                   (f'echo "{self.LAUNCHER} status r" | sh', 1), (f"x=$({self.LAUNCHER} status r)", 1),
+                                   (f"mytool {self.LAUNCHER} status r", 1), ("../tools/docket/bin/docket status r", 1)):
+            result = self.classify([codex_exec(command)])
+            self.assertEqual(("unknown", 0, bool(ambiguous)), (result["status"], result["pinned_cli_executions"],
+                                                               bool(result["ambiguous_docket_commands"])), command)
+        printed = self.classify([codex_exec(f'printf "%s\\n" "{self.FOREIGN} status r"'), codex_native(f"{self.LAUNCHER} status r")])
+        self.assertEqual(("pinned", 0), (printed["status"], printed["foreign_cli_executions"]), "printing a path runs nothing")
 
-    def test_bare_commands_count_only_with_a_paired_resolution_to_the_pinned_launcher(self) -> None:
+    def test_quoted_operators_conditional_branches_and_env_operands_are_never_executions(self) -> None:
+        L, F, M = self.LAUNCHER, self.FOREIGN, compare.design()["foreign_cli_markers"]
+        paths = {L, "/work/w1/tools/bin/docket"}
+        cases = {f'cd /tmp "&&" {L} status r': (0, 0), f'printf "%s\\n" "||" {F} status r': (0, 0),
+                 f"printf '%s' ';' {F} status r": (0, 0), f"echo \\; {F} status r": (0, 0),
+                 f"false && {F} status r": (0, 0), f"true || {F} status r": (0, 0),
+                 f"if false\nthen\n{F} status r\nfi": (0, 0), f"ls; {F} status r": (0, 0),
+                 f"env -u {L}": (0, 0), f"env -C {L} status r": (0, 0), f"env --split-string='{L} status r'": (0, 0),
+                 f"env -i -u X DOCKET_X=1 {L} status r": (1, 0), f"cd /w && {F} status r": (0, 1),
+                 f"/usr/bin/env -i {F} status r": (0, 1), f"/usr/bin/env -C /w {L} status r": (0, 0),
+                 f'{L} feedback r --body "a; b && c" 2>&1 | tail -3': (1, 0)}
+        for script, (pinned, foreign) in cases.items():
+            got = compare.classify_script(script, paths, M)
+            self.assertEqual((pinned, foreign), (got["pinned"], got["foreign"]), script)
+
+    def test_codex_freeform_javascript_is_never_read_for_commands(self) -> None:
+        pinned = codex_native(f"{self.LAUNCHER} status r")
+        uninvoked = [f'/* tools.exec_command({{cmd:"{self.FOREIGN} status r"}}) */ text("done");',
+                     f"const docs = 'tools.exec_command({{cmd:\"{self.FOREIGN} status r\"}})'; text(docs);",
+                     f'const later=()=>tools.exec_command({{cmd:"{self.FOREIGN} status r"}}); text("done");',
+                     f'if(false) await tools.exec_command({{cmd:"{self.FOREIGN} status r"}});']
+        for source in uninvoked:
+            self.assertEqual("pinned", self.status([pinned, codex_wrapped(source)]), "nothing ran but the pinned command")
+            self.assertEqual("unknown", self.status([codex_wrapped(source)]), "no harness record of execution")
+        # What the harness actually ran, whatever the JavaScript looked like.
+        for source, ran in ((f'await tools.exec_command({{cmd:"{self.LAUNCHER}" + ".other status r"}});', f"{self.LAUNCHER}.other status r"),
+                            (f'await tools.exec_command({{cmd:"{self.LAUNCHER} status r",cmd:"{self.FOREIGN} status r"}});', f"{self.FOREIGN} status r"),
+                            (f'await tools.exec_command({{cmd:"{self.LAUNCHER} status r",...{{cmd:"{self.FOREIGN} status r"}}}});', f"{self.FOREIGN} status r"),
+                            ('await tools.exec_command({cmd:"/home/u/.local/bin/" + "docket status r"});', f"{self.FOREIGN} status r"),
+                            (f'const run=tools["exec"+"_command"];await run({{cmd:"{self.FOREIGN} status r"}});', f"{self.FOREIGN} status r")):
+            self.assertEqual("foreign", self.status([pinned, codex_wrapped(source), codex_native(ran)]), source)
+        self.assertEqual("unknown", self.status([pinned, codex_native(f"{self.LAUNCHER} status r", status="declined")]),
+                         "an unrecognized execution status is opaque")
+
+    def test_each_freeform_call_needs_its_own_native_record_by_start_time(self) -> None:
+        call = lambda cid, at, end: [codex_wrapped(f'text(await tools.exec_command({{cmd:"{self.LAUNCHER} status r"}}));', cid, at),
+                                     codex_wrapped_output("ok", cid, end)]
+        covered = [*call("a", 1_000, 3_000), codex_native(f"{self.LAUNCHER} status r", started=2_000),
+                   *call("b", 4_000, 6_000), codex_native("ls", started=5_000)]
+        self.assertEqual(("pinned", 0), (lambda r: (r["status"], r["opaque_tool_calls"]))(self.classify(covered)))
+        uncovered = [*call("a", 1_000, 3_000), codex_native(f"{self.LAUNCHER} status r", started=2_000), *call("b", 4_000, 6_000)]
+        self.assertEqual(("unknown", 1), (lambda r: (r["status"], r["opaque_tool_calls"]))(self.classify(uncovered)),
+                         "one native record never covers another call")
+        overlapping = [*call("a", 1_000, 5_000), *call("b", 2_000, 6_000), codex_native(f"{self.LAUNCHER} status r", started=3_000),
+                       codex_native("ls", started=5_500)]
+        self.assertEqual("unknown", self.status(overlapping), "a record inside two windows credits neither")
+        aborted = [codex_wrapped(f'text(await tools.exec_command({{cmd:"{self.LAUNCHER} status r"}}));', "a", 1_000),
+                   codex_native(f"{self.LAUNCHER} status r", started=2_000), *call("b", 4_000, 6_000), codex_native("ls", started=5_000)]
+        self.assertEqual("pinned", self.status(aborted), "a call with no output ends where the next one begins")
+        typed = [*call("a", 1_000, 3_000), codex_native(f"{self.LAUNCHER} status r", started=2_000),
+                 codex_native(f"{self.FOREIGN} status r", started=9_000, source="user_shell")]
+        self.assertEqual("foreign", self.status(typed), "a record outside every window is still classified")
+
+    def test_freeform_calls_may_name_only_known_tools(self) -> None:
+        pinned = [codex_wrapped(f'text(await tools.exec_command({{cmd:"{self.LAUNCHER} status r"}}));'),
+                  codex_native(f"{self.LAUNCHER} status r")]
+        for source, ok in (('text(await tools.web__run({search_query:[{q:"x"}]}));', True),
+                           ("text(await tools.clock__current_time({}));", True),
+                           ('text(await tools.apply_patch("*** Begin Patch"));', True),
+                           ('text(await tools.mcp__shell__run({cmd:"x"}));', False),
+                           ("const t = tools; text(await t.exec_command({cmd:\"ls\"}));", False),
+                           ('const x = `${tools.exec_command}`; text(x);', False)):
+            self.assertEqual("pinned" if ok else "unknown",
+                             self.status([*pinned, codex_wrapped(source, "c2", 5_000), codex_wrapped_output("", "c2", 6_000)]),
+                             source)
+
+    def test_bare_commands_stay_unknown_whatever_resolved_earlier(self) -> None:
         pinned = claude_bash(f"{self.LAUNCHER} status r", "toolu_0")
-        bare = claude_bash("docket pickup r --role implementor --session s", "toolu_2")
-        proven = self.classify([pinned, claude_bash(RESOLVE), claude_result(self.LAUNCHER + "\n"), bare])
-        self.assertEqual(("pinned", 1, 1), (proven["status"], proven["bare_invocations"], proven["bare_proven_pinned"]))
+        resolver = [claude_bash('readlink -f "$(command -v docket)"', "toolu_1"), claude_result(self.LAUNCHER, "toolu_1")]
+        for bare in ("docket submit r T01", "PATH=/other/bin:$PATH docket status r", "docket instruct r --role implementor --resolve 1"):
+            result = self.classify([pinned, *resolver, claude_bash(bare, "toolu_2")], pane_path_verified=True)
+            self.assertEqual(("unknown", 1, True), (result["status"], result["bare_invocations"], result["pane_path_verified"]), bare)
 
-        codex = [codex_wrapped(f'text(await tools.exec_command({{cmd:"{self.LAUNCHER} status r"}}));'),
-                 codex_wrapped('text(await tools.exec_command({cmd:"readlink -f \\"$(command -v docket)\\"",'
-                               '"yield_time_ms":1000}));', "c2"),
-                 codex_wrapped_output(f"Chunk ID: 1\nOutput:\n{self.LAUNCHER}\n", "c2"),
-                 codex_wrapped('text(await tools.exec_command({cmd:"docket instruct r --role implementor --resolve 1"}));')]
-        self.assertEqual("pinned", self.classify(codex)["status"], "the native Codex wrapper pairs by call_id")
+    def test_stdin_is_not_execution_but_an_interactive_interpreter_is_unknown(self) -> None:
+        pinned = codex_native(f"{self.LAUNCHER} status r")
+        typed = codex_wrapped(f'text(await tools.write_stdin({{session_id:1,chars:"{self.LAUNCHER} status r\\n"}}));')
+        to_cat = self.classify([codex_native("cat"), typed])
+        self.assertEqual(("unknown", 0), (to_cat["status"], to_cat["pinned_cli_executions"]), "cat only echoed the text")
+        for shell in ("bash", "python3", "zsh -i"):
+            result = self.classify([pinned, codex_native(shell), typed])
+            self.assertEqual(("unknown", 1), (result["status"], result["ambiguous_docket_commands"]), shell)
 
-        elsewhere = self.classify([pinned, claude_bash(RESOLVE), claude_result("/home/u/.agents/skills/docket/bin/docket"), bare])
-        self.assertEqual(("foreign", 1), (elsewhere["status"], elsewhere["bare_resolved_elsewhere"]))
-        for records, extra, why in (([pinned, claude_bash(RESOLVE), bare], [], "no paired output"),
-                                    ([pinned, bare], [[claude_bash(RESOLVE), claude_result(self.LAUNCHER)]], "another transcript"),
-                                    ([pinned, claude_bash(f"{RESOLVE} && ls"), claude_result(self.LAUNCHER), bare], [], "compound")):
-            self.assertEqual("unknown", self.classify(records, extra=extra)["status"], why)
+    def test_nonempty_or_unrecognized_stdin_blocks_pinned_and_empty_polls_do_not(self) -> None:
+        pinned = claude_bash(f"{self.LAUNCHER} status r")
+        direct = lambda args: {"type": "response_item", "payload": {"type": "function_call", "name": "write_stdin",
+                                                                     "call_id": "w", "arguments": json.dumps(args)}}
+        typed = f"{self.FOREIGN} status r\n"
+        self.assertEqual("unknown", self.status([pinned, direct({"session_id": 123, "chars": typed})]))
+        for args in ({"session_id": 123, "chars": ""}, {"session_id": 123, "yield_time_ms": 1000}):
+            self.assertEqual("pinned", self.status([pinned, direct(args)]), args)
+        poll = 'text(await tools.write_stdin({session_id:57416,chars:"",yield_time_ms:1000,max_output_tokens:2000}));'
+        self.assertEqual("pinned", self.status([pinned, codex_wrapped(poll), codex_wrapped_output("", at=2_000)]))
+        for source in (f'text(await tools.write_stdin({{session_id:123,chars:"{self.FOREIGN} status r\\n"}}));',
+                       'text(await tools.write_stdin({session_id:1,chars:"",chars:"x"}));',
+                       'text(await tools.write_stdin({session_id:1,...{chars:"x"}}));',
+                       'const c = "x"; text(await tools.write_stdin({session_id:1,chars:c}));',
+                       'text(await tools.write_stdin({session_id:1,chars:"" + "x"}));'):
+            self.assertEqual("unknown", self.status([pinned, codex_wrapped(source), codex_wrapped_output("", at=2_000)]), source)
+        unknown_tool = {"type": "response_item", "payload": {"type": "function_call", "name": "run_terminal", "call_id": "u",
+                                                             "arguments": json.dumps({"command": "anything"})}}
+        self.assertEqual("unknown", self.status([pinned, unknown_tool]), "an unknown tool carrying a command is opaque")
+
+    def test_an_interpreter_by_absolute_path_is_still_an_interpreter(self) -> None:
+        pinned = claude_bash(f"{self.LAUNCHER} status r")
+        for script in ("/bin/bash -c 'docket submit r T01'", "/usr/bin/env bash -c 'docket submit r T01'",
+                       "/usr/bin/python3 -c 'import os; os.system(\"docket submit r T01\")'",
+                       "python3.14 -c 'import os; os.system(\"docket submit r T01\")'", "/bin/bash"):
+            result = self.classify([pinned, codex_exec(script)])
+            self.assertEqual("unknown", result["status"], script)
+            self.assertTrue(result["ambiguous_docket_commands"], script)
+        shell = [codex_wrapped('text(await tools.exec_command({cmd:"/bin/bash",tty:true}));', "s", 1_000),
+                 codex_native("/bin/bash", started=1_500), codex_wrapped_output("", "s", 2_000),
+                 codex_wrapped('text(await tools.write_stdin({session_id:1,chars:"docket submit r T01\\n"}));', "t", 3_000),
+                 codex_wrapped_output("", "t", 4_000)]
+        self.assertEqual("unknown", self.status([pinned, *shell]), "an interactive shell driven through stdin")
+
+    def test_unparsed_or_unrecognized_evidence_stays_unknown(self) -> None:
+        pinned = claude_bash(f"{self.LAUNCHER} help implementor")
+        self.assertEqual("unknown", self.status(f"$ {self.LAUNCHER} submit r T01\n"), "plain text is not parsed execution")
+        self.assertEqual("unknown", self.status(None), "a copied CLI alone proves nothing")
+        self.assertEqual("unknown", self.status([pinned], renderer=""), "no runtime prompt was rendered")
+        other_tool = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t", "name": "Shell2",
+                                                                    "input": {"command": "anything"}}]}}
+        self.assertEqual("unknown", self.status([pinned, other_tool]), "a command another tool ran cannot be placed")
 
     def test_every_pinned_subcommand_counts_as_bare_but_paths_and_prose_do_not(self) -> None:
         source = subprocess.run(["git", "show", f"{PINNED}:skills/docket/docket_cli/cli.py"], cwd=REPO, check=True,
@@ -821,8 +1041,7 @@ class ProvenanceTest(Temp):
     def test_runtime_prompt_json_counts_but_the_prepared_record_does_not(self) -> None:
         pinned = [claude_bash(f"{self.LAUNCHER} status r")]
         record = lambda renderer: json.dumps({"renderer_revision": renderer, "prompt": "renderer: derived-aaa"})
-        self.assertEqual("foreign", self.classify(pinned, runtime_json=record("derived-bbb"))["status"],
-                         "a runtime `prompt` by another CLI is caught")
+        self.assertEqual("foreign", self.status(pinned, runtime_json=record("derived-bbb")), "a runtime prompt by another CLI")
         self.assertEqual(("pinned", ["derived-aaa"]), (lambda r: (r["status"], r["renderers"]))(
             self.classify(pinned, renderer="", runtime_json=record("derived-aaa"))))
         self.assertEqual(("unknown", []), (lambda r: (r["status"], r["renderers"]))(
@@ -831,55 +1050,12 @@ class ProvenanceTest(Temp):
             self.classify(pinned, runtime_json="{not json")))
 
     def test_runtime_renderer_mismatch_is_foreign_but_a_quoted_one_is_not(self) -> None:
-        self.assertEqual("foreign", self.classify([claude_bash(f"{self.LAUNCHER} status r")], renderer="derived-bbb")["status"])
+        self.assertEqual("foreign", self.status([claude_bash(f"{self.LAUNCHER} status r")], renderer="derived-bbb"))
         quoted = self.classify([claude_bash(f"{self.LAUNCHER} status r"), codex_output("renderer: derived-bbb")])
         self.assertEqual(("pinned", ["derived-aaa"]), (quoted["status"], quoted["renderers"]))
 
-    def test_codex_exec_wrapper_literal_commands_are_execution(self) -> None:
-        pinned = codex_wrapped(f'text((await tools.exec_command({{cmd:"{self.LAUNCHER} status r","workdir":"/w",'
-                               '"yield_time_ms":2500})).output);')
-        parallel = codex_wrapped(f'const results = await Promise.allSettled([ tools.exec_command({{cmd:"cat README.md",'
-                                 f'"yield_time_ms":7000}}), tools.exec_command({{cmd:"{self.LAUNCHER} submit r T01 '
-                                 '--as implementor","yield_time_ms":9000}) ]); for (const r of results) text(r.value.output);')
-        result = self.classify([pinned, parallel, codex_wrapped_output(self.README)])
-        self.assertEqual(("pinned", 2, 0, 0, 4), (result["status"], result["pinned_cli_executions"], result["foreign_cli_executions"],
-                                                  result["opaque_tool_calls"], result["foreign_cli_doc_mentions"]))
-
-        foreign = codex_wrapped('text(await tools.apply_patch("*** Begin Patch")); '
-                                'text(await tools.exec_command({cmd:"~/.local/bin/docket submit r T01 --as implementor","yield_time_ms":1000}));')
-        self.assertEqual(("foreign", 1), (lambda r: (r["status"], r["foreign_cli_executions"]))(self.classify([pinned, foreign])))
-
-        escaped = codex_wrapped('text(await tools.exec_command({cmd:"cd \\"/w x\\" && ' + self.LAUNCHER + ' status r\\n"}));')
-        self.assertEqual(1, compare.executed_commands(self.write([escaped]))[0][0].count(self.LAUNCHER))
-
-    def test_codex_exec_wrapper_opaque_input_and_prose_are_not_execution(self) -> None:
-        pinned = codex_wrapped(f'text(await tools.exec_command({{cmd:"{self.LAUNCHER} status r","yield_time_ms":1000}}));')
-        prose = codex_wrapped('text("Next I would run ~/.local/bin/docket status r");')
-        result = self.classify([pinned, prose])
-        self.assertEqual(("pinned", 0, 0, 1), (result["status"], result["foreign_cli_executions"], result["opaque_tool_calls"],
-                                               result["foreign_cli_doc_mentions"]))
-
-        for source in ('const c = "~/.local/bin/docket submit r T01"; text(await tools.exec_command({cmd: c}));',
-                       f'const run = tools.exec_command; text(await run({{cmd:"{self.LAUNCHER} status r"}}));',
-                       f'text(await tools.exec_command({{workdir:"/w", cmd:"{self.LAUNCHER} status r"}}));',
-                       f'text(await tools.exec_command({{cmd:`{self.LAUNCHER} status ${{run}}`}}));',
-                       {"cmd": f"{self.LAUNCHER} status r"}):
-            result = self.classify([pinned, codex_wrapped(source)])
-            self.assertEqual(("unknown", 0, 1), (result["status"], result["foreign_cli_executions"], result["opaque_tool_calls"]),
-                             source)
-
-        typed = codex_wrapped('text(await tools.write_stdin({session_id:60307,chars:"docket submit r T01\\n","yield_time_ms":1000}));'
-                              ' text(await tools.write_stdin({session_id:60307,chars:"","yield_time_ms":3000}));')
-        result = self.classify([pinned, typed])
-        self.assertEqual(("unknown", 1, 0), (result["status"], result["bare_invocations"], result["opaque_tool_calls"]))
-
-    def write(self, records: list[dict]) -> Path:
-        path = self.tmp / f"w-{len(list(self.tmp.iterdir()))}.jsonl"
-        path.write_text("\n".join(json.dumps(r) for r in records))
-        return path
-
     def test_installed_skill_document_reads_are_reported_separately(self) -> None:
-        result = self.classify([claude_bash(f"cat /home/u/.agents/skills/docket/SKILL.md && {self.LAUNCHER} help implementor")])
+        result = self.classify([claude_bash(f"{self.LAUNCHER} help implementor; cat /home/u/.agents/skills/docket/SKILL.md")])
         self.assertEqual(("pinned", 1), (result["status"], result["installed_skill_doc_mentions"]))
 
 
@@ -921,22 +1097,23 @@ class HelperOutcomeTest(unittest.TestCase):
 def grade(arm: str, *, total: int = 1000, turns: object = 3, approved: bool = True, verified: bool = True,
           failed: list | None = None, observations: dict | None = None, models: dict | None = None,
           efforts: dict | None = None, private_hit: int = 0, helper: int = 0, cli: str = "pinned", full: bool = True,
-          caught: list | None = None, hidden: str = "", deps: bool = True, runtime_ok: bool = True) -> dict:
+          rounds: int = 1, hidden: str = "", deps: bool = True, runtime_ok: bool = True,
+          evidence: list | None = None, requests: list | None = None) -> dict:
     usage = {c: 1 for c in compare.CATEGORIES} | {"total": total, "telemetry": "measured", "gaps": [],
                                                   "models": {"implementor": ["claude-opus-5-5"], "reviewer": ["gpt-6.1-sol"]}}
     return {"hidden": {"status": hidden or ("failed" if failed else "passed"), "failed": failed or []},
             "pinned_tests": {"passed": True}, "graded_tree": "approved", "live_drift": {"added": [], "deleted": [], "modified": []},
             "node_modules_unchanged": deps, "runtime_matches_proof": runtime_ok,
-            "docket": {"rounds": 1, "approved": approved, "integrity": {"status": "intact" if approved else "not-approved"},
+            "docket": {"rounds": rounds, "approved": approved, "integrity": {"status": "intact" if approved else "not-approved"},
                        "recipe_selected": "x" if arm == "treatment" else "",
                        "recipe": {"verified": verified if arm == "treatment" else False, "reason": "" if verified else "no approved bundle"},
                        "helper_runs": helper},
-            "turns": {"total": turns}, "caught_defects": {"counted": caught or [], "rejected": []},
+            "turns": {"total": turns}, "recipe_evidence": evidence or [], "change_requests": requests or [],
             "recipe_helper_executions": 0,
             "exposure": {"transcripts": {"recipe": {"verify.mjs": 0}, "private": {"rubric.json": private_hit}}},
             "usage": usage,
             "identity": compare.identity(compare.design()["models"], usage["models"] if models is None else models,
-                                         {"reviewer": ["high"]} if efforts is None else efforts),
+                                         {"implementor": ["high"], "reviewer": ["high"]} if efforts is None else efforts),
             "full_sessions": {c: (usage[c] if full else None) for c in compare.CATEGORIES}
             | {"telemetry": "measured" if full else "unknown", "gaps": [] if full else ["implementor: no full-session transcript"]},
             "cli": {"status": cli, "renderers": ["derived-1"], "pinned_renderer": "derived-1",
@@ -944,7 +1121,6 @@ def grade(arm: str, *, total: int = 1000, turns: object = 3, approved: bool = Tr
             "observations": {"human_interventions": 0, **(observations or {})}}
 
 
-SAVED = {"caught": [".bundles/T01/01/x/recipe/evidence/result.json"]}
 
 
 class DecideTest(unittest.TestCase):
@@ -957,17 +1133,19 @@ class DecideTest(unittest.TestCase):
         return compare.decide(rows, RUBRIC)
 
     def valid(self, **t) -> list[tuple[dict, dict]]:
-        return [(grade("treatment", **{**SAVED, **t}), grade("control")), (grade("treatment", **t), grade("control"))]
+        """Two valid pairs whose only saving is one fewer correction round in the first."""
+        return [(grade("treatment", **t), grade("control", rounds=2)), (grade("treatment", **t), grade("control"))]
 
     def test_supported_only_with_complete_valid_evidence_and_a_saving(self) -> None:
         self.assertTrue(self.decide(self.valid())[0].startswith("opt-in-supported"))
         tie = [(grade("treatment"), grade("control"))] * 2
-        self.assertEqual(("not-supported", ["tie without a concrete operational saving or caught defect"]), self.decide(tie))
+        self.assertEqual(("not-supported", ["tie without a measured saving (a failure only the control shows, or fewer rounds)"]),
+                         self.decide(tie))
 
     def test_unverified_treatment_or_missing_approval_is_inconclusive(self) -> None:
         for t, c in (({"verified": False}, {}), ({"approved": False}, {}), ({}, {"approved": False}),
                      ({"approved": False, "verified": False}, {"approved": False})):
-            pairs = [(grade("treatment", **SAVED, **t), grade("control", **c)), (grade("treatment"), grade("control"))]
+            pairs = [(grade("treatment", **t), grade("control", **c)), (grade("treatment"), grade("control"))]
             outcome, reasons = self.decide(pairs)
             self.assertEqual("inconclusive", outcome, (t, c))
             self.assertTrue(reasons)
@@ -981,7 +1159,8 @@ class DecideTest(unittest.TestCase):
     def test_identity_mismatch_unknown_identity_or_exposure_is_inconclusive(self) -> None:
         for kw in ({"models": {"implementor": ["claude-opus-5-5"], "reviewer": ["gpt-5.6-sol"]}},
                    {"models": {"implementor": ["claude-opus-5-5"]}}, {"private_hit": 1},
-                   {"efforts": {"reviewer": ["medium"]}}, {"efforts": {}}):
+                   {"efforts": {"implementor": ["high"], "reviewer": ["medium"]}}, {"efforts": {"implementor": ["low"], "reviewer": ["high"]}},
+                   {"efforts": {"reviewer": ["high"]}}):
             self.assertEqual("inconclusive", self.decide(self.valid(**kw))[0], kw)
 
     def test_attributed_tokens_never_stand_in_for_unproven_full_sessions(self) -> None:
@@ -1001,7 +1180,7 @@ class DecideTest(unittest.TestCase):
         self.assertIn("control delegated work to 2 subagent transcript(s)", reasons[0])
 
     def test_unknown_telemetry_turns_or_adjudication_stay_inconclusive(self) -> None:
-        unknown_tokens = grade("treatment", **SAVED)
+        unknown_tokens = grade("treatment")
         unknown_tokens["full_sessions"]["total"] = None
         self.assertEqual("inconclusive", self.decide([(unknown_tokens, grade("control")), self.valid()[1]])[0])
         self.assertEqual("inconclusive", self.decide(self.valid(turns=None))[0])
@@ -1020,12 +1199,12 @@ class DecideTest(unittest.TestCase):
     def test_control_recipe_use_is_reported_and_selection_invalidates(self) -> None:
         control = grade("control", helper=1)
         rows = [compare.pair_row("t", {"treatment": "t", "control": "c"},
-                                 {"t": grade("treatment", **SAVED), "c": control},
+                                 {"t": grade("treatment"), "c": control},
                                  {"t": {}, "c": {}}, 0.15)]
         self.assertTrue(rows[0]["control_ran_recipe_helper"])
         control = copy.deepcopy(control)
         control["docket"]["recipe_selected"] = "x"
-        outcome, reasons = self.decide([(grade("treatment", **SAVED), control), self.valid()[1]])
+        outcome, reasons = self.decide([(grade("treatment"), control), self.valid()[1]])
         self.assertEqual("inconclusive", outcome)
         self.assertIn("control selected the recipe", reasons[0])
         ran = grade("control")
@@ -1035,16 +1214,20 @@ class DecideTest(unittest.TestCase):
 
     def test_an_infrastructure_failure_is_unknown_not_a_regression(self) -> None:
         for status in ("prerequisite-failed", "harness-failed"):
-            outcome, reasons = self.decide([(grade("treatment", **SAVED, hidden=status), grade("control")), self.valid()[1]])
+            outcome, reasons = self.decide([(grade("treatment", hidden=status), grade("control")), self.valid()[1]])
             self.assertEqual("inconclusive", outcome, status)
             self.assertIn("hidden checks without a verdict", reasons[0])
-        live = grade("treatment", **SAVED)
+        live = grade("treatment")
         live["graded_tree"] = "live"
         self.assertEqual("inconclusive", self.decide([(live, grade("control")), self.valid()[1]])[0])
 
     def test_free_text_savings_are_listed_but_never_scored(self) -> None:
-        noted = [(grade("treatment", observations={"operational_saving": "much faster"}), grade("control"))] * 2
-        self.assertEqual(("not-supported", ["tie without a concrete operational saving or caught defect"]), self.decide(noted))
+        caught = [{"status": "failed", "source": "intermediate-edit", "timing": "before-approval"}]
+        noted = [(grade("treatment", observations={"operational_saving": "much faster", "human_interventions": 0},
+                        evidence=caught, requests=[{"decision": "T01-decision-01.mdx"}]),
+                  grade("control", observations={"human_interventions": 3}))] * 2
+        self.assertEqual("not-supported", self.decide(noted)[0],
+                         "recipe catches, change requests, intervention counts and notes are never a saving")
         row = compare.pair_row("t", {"treatment": "t", "control": "c"}, {"t": noted[0][0], "c": noted[0][1]},
                                {"t": {}, "c": {}}, 0.15)
         self.assertEqual("much faster", row["unscored_notes"]["treatment"])

@@ -6,7 +6,7 @@
     "No observed behavioral regression: in every pair, the treatment fails no hidden check, pinned production test or adjudicated defect that its control passes.",
     "No extra routine model turn: in every pair, treatment routine model turns do not exceed control routine model turns.",
     "Median paired execution-token overhead is at most the budget. The budget is an operating choice, not a quality threshold; raw tokens are not money.",
-    "Promotion needs a concrete operational saving or a meaningful defect caught before approval in at least one pair. A tie without a saving does not promote.",
+    "Promotion needs a measured saving in at least one pair: a hidden-check, pinned-test or adjudicated failure that only the control shows, or fewer correction rounds in the treatment. Recipe helper runs, change requests, intervention counts and free-text notes are reported but never scored, because one arm's evidence cannot attribute them to the recipe. A tie without a measured saving does not promote.",
     "Unknown telemetry stays unknown and makes the dependent rule inconclusive, never passed.",
     "Exposure of hidden checks, the rubric or the variant mapping to any candidate makes the result inconclusive. Control use of the recipe is reported as contamination.",
     "Two pairs give a directional, opt-in-only finding. No result here promotes recipes to a default."

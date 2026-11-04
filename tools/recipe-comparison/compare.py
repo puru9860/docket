@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -204,13 +205,34 @@ def copy_tree(source: Path, dest: Path) -> None:
 
 
 def cli_decision(launcher: str) -> str:
-    # Worded so the renderer's bare-command rewrite never touches it: no backtick, line start or ": " before "docket".
-    return (f"Docket CLI: run every Docket command through the absolute launcher `{launcher}`, including the startup "
-            "register, pickup and instruct commands in a conductor message and any example that shows the bare command "
-            f"name; for role help use `{launcher} help ROLE`. Never run Docket through PATH, an alias or another copy.")
+    # Survives the renderer's bare-command rewrite verbatim: "docket" never follows a backtick or ": " or starts a line.
+    return (f"Run every Docket command through `{launcher}`, including the startup and obligation commands above "
+            "that name docket without a path; never invoke docket by bare name.")
 
 
-def plan_for(spec: dict, arm: str, d: dict, launcher: str) -> dict:
+def conductor_path(shim: Path, operator_path: str) -> list[str]:
+    """A PATH for the conductor and its milestone suite: Node/npm, Herdr and uv, and no Docket at all."""
+    shim.mkdir()
+    for tool in ("herdr", "uv"):
+        if not (found := shutil.which(tool, path=operator_path)):
+            die(f"{tool} is not on PATH; the conductor needs it")
+        (shim / tool).symlink_to(os.path.realpath(found))
+    node = shutil.which("node", path=operator_path)
+    if not node or not os.access(os.path.join(os.path.dirname(node), "npm"), os.X_OK):
+        die("node with npm beside it is not on PATH; the milestone suite needs both")
+    dirs = [str(shim), os.path.dirname(node), "/usr/bin", "/bin"]
+    if hits := [d for d in dirs if os.access(os.path.join(d, "docket"), os.X_OK)]:
+        die(f"the conductor PATH would resolve an installed docket in {', '.join(hits)}")
+    return dirs
+
+
+def suite_command(d: dict, tools_bin: Path, clean_path: list[str]) -> str:
+    """The repository's own finish gate, run with capture on and the candidate's pinned `docket` first on PATH."""
+    return (f"env -u DOCKET_SESSION_CAPTURE PATH={shlex.quote(':'.join([str(tools_bin), *clean_path]))} "
+            f"/bin/sh -c {shlex.quote(d['milestone_command'])}")
+
+
+def plan_for(spec: dict, arm: str, d: dict, launcher: str, suite: str) -> dict:
     task_spec = {"owner": RUN_OWNER, "title": spec["title"], "goal": spec["goal"],
                  "criterion": spec["criteria"], "file": spec["files"], "verify": d["arms"][arm]["verify"],
                  "verify_timeout": d["verify_timeout"], "risk": "low", "complexity": "low",
@@ -222,7 +244,7 @@ def plan_for(spec: dict, arm: str, d: dict, launcher: str) -> dict:
     return {"run": {"title": spec["title"], "objective": spec["objective"], "approach": d["approach"],
                     "evidence_mode": "git"},
             "roots": ["app=."], "tasks": [task_spec],
-            "milestones": [{"id": d["milestone"], "members": [RUN_OWNER], "command": d["milestone_command"],
+            "milestones": [{"id": d["milestone"], "members": [RUN_OWNER], "command": suite,
                             "implementor_harness": m["implementor_harness"], "implementor_model": m["implementor_model"],
                             "reviewer_harness": m["reviewer_harness"], "reviewer_model": m["reviewer_model"],
                             "assignment_reason": "Fixed model assignment held equal across matched tasks."}]}
@@ -340,6 +362,8 @@ def cmd_prepare(a: argparse.Namespace) -> None:
     sanitized = private / "source" / "tree"
     source_record = export(source, a.revision, sanitized, d["excluded_paths"], env)
     proven = sensitivity(absolute(a.proof, "--proof"), source_record, runtime(deps, a.browsers_path, env))
+    # Outside the private root, so no private path enters the conductor's environment.
+    clean_path = conductor_path(candidates / "tools-bin", os.environ.get("PATH", ""))
     order = schedule(seed, d["tasks"])
     labels = {(t, arm): label_for(seed, f"{t}|{arm}") for t, arm in order}
     if len(set(labels.values())) != len(labels):
@@ -349,7 +373,7 @@ def cmd_prepare(a: argparse.Namespace) -> None:
              "residual_mentions": residuals(sanitized, d["residual_markers"]),
              "node_modules_digest": proven["runtime"]["node_modules_digest"],
              "tasks": {t: {"spec_sha256": sha((HERE / "tasks" / f"{t}.json").read_bytes())} for t in d["tasks"]},
-             "sequence": [labels[k] for k in order], "candidates": {}}
+             "sequence": [labels[k] for k in order], "conductor_path": clean_path, "candidates": {}}
     for t, arm in order:
         label, spec = labels[(t, arm)], task(t)
         home = candidates / label
@@ -371,7 +395,7 @@ def cmd_prepare(a: argparse.Namespace) -> None:
         run(["git", "commit", "-q", "-m", "Import project"], project, git_env)
         commit = run(["git", "rev-parse", "HEAD"], project, git_env).stdout.strip()
         launcher = str(tools / "docket" / "bin" / "docket")
-        plan = plan_for(spec, arm, d, launcher)
+        plan = plan_for(spec, arm, d, launcher, suite_command(d, tools / "bin", clean_path))
         write_json(launch / "plan.json", plan, private=True)
         cli = [sys.executable, launcher]
         applied = run([*cli, "plan", "apply", t, "--file", str(launch / "plan.json")], project, env)
@@ -382,6 +406,10 @@ def cmd_prepare(a: argparse.Namespace) -> None:
                       "--model", d["models"]["implementor_model"]], project, bare).stdout
         if launcher not in prompt or cli_decision(launcher) not in prompt or BARE_DOCKET.search(prompt):
             die(f"{label}: the initial prompt does not carry the pinned-CLI decision and absolute commands")
+        review = run([*cli, "prompt", t, RUN_OWNER, "--role", "reviewer", "--model", d["models"]["reviewer_model"]],
+                     project, bare).stdout
+        if cli_decision(launcher) not in review:
+            die(f"{label}: the reviewer contract does not carry the pinned-CLI decision verbatim")
         (launch / "implementor-prompt.md").write_text(prompt)
         prompts = project / ".docket" / "runs" / t / ".prompts"
         agents = json.loads(run([sys.executable, "-c", AGENT_NAMES, str(tools / "docket"), t, d["milestone"]],
@@ -438,11 +466,14 @@ def schedule_text(study: dict, candidates: Path, private: Path) -> str:
                   f"- Check before starting: `{cli} status {c['run']}` (cwd `{project}`)."]
         for role in ("implementor", "reviewer"):
             harness, name = m[f"{role}_harness"], c["agent_names"][role]
-            lines.append(f"- Prestart the {role} so the conductor adopts it: a Herdr pane with cwd `{project}` and "
-                         f"`--env DOCKET_RUN={c['run']} --env DOCKET_ROLE={role} --env DOCKET_SESSION={name}`, then "
-                         f"`herdr agent start {name} --kind {harness} --pane PANE -- "
+            lines.append(f"- Prestart the {role} so the conductor adopts it, in its own Herdr pane shared with nothing else: "
+                         f"`herdr pane split ... --cwd {project} --env DOCKET_RUN={c['run']} --env DOCKET_ROLE={role} "
+                         f"--env DOCKET_SESSION={name}`, then `herdr agent start {name} --kind {harness} --pane PANE -- "
                          f"{harness_args(harness, m[f'{role}_model'], m[f'{role}_effort'])}`. A fresh session used for nothing else.")
-        lines += [f"- Conductor, in its own pane in the foreground: `cd {project} && {cli} conduct {c['run']}`",
+        lines += ["- Before the conductor starts, `herdr agent list` must show both exact names above, each with `agent` "
+                  "equal to its harness, idle at the prompt; an unnamed or misnamed agent is not adopted.",
+                  f"- Conductor, in its own pane in the foreground: `cd {project} && env PATH={':'.join(study['conductor_path'])} "
+                  f"{cli} conduct {c['run']}`",
                   "- End both role sessions within 900 s of the final decision; keep each whole transcript for `--full-session`.",
                   f"- After finish: `cd {project} && {cli} usage {c['run']} --json > "
                   f"{private / 'telemetry' / (label + '-usage.json')}`",
@@ -469,7 +500,25 @@ SUBCOMMANDS = ("amendment arm assign batch bundle conduct config decide delivery
                "switch-model usage validate-task verify watch").split()
 BARE_DOCKET = re.compile(r"(?<![\w/.-])docket\s+(?:%s|-h|--help|--version)(?![\w-])"
                          % "|".join(map(re.escape, sorted(SUBCOMMANDS, key=len, reverse=True))))
-RESOLVE_DOCKET = re.compile(r'readlink -f (?:"\$\(command -v docket\)"|\$\(command -v docket\))')
+SEPARATORS = {";", "&&", "||", "|", "|&", "&", "\n", ";;"}
+REDIRECTS = {">", ">>", "<", ">&", "<&", "&>", "&>>", ">|", "<>"}
+KEYWORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function",
+            "select", "in", "!", "{", "}", "[[", "]]", "time", "coproc", "(", ")"}
+# Commands that run other code or read commands from stdin: a Docket command inside them cannot be placed.
+INDIRECT = {"bash", "sh", "zsh", "dash", "ksh", "fish", "eval", "exec", "source", ".", "xargs", "sudo", "su", "nohup",
+            "timeout", "watch", "nice", "setsid", "script", "command", "builtin", "find", "parallel", "python",
+            "python3", "node", "perl", "ruby", "uv", "npx", "make", "awk", "sed"}
+# Commands that only read or print their arguments, so a Docket path among them is data.
+DATA = {"cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "wc", "printf",
+        "echo", "readlink", "realpath", "dirname", "basename", "test", "[", "diff", "cd", "which", "type", "git",
+        "true", "false", "sort", "uniq", "cut", "tr", "jq", "sha256sum", "nl", "tree"}
+
+
+def argv_script(argv: list[str]) -> str:
+    """The script a `shell -c SCRIPT` argv runs, or the argv itself as one command line."""
+    if len(argv) == 3 and os.path.basename(argv[0]) in ("bash", "zsh", "sh", "dash") and argv[1] in ("-c", "-lc", "-ic"):
+        return argv[2]
+    return shlex.join(argv)
 
 
 def command_fields(value: object) -> list[str]:
@@ -480,55 +529,163 @@ def command_fields(value: object) -> list[str]:
         field = value.get(key)
         if isinstance(field, str):
             out.append(field)
-        elif isinstance(field, list) and all(isinstance(x, str) for x in field):
-            out.append(" ".join(field))
+        elif isinstance(field, list) and field and all(isinstance(x, str) for x in field):
+            out.append(argv_script(field))
     return out
 
 
-# Codex's freeform `exec` tool wraps calls in JavaScript, e.g. text(await tools.exec_command({cmd:"..."})).
-# Only a call whose first argument key is a literal string is read; every other mention of a tool name
-# (a variable, an alias, a later key, a name inside a string) is opaque rather than guessed.
-WRAPPED_TOOLS = {"exec_command": "cmd", "write_stdin": "chars"}
-WRAPPED_CALL = re.compile(r'tools\.(exec_command|write_stdin)\(\s*\{\s*(?:[\w"]+\s*:\s*\d+\s*,\s*)?"?(cmd|chars)"?'
-                          r'\s*:\s*("(?:[^"\\\n]|\\.)*")')
+QUOTED = re.compile(r"""'[^']*'|"(?:[^"\\]|\\.)*"|\\.""", re.S)
+PUNCTUATION = ";&|()<>\n"
 
 
-def wrapped_commands(source: str) -> tuple[list[str], int]:
-    """Literal commands and stdin in a Codex exec wrapper, and how many tool calls stayed opaque."""
-    commands, read = [], 0
-    for match in WRAPPED_CALL.finditer(source):
-        if WRAPPED_TOOLS[match[1]] != match[2]:
-            continue
-        try:
-            commands.append(json.loads(match[3]))
-        except ValueError:
-            continue
-        read += 1
-    return [c for c in commands if c], sum(source.count(name) for name in WRAPPED_TOOLS) - read
+def shell_tokens(script: str) -> list[tuple[str, bool]] | None:
+    """Words and operators of a script; None when its syntax is outside the supported subset.
 
-
-def output_text(value: object) -> str:
-    """Every string a tool result carries, including JSON-encoded result envelopes."""
-    if isinstance(value, str):
-        if value.lstrip().startswith(("{", "[")):
-            try:
-                return value + "\n" + output_text(json.loads(value))
-            except ValueError:
-                pass
-        return value
-    if isinstance(value, list):
-        return "\n".join(output_text(v) for v in value)
-    if isinstance(value, dict):
-        return "\n".join(output_text(v) for k, v in value.items() if k in ("text", "output", "content", "stdout"))
-    return ""
-
-
-def transcript_calls(path: Path) -> dict | None:
-    """Tool calls a Claude or Codex transcript recorded, with their commands and paired outputs.
-
-    Tool outputs are never execution. None means nothing in the file parsed, so it gives no evidence either way.
+    Tokenized twice: as written for word values, and with every quoted string and escape masked, so a
+    quoted "&&" stays a word. Only a token that is punctuation in the masked pass is an operator.
     """
-    calls, outputs, opaque, parsed = [], {}, 0, False
+    def lex(text: str) -> list[str]:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=PUNCTUATION)
+        lexer.whitespace, lexer.whitespace_split = " \t\r", True
+        return list(lexer)
+
+    masked = QUOTED.sub(lambda m: m[0][0] + "Q" * (len(m[0]) - 2) + m[0][-1] if m[0][0] in "'\"" else "QQ", script)
+    try:
+        words, shape = lex(script), lex(masked)
+    except ValueError:
+        return None
+    if len(words) != len(shape):
+        return None
+    return [(word, bool(form) and set(form) <= set(PUNCTUATION)) for word, form in zip(words, shape)]
+
+
+def env_command(words: list[str]) -> list[str] | None:
+    """The command `env` runs, past its supported options; None for any other option."""
+    words = words[1:]
+    while words:
+        if words[0] in ("-i", "--ignore-environment", "-") or re.fullmatch(r"[A-Za-z_]\w*=.*", words[0], re.S):
+            words = words[1:]
+        elif words[0] in ("-u", "--unset") and len(words) > 1:
+            words = words[2:]
+        elif re.fullmatch(r"-u.+|--unset=.+", words[0]):
+            words = words[1:]
+        elif words[0].startswith("-"):
+            return None
+        else:
+            break
+    return words
+
+
+def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[str, int]:
+    """Docket executions at recognized command positions of one executed shell script.
+
+    Only a restricted shell subset is recognized: simple commands joined by separators, with assignments,
+    supported `env` options and redirects. An execution counts as pinned or foreign only where it certainly
+    runs: the first command, or one reached only through `cd DIR &&`. A Docket path or name anywhere else
+    (a later or conditional command, an interpreter, a substitution, a control structure, a here-document,
+    an unknown command's arguments, unsupported syntax) is ambiguous, and so is a bare interactive shell
+    or interpreter whose stdin could run anything.
+    """
+    out = {"pinned": 0, "foreign": 0, "bare": 0, "ambiguous": 0}
+    docket = lambda t: t == "docket" or t.endswith("/bin/docket") or any(m in t for m in [*pinned, *markers])
+    mentioned = any(m in script for m in [*pinned, *markers]) or bool(BARE_DOCKET.search(script))
+    tokens = shell_tokens(script)
+    if tokens is None:
+        out["ambiguous"] += mentioned
+        return out
+    mentioned = mentioned or any(docket(t) for t, _ in tokens)
+    unplaced = "$(" in script or "`" in script or "<(" in script
+    segments, current, joins = [], [], []
+    for token, operator in tokens:
+        if operator and token in SEPARATORS:
+            segments.append(current)
+            joins.append(token)
+            current = []
+        else:
+            if operator and (token not in REDIRECTS):
+                unplaced = True
+            current.append(token)
+    segments.append(current)
+    unconditional = True
+    for n, words in enumerate(segments):
+        while words and re.fullmatch(r"[A-Za-z_]\w*=.*", words[0], re.S):
+            words = words[1:]
+        if words and os.path.basename(words[0]) == "env":
+            words = env_command(words)
+            if words is None:
+                unplaced = True
+                words = []
+        if not words:
+            unconditional = False
+            continue
+        word = words[0]
+        # `/bin/bash` or `python3.14` is still bash or python.
+        base = re.sub(r"^(python)[\d.]*$", r"\1", os.path.basename(word))
+        if base == "python" and len(words) > 1 and docket(words[1]):
+            word = base = words[1]
+        if word in KEYWORDS or "$" in word or any(c in word for c in "*?[") and word != "[":
+            unplaced = True
+        elif docket(word):
+            if word == "docket":
+                out["bare"] += 1
+            elif not unconditional or not word.startswith(("/", "~")):
+                out["ambiguous"] += 1
+            elif os.path.normpath(word) in pinned:
+                out["pinned"] += 1
+            else:
+                out["foreign"] += 1
+        elif base in INDIRECT and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
+            unplaced = True
+            if not [w for w in words[1:] if not w.startswith("-") and w not in REDIRECTS]:
+                out["ambiguous"] += 1
+        elif base not in DATA and any(docket(t) or BARE_DOCKET.search(t) for t in words[1:]):
+            out["ambiguous"] += 1
+        unconditional = unconditional and base == "cd" and n < len(joins) and joins[n] == "&&"
+    out["ambiguous"] += unplaced and mentioned
+    return out
+
+
+KNOWN_TOOL = re.compile(r"\btools\.(?:exec_command|write_stdin|apply_patch|view_image|web__run|clock__\w+)\s*\(")
+JS_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|`(?:[^`\\]|\\.)*`', re.S)
+
+
+def freeform_unknown_tools(source: str) -> bool:
+    """Whether a freeform call reaches tools other than by a literal known name (alias, computed or other)."""
+    if any(m.group().startswith("`") and "${" in m.group() for m in JS_STRING.finditer(source)):
+        return True
+    return bool(re.search(r"\btools\b", KNOWN_TOOL.sub("", JS_STRING.sub('""', source))))
+
+
+STDIN_POLL = re.compile(r'tools\.write_stdin\(\s*\{((?:\s*"?\w+"?\s*:\s*(?:\d+|"")\s*,?)*)\}\s*\)')
+POLL_KEYS = {"session_id", "chars", "yield_time_ms", "max_output_tokens"}
+
+
+def stdin_polls_only(source: str) -> bool:
+    """Whether every write_stdin a freeform call names is a literal empty poll; stdin's recipient is unproven."""
+    polls = 0
+    for match in STDIN_POLL.finditer(source):
+        pairs = re.findall(r'"?(\w+)"?\s*:\s*(\d+|"")', match[1])
+        keys = [k for k, _ in pairs]
+        if len(keys) != len(set(keys)) or not set(keys) <= POLL_KEYS or "session_id" not in keys \
+                or any((k == "chars") != (v == '""') for k, v in pairs):
+            return False
+        polls += 1
+    return polls == source.count("write_stdin")
+
+
+def millis(value: object) -> int | None:
+    moment = instant(value) if isinstance(value, str) else None
+    return int(moment.timestamp() * 1000) if moment else None
+
+
+def executed_commands(path: Path) -> tuple[list[str], int] | None:
+    """Shell scripts a transcript shows were executed, and tool calls whose execution it cannot show.
+
+    Claude's Bash tool runs its `command` input as written. Codex records what its harness actually ran as
+    `CommandExecution` items; the model's freeform JavaScript is never read for commands, so a freeform call
+    without those records is opaque. Tool outputs are never execution. None means nothing parsed.
+    """
+    scripts, opaque, parsed, calls, starts = [], 0, False, {}, []
     for line in path.read_text(errors="replace").splitlines():
         try:
             record = json.loads(line)
@@ -539,37 +696,74 @@ def transcript_calls(path: Path) -> dict | None:
         parsed = True
         message, payload = record.get("message"), record.get("payload")
         content = message.get("content") if isinstance(message, dict) else None
-        for item in content if isinstance(content, list) else []:
-            if not isinstance(item, dict):
-                continue
-            if record.get("type") == "assistant" and item.get("type") == "tool_use":
-                calls.append({"id": item.get("id"), "commands": command_fields(item.get("input"))})
-            elif record.get("type") == "user" and item.get("type") == "tool_result" and item.get("tool_use_id"):
-                outputs[item["tool_use_id"]] = output_text(item.get("content"))
-        if record.get("type") != "response_item" or not isinstance(payload, dict):
+        if record.get("type") == "assistant":
+            for item in content if isinstance(content, list) else []:
+                if isinstance(item, dict) and item.get("type") == "tool_use":
+                    fields = command_fields(item.get("input"))
+                    if item.get("name") == "Bash":
+                        scripts += fields
+                    else:
+                        opaque += bool(fields)
+        if not isinstance(payload, dict):
             continue
-        kind, call_id = payload.get("type"), payload.get("call_id")
-        if kind == "function_call":
-            try:
-                calls.append({"id": call_id, "commands": command_fields(json.loads(payload.get("arguments") or "{}"))})
-            except ValueError:
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        if record.get("type") == "event_msg" and payload.get("type") == "item_completed" \
+                and item.get("type") == "CommandExecution":
+            starts.append(payload.get("started_at_ms"))
+            argv = item.get("command")
+            if item.get("status") in ("completed", "failed") and isinstance(argv, list) and argv \
+                    and all(isinstance(x, str) for x in argv):
+                scripts.append(argv_script(argv))
+            else:
                 opaque += 1
+        if record.get("type") != "response_item":
+            continue
+        kind = payload.get("type")
+        if kind == "function_call":
+            raw = payload.get("arguments") or "{}"
+            try:
+                arguments = json.loads(raw)
+            except ValueError:
+                arguments = None
+            if payload.get("name") in ("exec_command", "shell", "container.exec"):
+                if arguments is None:
+                    opaque += 1
+                else:
+                    scripts += command_fields(arguments)
+            elif payload.get("name") == "write_stdin":
+                opaque += not isinstance(arguments, dict) or arguments.get("chars") not in (None, "")
+            elif arguments is None:
+                opaque += "cmd" in raw or "command" in raw
+            else:
+                opaque += bool(command_fields(arguments))
         elif kind == "local_shell_call":
-            calls.append({"id": call_id, "commands": command_fields(payload.get("action"))})
+            scripts += command_fields(payload.get("action"))
         elif kind == "custom_tool_call" and payload.get("name") == "exec":
             source = payload.get("input")
-            found, hidden_calls = wrapped_commands(source) if isinstance(source, str) else ([], 1)
-            calls.append({"id": call_id, "commands": found})
-            opaque += hidden_calls
-        elif kind in ("function_call_output", "custom_tool_call_output") and call_id:
-            outputs[call_id] = output_text(payload.get("output"))
-    return {"calls": calls, "outputs": outputs, "opaque": opaque} if parsed else None
-
-
-def executed_commands(path: Path) -> tuple[list[str], int] | None:
-    """Commands a transcript asked a tool to run, and the opaque calls it made."""
-    parsed = transcript_calls(path)
-    return None if parsed is None else ([c for call in parsed["calls"] for c in call["commands"]], parsed["opaque"])
+            calls[payload.get("call_id")] = {"start": millis(record.get("timestamp")), "end": None, "native": 0,
+                                             "source": source if isinstance(source, str) else ""}
+        elif kind == "custom_tool_call_output" and payload.get("call_id") in calls:
+            calls[payload["call_id"]]["end"] = millis(record.get("timestamp"))
+    # No id links a native record to its freeform call; its start time places it in exactly one call's window.
+    if calls:
+        # A call with no output (an aborted turn) ends where the next freeform call begins.
+        ordered = sorted((c for c in calls.values() if c["start"] is not None), key=lambda c: c["start"])
+        for current, following in zip(ordered, ordered[1:] + [None]):
+            if current["end"] is None and following:
+                current["end"] = following["start"]
+        for started in starts:
+            inside = [c for c in calls.values() if isinstance(started, int) and c["start"] is not None
+                      and c["start"] <= started <= (c["end"] if c["end"] is not None else started)]
+            # A record outside every window (a user shell command, clock skew) is still classified from its
+            # real command; one inside several cannot credit a single call.
+            if len(inside) == 1:
+                inside[0]["native"] += 1
+            elif inside:
+                opaque += 1
+        for call in calls.values():
+            opaque += call["start"] is None or freeform_unknown_tools(call["source"]) or not stdin_polls_only(call["source"]) \
+                or ("tools.exec_command(" in call["source"] and not call["native"])
+    return (scripts, opaque) if parsed else None
 
 
 def runtime_renderers(prompts: Path, prepared: dict[str, str]) -> tuple[set[str], int]:
@@ -592,35 +786,28 @@ def provenance(prompts: Path, prepared: dict[str, str], transcripts: list[Path],
                observations: dict, d: dict) -> dict:
     """Whether the roles actually ran the pinned CLI: runtime prompts the CLI wrote, and executed commands.
 
-    A bare `docket` counts only where the same transcript ran `readlink -f "$(command -v docket)"` and its
-    paired output named the pinned launcher; a pane's PATH does not decide what a harness tool shell resolves.
+    A bare `docket` stays unknown: neither a pane's PATH nor an earlier resolution shows what a later
+    command resolved. Anything the recognizer cannot place stays unknown, never pinned.
     """
     renderers, unreadable = runtime_renderers(prompts, prepared)
-    foreign = pinned_runs = bare = proven_bare = foreign_resolution = unparsed = opaque = doc_mentions = skill_docs = 0
+    paths = {launcher, str(Path(launcher).parents[2] / "bin" / "docket")}
+    totals = {"pinned": 0, "foreign": 0, "bare": 0, "ambiguous": 0}
+    unparsed = opaque = doc_mentions = skill_docs = 0
     for path in transcripts:
         text = path.read_bytes().decode("utf-8", "replace")
         skill_docs += sum(text.count(m) for m in d["installed_skill_markers"])
         doc_mentions += sum(text.count(m) for m in d["foreign_cli_markers"])
-        if (parsed := transcript_calls(path)) is None:
+        if (executed := executed_commands(path)) is None:
             unparsed += 1
             continue
-        opaque += parsed["opaque"]
-        here, proofs = 0, []
-        for call in parsed["calls"]:
-            for command in call["commands"]:
-                foreign += any(m in command for m in d["foreign_cli_markers"])
-                pinned_runs += launcher in command
-                here += bool(BARE_DOCKET.search(command.replace(launcher, "")))
-            if len(call["commands"]) == 1 and RESOLVE_DOCKET.fullmatch(call["commands"][0].strip()):
-                result = parsed["outputs"].get(call["id"]) if call["id"] else None
-                proofs.append(None if result is None else launcher in (x.strip() for x in result.splitlines()))
-        bare += here
-        if here and proofs and all(proofs):
-            proven_bare += here
-        elif here and False in proofs:
-            foreign_resolution += 1
-    resolved = transcripts and not unparsed and not opaque and pinned_runs and bare == proven_bare
-    if foreign or foreign_resolution or renderers - {pinned}:
+        scripts, hidden_calls = executed
+        opaque += hidden_calls
+        for script in scripts:
+            for k, v in classify_script(script, paths, d["foreign_cli_markers"]).items():
+                totals[k] += v
+    resolved = transcripts and not unparsed and not opaque and not totals["ambiguous"] and not totals["bare"] \
+        and totals["pinned"]
+    if totals["foreign"] or renderers - {pinned}:
         status = "foreign"
     elif renderers and not unreadable and resolved:
         status = "pinned"
@@ -628,8 +815,8 @@ def provenance(prompts: Path, prepared: dict[str, str], transcripts: list[Path],
         status = "unknown"
     return {"status": status, "pinned_renderer": pinned, "renderers": sorted(renderers),
             "unreadable_prompt_records": unreadable,
-            "foreign_cli_executions": foreign, "pinned_cli_executions": pinned_runs, "bare_invocations": bare,
-            "bare_proven_pinned": proven_bare, "bare_resolved_elsewhere": foreign_resolution,
+            "foreign_cli_executions": totals["foreign"], "pinned_cli_executions": totals["pinned"],
+            "bare_invocations": totals["bare"], "ambiguous_docket_commands": totals["ambiguous"],
             "unparsed_transcripts": unparsed, "opaque_tool_calls": opaque, "foreign_cli_doc_mentions": doc_mentions,
             "installed_skill_doc_mentions": skill_docs, "pane_path_verified": observations.get("pane_path_verified") is True}
 
@@ -947,7 +1134,7 @@ def full_sessions(specs: list[str], tools: Path, run_dir: Path, project: Path, p
         roles[role] = {"proven": not problems, "problems": problems, "first": m["first"], "last": m["last"],
                        "files": len(files), "delegated_transcripts": sum("/subagents/" in f for f in files), **{c: usage.get(c) for c in CATEGORIES},
                        "models": usage.get("models", []),
-                       "efforts": codex_efforts([Path(f) for f in files]) if harness == "codex" else []}
+                       "efforts": session_efforts(harness, [Path(f) for f in files])}
         gaps += [f"{role}: {p}" for p in problems]
     if gaps:
         return {**unknown, "roles": roles, "gaps": gaps, "raw": raw}
@@ -963,23 +1150,20 @@ def delegated(full: dict) -> int:
 
 
 def identity(requested: dict, models: dict, efforts: dict) -> dict:
-    """Requested models and effort versus what each role's own proven session recorded.
-
-    Codex records effort per turn; Claude transcripts do not, so its effort is reported as unobservable.
-    """
+    """Requested models and effort versus what each role's own proven session recorded; missing stays unknown."""
     out = {}
     for role in REQUIRED_ROLES:
-        want, seen = requested[f"{role}_model"], models.get(role)
-        effort = efforts.get(role) if requested[f"{role}_harness"] == "codex" else "unobservable"
+        want, seen, effort = requested[f"{role}_model"], models.get(role), efforts.get(role)
         model_ok = None if not seen else seen == [want]
-        effort_ok = True if effort == "unobservable" else (None if not effort else effort == [requested[f"{role}_effort"]])
+        effort_ok = None if not effort else effort == [requested[f"{role}_effort"]]
         out[role] = {"requested": want, "observed": seen, "requested_effort": requested[f"{role}_effort"],
                      "observed_effort": effort,
                      "matches": None if None in (model_ok, effort_ok) else model_ok and effort_ok}
     return out
 
 
-def codex_efforts(files: list[Path]) -> list[str]:
+def session_efforts(harness: str, files: list[Path]) -> list[str]:
+    """Effort as the transcript records it: Codex per turn context, Claude per assistant record."""
     efforts = set()
     for path in files:
         for line in path.read_text(errors="replace").splitlines():
@@ -987,9 +1171,16 @@ def codex_efforts(files: list[Path]) -> list[str]:
                 record = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(record, dict) and record.get("type") == "turn_context":
-                if effort := (record.get("payload") or {}).get("effort"):
-                    efforts.add(str(effort))
+            if not isinstance(record, dict):
+                continue
+            if harness == "codex" and record.get("type") == "turn_context":
+                effort = (record.get("payload") or {}).get("effort")
+            elif harness == "claude" and record.get("type") == "assistant":
+                effort = record.get("effort")
+            else:
+                continue
+            if effort:
+                efforts.add(str(effort))
     return sorted(efforts)
 
 
@@ -1025,52 +1216,60 @@ def section(body: str, heading: str) -> str:
     return re.sub(r"(?s)<!--.*?-->", "", match[1]).strip() if match else ""
 
 
-def defect_problem(run_state: Path, rel: object, approved_round: int | None) -> str:
-    """Why a cited artifact is not a defect caught after an edit and before approval; empty when it is."""
-    if approved_round is None:
-        return "no intact approval to have caught it before"
-    if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
-        return "not a path inside the graded run state"
-    path = run_state / rel
-    if not path.is_file() or path.is_symlink():
-        return "cited file is not in the graded run state"
-    if re.fullmatch(rf"{RUN_OWNER}-decision-\d+\.mdx", rel):
-        meta, body = frontmatter(path), path.read_text()
-        if meta.get("verdict") != "changes-requested" or not meta.get("bundle_digest"):
-            return f"decision verdict {meta.get('verdict') or 'missing'} is not a change request bound to a bundle"
-        if not meta.get("round", "").isdigit() or int(meta["round"]) >= approved_round:
-            return "change request is not from a round before the approved one"
-        return "" if section(body, "Required changes") else "change request names no required change"
-    bundle = next((b for b in path.parents if (b / "bundle.json").is_file() and run_state in b.parents), None)
-    if path.name != "result.json" or bundle is None or ".bundles" not in Path(rel).parts:
-        return "not a frozen recipe result or a change request"
-    manifest_data = load_json(bundle / "bundle.json")
-    file = path.relative_to(bundle).as_posix()
-    entry = next((e for e in (manifest_data.get("recipe") or {}).get("evidence", []) if e.get("file") == file), None)
-    if not entry or entry.get("sha256") != f"sha256:{sha(path.read_bytes())}":
-        return "recipe result is not recorded unaltered in its bundle"
-    result = load_json(path)
-    if result.get("negative_control"):
-        return "a deliberate negative control is not a caught defect"
-    if result.get("status") != "failed":
-        return f"recipe result {result.get('status')} is not a behavioral failure"
-    if not isinstance(manifest_data.get("round"), int) or manifest_data["round"] >= approved_round:
-        return "recipe failure is not from a round before the approved one"
-    if not any(r.get("paths") for r in (manifest_data.get("patch") or {}).get("roots", [])):
-        return "the failing round changed nothing, so it is a baseline failure"
-    return ""
+def change_requests(run_state: Path) -> list[dict]:
+    """Change requests the reviewer recorded; reported, never scored, since both arms have a reviewer."""
+    out = []
+    for path in sorted(run_state.glob(f"{RUN_OWNER}-decision-*.mdx")):
+        meta = frontmatter(path)
+        if meta.get("verdict") == "changes-requested":
+            items = [x for x in section(path.read_text(), "Required changes").splitlines() if x.strip()]
+            out.append({"decision": path.name, "round": meta.get("round", ""), "required_changes": len(items)})
+    return out
 
 
-def caught_defects(run_state: Path, cited: object, approved_round: int | None) -> dict:
-    """Only cited post-edit recipe failures or change requests before approval count; free text never does."""
-    counted, rejected = [], []
-    for item in cited if isinstance(cited, list) else ([] if cited is None else [cited]):
-        rel = item.get("evidence") if isinstance(item, dict) else item
-        if problem := defect_problem(run_state, rel, approved_round):
-            rejected.append({"evidence": rel, "reason": problem})
+UI_BUILD_PREFIX = "ui/"
+
+
+def recipe_evidence(run_state: Path, prepared: dict[str, str], approved: dict[str, str] | None,
+                    prepared_at: str, frozen_at: str) -> list[dict]:
+    """Every recipe helper run left in the run state, placed against the prepared seed and the approved freeze.
+
+    A failing helper refuses the submission at the pinned revision, so its evidence stays unfrozen in
+    `.recipe-evidence`. Each run is classified mechanically and reported; none is scored, because a catch
+    cannot be attributed to the recipe against the control from one arm's evidence.
+    """
+    out = []
+    for result_path in sorted(run_state.glob(f".recipe-evidence/{RUN_OWNER}/*/result.json")):
+        entry = {"evidence": result_path.parent.name, "result_sha256": sha(result_path.read_bytes())}
+        try:
+            result, doctor = load_json(result_path), load_json(result_path.parent / "doctor.json")
+        except (OSError, ValueError):
+            out.append({**entry, "source": "unknown", "reason": "result or doctor record missing or unreadable"})
+            continue
+        build = (doctor.get("build") or {}).get("sha256") or {}
+        files = {UI_BUILD_PREFIX + k: v for k, v in build.items()} if isinstance(build, dict) else {}
+        started = instant(str(result.get("started_at", "")))
+        if not files or result.get("invocation") != doctor.get("invocation") or started is None:
+            source, timing = "unknown", "unknown"
         else:
-            counted.append(rel)
-    return {"counted": counted, "rejected": rejected}
+            source = ("baseline" if all(prepared.get(k) == v for k, v in files.items())
+                      else "approved-source" if approved and all(approved.get(k) == v for k, v in files.items())
+                      else "intermediate-edit" if approved else "unknown")
+            frozen = instant(frozen_at)
+            timing = ("before-preparation" if started < instant(prepared_at)
+                      else "unknown" if frozen is None
+                      # `frozen_at` has whole-second resolution.
+                      else "before-approval" if started.replace(microsecond=0) <= frozen else "after-approval")
+        helper = UI_BUILD_PREFIX + "verification/companion-projects/verify.mjs"
+        out.append({**entry, "status": result.get("status"), "negative_control": result.get("negative_control"),
+                    "kind": helper_outcome(0 if result.get("status") == "passed" else 1, result)["kind"],
+                    "source": source, "timing": timing,
+                    "helper_unchanged": helper in files and files[helper] == prepared.get(helper)})
+    return out
+
+
+def helper_executions(scripts: list[str]) -> int:
+    return sum(bool(re.search(r"(?<![\w/.-])node\s+(?:\S*/)?verify\.mjs(?![\w.])", s)) for s in scripts)
 
 
 def prepared_bytes(sanitized: Path, spec: dict, rel: str) -> bytes | None:
@@ -1171,8 +1370,10 @@ def cmd_grade(a: argparse.Namespace) -> None:
                      c["pinned_launcher"], observations, d)
     outcome = docket_outcome(out / "docket-state", c["run"], integrity)
     outcome["helper_runs"] = helper_runs(out / "docket-state")
-    helper_executions = sum(sum("verify.mjs" in command for command in (executed_commands(p) or ([], 0))[0])
-                            for p in transcripts)
+    helper_runs_executed = sum(helper_executions((executed_commands(p) or ([], 0))[0]) for p in transcripts)
+    frozen_bundle = out / "docket-state" / "runs" / c["run"] / integrity.get("bundle_path", "") / "bundle.json"
+    frozen_at = str(load_json(frozen_bundle).get("frozen_at", "")) \
+        if integrity["status"] == "intact" and frozen_bundle.is_file() else ""
     roles = full.get("roles") or {}
     proven = {r: v for r, v in roles.items() if v.get("proven")}
     hidden_status = result.get("status")
@@ -1192,9 +1393,10 @@ def cmd_grade(a: argparse.Namespace) -> None:
              "candidate_tests": candidate_tests, "pinned_tests": pinned_tests,
              "docket": outcome,
              "turns": routine_turns(run_state),
-             "caught_defects": caught_defects(run_state, observations.get("defects_caught_before_approval"),
-                                              integrity.get("round") if integrity["status"] == "intact" else None),
-             "recipe_helper_executions": helper_executions,
+             "recipe_evidence": recipe_evidence(run_state, prepared, now if tree == approved else None,
+                                                study["prepared_at"], frozen_at),
+             "change_requests": change_requests(run_state),
+             "recipe_helper_executions": helper_runs_executed,
              "exposure": exposure({"docket_state": state_files, "transcripts": transcripts}, markers),
              "transcripts_scanned": len(transcripts),
              "usage": telemetry, "full_sessions": full,
@@ -1248,9 +1450,6 @@ def pair_row(task_id: str, labels: dict[str, str], grades: dict, adjudications: 
         savings.append(f"control escaped {sorted(f['control'] - f['treatment'])} that treatment did not")
     if g["treatment"]["docket"]["rounds"] < g["control"]["docket"]["rounds"]:
         savings.append("fewer correction rounds")
-    if None not in help_.values() and help_["treatment"] < help_["control"]:
-        savings.append("fewer human interventions")
-    savings += [f"caught before approval: {x}" for x in g["treatment"]["caught_defects"]["counted"]]
     contamination = sorted({f"{arm}:{group}:{m}" for arm in arms for source in g[arm]["exposure"].values()
                             for group, ms in source.items() for m, n in ms.items()
                             if n and (group == "private" or arm == "control")})
@@ -1282,7 +1481,8 @@ def pair_row(task_id: str, labels: dict[str, str], grades: dict, adjudications: 
             "overhead": overhead, "human_interventions": help_,
             "setup_interventions": pick(lambda arm: obs[arm].get("setup_interventions")),
             "process_overhead": pick(lambda arm: obs[arm].get("process_overhead")),
-            "rejected_defect_citations": g["treatment"]["caught_defects"]["rejected"],
+            "recipe_evidence": pick(lambda arm: g[arm]["recipe_evidence"]),
+            "change_requests": pick(lambda arm: g[arm]["change_requests"]),
             "unscored_notes": pick(lambda arm: obs[arm].get("operational_saving")),
             "control_ran_recipe_helper": control_ran_helper,
             "contamination": contamination, "savings": savings}
@@ -1332,7 +1532,7 @@ def decide(rows: list[dict], rubric: dict) -> tuple[str, list[str]]:
     if unknown:
         return "inconclusive", [f"{name} unknown" for name in unknown]
     if not any(r["savings"] for r in graded):
-        return "not-supported", ["tie without a concrete operational saving or caught defect"]
+        return "not-supported", ["tie without a measured saving (a failure only the control shows, or fewer rounds)"]
     return "opt-in-supported (directional; two pairs; no default)", []
 
 
@@ -1377,8 +1577,9 @@ def report_text(report: dict, rubric: dict) -> str:
              "Execution tokens are whole fresh role sessions with proven bounds; Docket's attributed tokens start at "
              "each role's first in-harness registration and are only a lower bound.",
              "Behavior is graded on the approved round's frozen tree, exported by the pinned CLI; live drift is reported. "
-             "Routine turns are the conductor's successful deliveries. A caught defect counts only when it cites a "
-             "post-edit recipe failure or change request frozen before approval; free-text notes are listed, never scored.",
+             "Routine turns are the conductor's successful deliveries. Savings are measured only: a failure only the "
+             "control shows, or fewer correction rounds. Recipe helper runs, change requests, intervention counts and "
+             "free-text notes are listed, never scored.",
              "Limitation: when the treatment's recipe correctly blocks a broken fix and no approval follows, the pair is "
              "inconclusive rather than a win.", "",
              "| Task | Approved T / C | Recipe verified (T) | Failures T / C | Rounds T / C | Turns T / C | Full-session tokens T / C | Attributed lower bound T / C | Overhead | Savings | Contamination |",
@@ -1400,7 +1601,7 @@ def report_text(report: dict, rubric: dict) -> str:
         for arm, v in (r.get("cli") or {}).items():
             lines.append(f"- {r['task']} {arm}: {v['status']}; runtime renderers {', '.join(v['renderers']) or 'none'} "
                          f"(pinned {v['pinned_renderer']}); pinned executions {v['pinned_cli_executions']}, foreign "
-                         f"{v['foreign_cli_executions']}, bare {v['bare_invocations']} (proven pinned {v['bare_proven_pinned']}), "
+                         f"{v['foreign_cli_executions']}, bare {v['bare_invocations']}, ambiguous {v['ambiguous_docket_commands']}, "
                          f"opaque calls {v['opaque_tool_calls']}, unparsed transcripts {v['unparsed_transcripts']}; "
                          f"installed-skill doc mentions {v['installed_skill_doc_mentions']}")
     lines += ["", "## Graded trees and evidence notes", ""]
@@ -1413,8 +1614,11 @@ def report_text(report: dict, rubric: dict) -> str:
                          + ("not compared" if drift is None else ", ".join(f"{k} {len(v)}" for k, v in drift.items()))
                          + f"; setup interventions {fmt(r['setup_interventions'][arm])}, human interventions "
                          f"{fmt(r['human_interventions'][arm])}; unscored note: {r['unscored_notes'][arm] or 'none'}")
-        for item in r["rejected_defect_citations"]:
-            lines.append(f"- {r['task']} treatment: citation {item['evidence']!r} not counted ({item['reason']})")
+            runs = r["recipe_evidence"][arm]
+            lines.append(f"- {r['task']} {arm} (unscored): {len(r['change_requests'][arm])} change request(s); "
+                         f"{len(runs)} recipe helper run(s)" + "".join(
+                             f"; {e.get('status', '?')} {e.get('kind', '')} on {e['source']} source, {e.get('timing', 'unknown')}"
+                             for e in runs))
     lines += ["", "## Model identity: requested versus observed", ""]
     for r in report["pairs"]:
         for arm, roles in (r.get("identity") or {}).items():
