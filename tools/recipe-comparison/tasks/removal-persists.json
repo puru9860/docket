@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "id": "removal-persists",
+  "title": "Removed companion projects come back after restart",
+  "objective": "A project removed from the companion's project list stays removed across companion restarts, and every other saved project is kept.",
+  "goal": "Removing a project with \"Remove from list\" in the companion's project menu works until the companion restarts; after a restart the removed project is listed again. Make a removal persist across restarts while every other saved project, including one added after the removal, stays listed.",
+  "criteria": [
+    "A project removed from the list is not listed after a companion restart.",
+    "Every other saved project, including one added again after its removal, is still listed after a restart.",
+    "The starting project still cannot be removed, and the saved list keeps its format and private file permissions."
+  ],
+  "out_of_scope": [
+    "Restoring the last selected project after a restart."
+  ],
+  "notes": [
+    "Start the companion with `cd ui && npm start -- --workspace /absolute/project --socket /absolute/private/dir/none.sock`; it prints a private local URL, and the private `--socket` path keeps a manual check away from any live Herdr server.",
+    "The project list is saved to `$XDG_STATE_HOME/docket-ui/projects.json` (default `~/.local/state/docket-ui/projects.json`); use a private `XDG_STATE_HOME` and disposable projects for any manual check, never real companion state.",
+    "Prerequisites: Node.js 22+ and Python 3.11+ as `python3`. The companion's npm dependencies are already installed in `ui/node_modules` and the machine may be offline, so do not reinstall, update or remove them."
+  ],
+  "files": [
+    "ui/projects.mjs",
+    "ui/tests/projects.test.mjs"
+  ],
+  "recipe_covered": false,
+  "seed": [
+    {
+      "path": "ui/projects.mjs",
+      "old": "    await mkdir(path.dirname(preferencesPath), { recursive: true });\n    const temporary = `${preferencesPath}.${process.pid}.tmp`;\n    await writeFile(temporary, JSON.stringify({ version: 1, projects: [...projects.values()].map(p => p.path) }, null, 2), { mode: 0o600 });\n",
+      "new": "    await mkdir(path.dirname(preferencesPath), { recursive: true });\n    // Keep entries another companion instance saved since this one loaded.\n    let saved = [];\n    try { saved = JSON.parse(await readFile(preferencesPath, 'utf8')).projects; } catch { saved = []; }\n    const paths = new Set([...(Array.isArray(saved) ? saved : []), ...[...projects.values()].map(p => p.path)]);\n    const temporary = `${preferencesPath}.${process.pid}.tmp`;\n    await writeFile(temporary, JSON.stringify({ version: 1, projects: [...paths] }, null, 2), { mode: 0o600 });\n"
+    }
+  ],
+  "alternate_fix": [
+    {
+      "path": "ui/projects.mjs",
+      "old": "  const projects = new Map();\n",
+      "new": "  const projects = new Map();\n  const removed = new Set();\n"
+    },
+    {
+      "path": "ui/projects.mjs",
+      "old": "...(Array.isArray(saved) ? saved : [])",
+      "new": "...(Array.isArray(saved) ? saved : []).filter(p => !removed.has(p))"
+    },
+    {
+      "path": "ui/projects.mjs",
+      "old": "      if (!projects.delete(id))",
+      "new": "      const gone = projects.get(id);\n      if (gone) removed.add(gone.path);\n      if (!projects.delete(id))"
+    },
+    {
+      "path": "ui/projects.mjs",
+      "old": "      const project = add(real);\n",
+      "new": "      removed.delete(real);\n      const project = add(real);\n"
+    }
+  ]
+}

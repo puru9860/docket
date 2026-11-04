@@ -6,14 +6,14 @@ pushes are authorized again. No comparison candidates have been launched.
 The working branch is `audit-3-fixes`; read
 [the adoption plan](pstack-adoption-plan.md) for scope.
 
-Verified implementation is pushed through `b1a6fbe`. The comparison lane's
-latest saved checkpoint is `acb9cd1` on `pstack-recipe-comparison`, with further
-uncommitted review fixes in that worktree. Its pre-pause final verification was
-interrupted. Fresh independent Opus and Sol probes found false positive CLI
-provenance, process-only requests counted as defects, an unreachable failed
-recipe evidence shape, and missing Claude effort checks. Fix and verify these
-before candidates. A separate no-model qualification is running the exact full
-milestone under the clean conductor PATH. The installed skill remains unchanged.
+Verified core implementation is pushed through `b1a6fbe`. The comparison tooling
+is now implemented and verified: 61 tests including the browser sensitivity
+proof, plus 11 independent targeted provenance assertions. Its source checkpoint
+is `c1b1faa` on `pstack-recipe-comparison`, integrated in this checkpoint.
+The exact pinned-revision completion checks also passed: 789 CLI, 43 UI Python,
+104 UI Node, 415.2 seconds within the fixed 900-second conductor timeout.
+No comparison candidates have run yet. The installed skill remains unchanged
+until the comparison finishes, to keep the treatment isolated.
 
 ## Source and validation
 
@@ -63,18 +63,20 @@ unchanged reports and no bundle. Startup removal is refused by the actual
 server; the controlled failure is atomic and preserves other state. See the
 maintained feature map. Terminal-binding invalidation remains unobserved.
 
-M3: Opus is preparing the narrow blinded procedure on `pstack-recipe-comparison`.
-Its current WIP preservation checkpoint is `acb9cd1`, including the latest
-review fixes. Review and rerun verification before integration or candidates.
-Preparation and sensitivity tests ran, but no model candidates have run.
-The first two seeds escaped the original Add-project helper because they concern
-adjacent behavior. One task now covers server shutdown deleting the saved list, while the other
-remains adjacent removal behavior. Sensitivity tests prove reference/alternate repairs pass,
-the seeds escape existing tests, and the original helper catches the covered
-persistence failure while passing on the adjacent seed. Independent review found
-additional provenance/launch, frozen-tree grading and scoring issues; the
-isolated lane has draft fixes awaiting final review and verification before any candidates. Use the final reviewed
-protocol, not a draft launch procedure. Keep applicability limits explicit.
+M3 tooling is complete and independently reviewed. Final native provenance fixes
+use actual Codex CommandExecution records, explicit command positions, conservative
+stdin handling and observed effort for both harnesses. Unproven execution remains
+unknown. Recipe evidence, change requests, intervention counts and free-text notes
+are reported but never scored as benefits. Only measured escaped failures and
+correction-round differences can establish a saving.
+
+The 61-test comparison suite passed, including browser sensitivity. A retained
+proof with matching frozen code hashes has no problems: reference and alternative
+repairs pass both tasks, the seeds fail independent decisive checks, and existing
+UI tests miss the seeds. The original Add recipe catches the covered normal-stop
+persistence seed and passes the adjacent removal seed. No model candidates have
+run, and no comparative cost/quality result is claimed.
+
 Pin `fe58b1a` and identical Opus implementor/Sol reviewer assignments in both arms;
 exclude M1 and M2 to isolate the first treatment. Freeze source/tasks/checks/rubric
 before candidates, keep private mapping/checks outside candidate directories,
@@ -98,20 +100,15 @@ after the discovery/recipe guidance has been used.
 
 ## Continue from another machine
 
-On this machine, untracked
-`docs/recipe-comparison-protocol.md` and `tools/` in the main checkout contain an
-older comparison integration that passed 40 tests, not the latest paused draft.
-Do not stage those stale copies as the current comparison implementation.
-The authoritative draft is the `pstack-recipe-comparison` branch at `acb9cd1`.
-Preserve unrelated files when replacing the older integration on resume.
+The comparison toolkit is integrated in this branch. The old untracked main
+copies were replaced only after their recorded hashes matched, and unrelated
+files were preserved. The current source checkpoint in the comparison branch
+supersedes `acb9cd1` and `9f66fbe`.
 
-Remaining comparison work includes closing the new independent provenance/scoring
-findings, checking observed effort for both harnesses, qualifying the full milestone,
-final toolkit tests and sensitivity proof,
-and actual launch qualification before any candidates. A real conductor with
-fake Herdr is useful plumbing evidence but cannot establish that model commands
-use the pinned CLI. Candidate traces must prove that separately. Do not change
-global aliases, permissions or installed Docket to make the experiment launch.
+Remaining work is the blinded candidate runs and sanitized aggregate report,
+then final installed-copy sync. Follow the reviewed protocol and generated
+schedule. Do not change global aliases, permissions or installed Docket to launch
+an experiment.
 The fake-Herdr qualification proved the pinned conductor adopts already idle
 agents only by its exact path-derived name and harness kind, without reading
 launch flags. Each role needs its own pane with `DOCKET_RUN`, `DOCKET_ROLE` and
@@ -123,8 +120,9 @@ bare command examples inside the decision are rewritten by the pinned renderer.
 Three startup/obligation commands outside the contract remain bare, so the first
 live case must prove compliance through actual tool calls. Codex can record these
 as `custom_tool_call` wrapping `functions.exec`, not only `function_call`.
-The clean conductor PATH needs the real Node/npm directory for milestone checks
-and a separate Herdr shim, without introducing installed Docket. Keep capture off
+The clean conductor PATH needs the real Node/npm directory and a separate shim
+for Herdr and uv. The milestone alone unsets `DOCKET_SESSION_CAPTURE` and puts
+its own pinned `tools/bin` first, preserving every completion check and limit. Keep capture off
 and use absolute `conduct`, not `launch`.
 
 Keep the fixed `fe58b1a` treatment source and mandatory repository completion
