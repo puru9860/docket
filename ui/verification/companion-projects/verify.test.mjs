@@ -29,9 +29,14 @@ async function invoke(evidence, args = [], env = process.env) {
   }
 }
 const json = async (dir, name) => JSON.parse(await readFile(path.join(dir, name), 'utf8'));
-async function retainedProof(dir, screenshot, removal = false) {
+// Docket refuses a passing run when any manifest-required evidence file is absent.
+async function missingFor(manifest, dir) {
+  const present = new Set(await readdir(dir));
+  return (await json(path.dirname(helper), manifest)).evidence.filter(name => !present.has(name));
+}
+async function retainedProof(dir, screenshot, receipt = null) {
   const expected = screenshot ? ['doctor.json', 'journey.png', 'result.json'] : ['doctor.json', 'result.json'];
-  if (removal) expected.push('removal-proof.json');
+  if (receipt) expected.push(receipt);
   assert.deepEqual((await readdir(dir)).sort(), expected.sort());
   const doctor = await json(dir, 'doctor.json'), result = await json(dir, 'result.json');
   assert.equal(doctor.invocation, result.invocation);
@@ -58,7 +63,9 @@ async function retainedProof(dir, screenshot, removal = false) {
 
 test('manifest names only present, explicit recipe inputs and required proof', async () => {
   const base = path.dirname(helper), manifest = await json(base, 'recipe.json');
-  assert.deepEqual(manifest, { version: 1, name: 'companion-projects', instructions: 'recipe.md', helpers: ['verify.mjs'], evidence: ['doctor.json', 'result.json', 'journey.png'] });
+  assert.deepEqual(manifest, { version: 1, name: 'companion-projects', instructions: 'recipe.md', helpers: ['verify.mjs'],
+    evidence: ['doctor.json', 'result.json', 'journey.png', 'add-proof.json'] });
+  assert.ok(!manifest.evidence.includes('removal-proof.json'));
   for (const file of [manifest.instructions, ...manifest.helpers]) {
     assert.equal((await lstat(path.join(base, file))).isFile(), true);
     assert.equal((await lstat(path.join(base, file))).isSymbolicLink(), false);
@@ -73,7 +80,7 @@ test('real browser add persists through a new companion process and fresh browse
   const run = await invoke(evidence, [], { ...process.env, XDG_STATE_HOME: unrelated, XDG_CONFIG_HOME: unrelated,
     HERDR_SOCKET_PATH: path.join(unrelated, 'never-connect.sock'), DOCKET_RUN: 'never-use-inherited-run' });
   assert.equal(run.code, 0, run.stdout + run.stderr);
-  const { doctor, result } = await retainedProof(evidence, true);
+  const { doctor, result } = await retainedProof(evidence, true, 'add-proof.json');
   assert.equal(result.status, 'passed');
   assert.equal(result.scenario, 'add-projects');
   assert.equal(doctor.scenario, 'add-projects');
@@ -94,6 +101,14 @@ test('real browser add persists through a new companion process and fresh browse
   assert.match(doctor.runtime.python, /^3\./);
   assert.equal(await readFile(path.join(unrelated, 'projects.json'), 'utf8'), canary);
   assert.deepEqual(await readdir(unrelated), ['projects.json'], 'inherited unrelated state remains untouched');
+  const proof = await json(evidence, 'add-proof.json');
+  assert.deepEqual(proof, { version: 1, invocation: result.invocation, scenario: 'add-projects', status: 'passed',
+    restart: result.restart_observation, cleanup: { servers_stopped: true, sandbox_removed: true } });
+  assert.equal(result.add_proof, 'add-proof.json');
+  assert.equal(result.removal_proof, undefined);
+  assert.deepEqual(await missingFor('recipe.json', evidence), []);
+  assert.deepEqual(await missingFor('removal.json', evidence), ['removal-proof.json'],
+    'a successful add journey must not satisfy the removal manifest');
 });
 
 test('controlled persistence loss is a failure after real save/restart, with failure screenshot and complete cleanup', { timeout: 100000 }, async t => {
@@ -174,7 +189,8 @@ test('core-shaped checkout/.docket evidence accepts a real positive journey and 
   const evidence = path.join(invocationRoot, '.recipe-evidence', 'T01', 'invocation');
   const run = await invoke(evidence);
   assert.equal(run.code, 0, run.stdout + run.stderr);
-  const { result } = await retainedProof(evidence, true);
+  const { result } = await retainedProof(evidence, true, 'add-proof.json');
+  assert.equal((await json(evidence, 'add-proof.json')).invocation, result.invocation);
   assert.equal(result.status, 'passed');
   assert.equal(result.cleanup.sandbox_removed, true);
   assert.equal(result.restart_observation.fresh_browser_context, true);
@@ -192,6 +208,7 @@ test('removal manifest declares its own instructions and the same explicit helpe
   assert.deepEqual(manifest, { version: 1, name: 'companion-project-removal', instructions: 'removal.md',
     helpers: ['verify.mjs'], evidence: ['doctor.json', 'result.json', 'journey.png', 'removal-proof.json'] });
   assert.ok(!(await json(base, 'recipe.json')).evidence.includes('removal-proof.json'));
+  assert.ok(!manifest.evidence.includes('add-proof.json'));
   for (const file of [manifest.instructions, ...manifest.helpers]) {
     assert.equal((await lstat(path.join(base, file))).isFile(), true);
     assert.equal((await lstat(path.join(base, file))).isSymbolicLink(), false);
@@ -202,7 +219,7 @@ test('real browser removal survives restart, retained project stays usable, and 
   const evidence = path.join(await temporary(t), 'proof');
   const run = await invoke(evidence, ['--scenario', 'remove-projects']);
   assert.equal(run.code, 0, run.stdout + run.stderr);
-  const { doctor, result } = await retainedProof(evidence, true, true);
+  const { doctor, result } = await retainedProof(evidence, true, 'removal-proof.json');
   assert.equal(result.status, 'passed');
   assert.equal(result.scenario, 'remove-projects');
   assert.equal(doctor.scenario, 'remove-projects');
@@ -240,6 +257,11 @@ test('real browser removal survives restart, retained project stays usable, and 
   assert.deepEqual(proof.readd.listed, ['startup', 'retained', 'removed']);
   assert.equal(proof.startup_removal.server.status, 400);
   assert.deepEqual(proof.cleanup, { servers_stopped: true, sandbox_removed: true });
+  assert.equal(result.removal_proof, 'removal-proof.json');
+  assert.equal(result.add_proof, undefined);
+  assert.deepEqual(await missingFor('removal.json', evidence), []);
+  assert.deepEqual(await missingFor('recipe.json', evidence), ['add-proof.json'],
+    'a successful removal journey must not satisfy the add manifest');
 });
 
 test('controlled restored membership fails at removal read-back with private retained proof and cleanup', { timeout: 100000 }, async t => {

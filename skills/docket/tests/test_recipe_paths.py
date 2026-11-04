@@ -182,6 +182,19 @@ class RecipePaths(unittest.TestCase):
         self.assertEqual("body\n", body)
         self.assertEqual((meta, body), self.mod.parse(self.mod.render(meta, body)))
 
+    def test_codec_keeps_string_delimiters_but_backslash_paths_remain_refused(self):
+        run = self.init()
+        for reference in ('recipes/end slash\\', 'recipes/quoted "path" \\'):
+            with self.subTest(reference=reference):
+                encoded = self.mod.encode_recipe_reference(reference)
+                task = self.mod.render({self.mod.RECIPE_KEY: encoded}, "")
+                self.assertEqual(reference, self.mod.recipe_reference(task))
+                refused = self.cli("assign", run.name, "T01", "--as", "planner",
+                                   "--goal", "Invalid path.", "--criterion", CRITERION,
+                                   "--verify", "true", "--recipe", reference, ok=False)
+                self.assertNotEqual(0, refused.returncode)
+                self.assertFalse((run / "T01-task.mdx").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

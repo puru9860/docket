@@ -19,6 +19,14 @@ Assign focused per-task verification; reserve the full suite for the milestone c
 A task verify should contain only its focused tests, never a full suite chained after them.
 Focused verify commands differ by task; the full suite runs once per milestone through `docket batch --verify`.
 Name real-system boundary observations when mocks cannot prove a criterion.
+For relevant refactor-equivalence or performance work, select guidance through
+`--decision` (plan `decision`), for example:
+
+```text
+Work type: refactor-equivalence. Follow `docket help task-methods` (refactor-equivalence).
+```
+
+Methods never change acceptance or authorize behavior changes. Do not select them by default.
 
 ## Apply the complete plan
 

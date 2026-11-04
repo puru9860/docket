@@ -1,6 +1,6 @@
 # Pstack adoption and continuation plan
 
-Updated 2026-11-03. Working branch: `audit-3-fixes`.
+Updated 2026-11-04. Working branch: `audit-3-fixes`.
 
 **Resumed by the user on 2026-11-03.** The existing disjoint Opus and Sol
 lanes are active again. Read [the continuation handoff](pstack-resume-handoff.md)
@@ -53,13 +53,13 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | ID | Work | State | Main owner |
 | --- | --- | --- | --- |
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
-| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; combined suite 814 passed, then 7 focused tests passed after final guidance refinements | Sol, Opus/coordinator review |
+| M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; final combined suite 823 passed | Sol, Opus/coordinator review |
 | M2 | Broader recipe coverage and maintained feature map | Implemented and reviewed; 13 browser tests and real positive/wrong-scenario core integration passed | Sol implementation, Opus/coordinator boundary review |
-| M3 | Blinded recipe-only comparison with fixed model assignments | Preparation tested; correcting coverage mismatch before any candidate launch | Opus design/candidates, Sol bounded adjudication |
-| M4 | Focused refactor-equivalence and performance guidance | Small explicit work-type selection, when the relevant task needs it | Opus design, Sol mechanical integration |
-| M5 | Native group discussions | Integrated and regression-tested; live three-party pilot in progress | Opus, coordinator review |
-| M6 | Optional PR/CI babysitting | Assess existing tools, then implement a bounded deterministic adapter if useful | Opus |
-| M7 | Independent early oracle checks | Separate risk-triggered trial; retain three roles and final independent review | Opus |
+| M3 | Blinded recipe-only comparison with fixed model assignments | Covered/adjacent tasks sensitivity-tested; independent tooling review fixes in progress before candidates | Opus design/candidates, Sol bounded adjudication |
+| M4 | Focused refactor-equivalence and performance guidance | Implemented and reviewed; 8 focused tests and final combined suite passed | Opus design, Sol mechanical integration |
+| M5 | Native group discussions | Integrated and regression-tested; direct three-party pilot concluded unanimously with manual delivery | Opus, coordinator review |
+| M6 | Optional PR/CI babysitting | Assessed and deferred until concrete forge/CI waiting friction exists | Opus assessment, G05 advice |
+| M7 | Independent early oracle checks | Assessed and deferred pending material residual need after M0/M1 use | Opus assessment, G05 advice |
 | M8 | Final review, installed-copy sync, commits, push, portable handoff | After corresponding checks and approvals | Coordinator |
 
 M5-M7 were deliberately deferred in the initial consultation. Continuous work
@@ -100,12 +100,18 @@ stays absent across a real restart, retained membership remains usable, and
 re-addition survives another restart. It observes the starting project's server
 refusal and preserves unrelated state. A removal-only passing proof file prevents
 the default Add journey from accidentally satisfying the removal manifest.
+Each current manifest requires its own passing receipt (`add-proof.json` or
+`removal-proof.json`), so neither successful scenario can stand in for the other.
+This identifies the scenario, not the correctness of its expected outcomes.
 The named injected regression and unavailable-browser cases remain non-success.
 All 13 explicit browser tests passed, as did 43 UI Python and 104 UI Node tests.
 Real core preflight/submission froze all four required outputs in an intact
 bundle with distinct proof directories; a default Add verification against the
 removal manifest refused submission without changing the report or publishing a
 bundle. That integration fixture is documents-only, not a Git-freeze claim.
+Both current scenarios were separately preflighted, submitted and frozen with
+four outputs, and both wrong-scenario directions refused with unchanged reports
+and no bundle. M3 keeps the original three-output Add manifest at `fe58b1a`.
 
 ## M1 acceptance
 
@@ -181,6 +187,19 @@ For early oracle checks, justify any extra independent reviewer turn with a
 separate trial. A discovery probe is not a pre-dispatch review. Preserve final
 review independence and the existing objective/contract authority.
 
+Current assessment: this repository has no CI configuration or demonstrated
+PR-wait problem to justify a forge adapter. Revisit M6 when a managed project
+provides that evidence, beginning with read-only exact-head status, bounded
+retries and deduplicated wakes. Existing forge tools can serve occasional checks.
+
+For M7, Opus reviewed 20 required changes in five earlier rejected tasks and
+classified five as plausibly knowable from the pre-code scope. Every task also
+had post-implementation findings. This is a small selected retrospective and a
+judgment about possible early detection, not measured counterfactual savings.
+M0/M1 and observable criteria already target those pre-code categories. First
+measure the residual after use; an extra early turn needs its own high-risk trial
+and a separate final review session. Neither deferral is a permanent rejection.
+
 ## Validation, commits and home-PC continuation
 
 After each source milestone run focused checks, independent review and required
@@ -245,3 +264,22 @@ an active run. Keep local model launch configuration outside Git.
   boundary review. The scenario receipt, server refusal and atomic negative
   control were exercised; all 13 browser tests and UI unit tests passed. Real
   core freezing and wrong-scenario refusal passed before committing this step.
+- 2026-11-03: G05 concluded unanimously on the scoped M4 design and M6/M7
+  deferrals. Opus and Sol joined from distinct native Claude/Codex sessions,
+  exchanged attributed messages directly and each accepted exact proposal 3.
+  The coordinator used an explicit session because native ancestry was
+  unavailable. Delivery was manually initiated; installed automatic hook
+  integration is not claimed. Agreement is design advice, not coding approval.
+- 2026-11-04: Integrated explicit task methods and symmetric recipe receipts.
+  The planner example retains a runnable backticked help pointer and fits the
+  existing 8,000-character limit; the limit was not raised. All 823 CLI tests
+  passed after the final help-size correction. Against an actual archived
+  `bf3941c`, unselected implementor/reviewer prompt bytes and revisions were
+  identical. Eight task-method and eight path-codec tests pass; the codec also
+  preserves its own string delimiters while public backslash paths stay refused.
+  The 13 browser tests passed on the receipt changes, and real core integration
+  verified positive freezing and wrong-scenario refusal in both directions.
+- 2026-11-04: Independent M3 review found launch/provenance, frozen-tree grading,
+  infrastructure classification and scoring issues before any candidates ran.
+  Fixes remain in the isolated comparison lane. There are still no comparative
+  model outcomes, cost/quality claims or default promotion.

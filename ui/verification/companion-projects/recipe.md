@@ -96,6 +96,10 @@ or the failure state when a page exists. A prerequisite failure can have no
 screenshot and therefore cannot satisfy normal required proof. No prior output
 is reused. The helper writes private JSON/PNG files only into the requested empty
 evidence directory.
+`add-proof.json` is written only after a passing add scenario's cleanup.
+It repeats the invocation, scenario, restart observation, and cleanup outcome.
+The manifest requires it, so a passing removal run, which writes `removal-proof.json` instead, cannot satisfy this manifest.
+The receipt marks which journey passed; it is not an oracle for whether the behavior is right.
 
 On success and handled failure, close the owned browser, stop only the owned
 companion children (SIGTERM, then SIGKILL if needed), and remove private fixture,

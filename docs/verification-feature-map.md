@@ -33,14 +33,18 @@ node --test ui/verification/companion-projects/verify.test.mjs
 
 Docket's verify command instead passes `--evidence-dir
 "$DOCKET_RECIPE_EVIDENCE_DIR"`. Recipe selection and scenario flag are explicit and
-must match. The unchanged default manifest still selects add persistence. No new
+must match. The default manifest still selects add persistence. No new
 Docket field or inferred work type is involved.
 
 Read `doctor.json` for actual runtime/build identity and owned server readiness/
 exit, `result.json` for scenario, assertions, restart observations and cleanup,
-and `journey.png` for the settled final DOM. Removal additionally requires
-`removal-proof.json`, emitted only by that passing scenario after cleanup; a
-default Add run lacks this required file. JSON and PNG survive sandbox cleanup.
+and `journey.png` for the settled final DOM.
+Each manifest also requires a receipt that only its own passing scenario writes after cleanup.
+Add requires `add-proof.json`, and removal requires `removal-proof.json`.
+A successful journey of the other scenario therefore misses required proof in both directions.
+Failed and prerequisite-failed runs write neither receipt.
+The receipt binds the selected manifest to the scenario that ran; it is not a semantic oracle.
+JSON and PNG survive sandbox cleanup.
 For removal, the final screenshot follows re-add; the intermediate removal
 observation in result establishes absence at its own restart boundary. Startup is
 selected afresh on restart; last-selected persistence is not an expectation.

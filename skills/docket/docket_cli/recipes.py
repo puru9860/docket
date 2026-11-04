@@ -31,7 +31,8 @@ def encode_recipe_reference(reference: str) -> str:
     # parse() tracks quotes but deliberately does not interpret backslash escapes.
     # A literal \" inside a JSON string would end its quoted region there, exposing
     # a later whitespace-# as a comment. Unicode escapes contain no quote to toggle.
-    return json.dumps(reference, ensure_ascii=True).replace(r'\"', r'\u0022')
+    encoded = json.dumps(reference, ensure_ascii=True)
+    return '"' + encoded[1:-1].replace(r'\"', r'\u0022') + '"'
 
 
 def decode_recipe_reference(value: object) -> str:

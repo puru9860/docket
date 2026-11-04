@@ -73,7 +73,10 @@ ensure old evidence cannot be silently reused.
 ## Review the evidence
 
 The manifest declares `recipe.md`, `verify.mjs`, and required outputs
-`doctor.json`, `result.json`, `journey.png`. Read the
+`doctor.json`, `result.json`, `journey.png`, `add-proof.json`.
+`add-proof.json` is written only by a passing add scenario after cleanup.
+The M3 comparison stays pinned at fe58b1a, whose historical manifest requires only the first three outputs.
+Read the
 [full recipe](../ui/verification/companion-projects/recipe.md) for startup,
 prerequisites, interaction, expected effects, cleanup and exit semantics.
 Doctor records actual build/runtime identity and owned server readiness/exit;
@@ -139,9 +142,10 @@ other saved bytes, entry order and mode by atomic rename. Result records fixture
 validity and pre/post hashes. It must exit 1/`REMOVAL_NOT_PERSISTED` at removal
 read-back, retaining failed proof. Prerequisite failures remain exit 2, never
 skip/pass. Both scenarios share the doctor/result/screenshot contract and owned
-cleanup. The removal manifest also requires `removal-proof.json`, emitted only by
-a passing removal scenario after cleanup, so a default Add invocation cannot
-satisfy that manifest. Scenario/control pair errors are rejected before evidence
+cleanup.
+Each manifest also requires its own scenario receipt, written only after that scenario passes and cleans up.
+Removal requires `removal-proof.json` and add requires `add-proof.json`, so neither successful journey satisfies the other manifest.
+Scenario/control pair errors are rejected before evidence
 creation. Removal of terminal bindings is unobserved because fixtures have none.
 For removal, inspect the intermediate absence observation in result;
 the final screenshot intentionally follows re-add.

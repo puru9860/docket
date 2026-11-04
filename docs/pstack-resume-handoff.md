@@ -13,15 +13,14 @@ worktrees, commits and pushes remain authorized. The working branch is
 - The continuation checkpoint containing this file integrates M1 reasoning
   guidance, the recipe-path fix and native opt-in group discussions.
 
-The combined CLI suite passed 814 tests. The earlier attempt exposed duplicate
-mandatory reviewer prose exceeding the existing 6000-character limit. That was
-fixed by sharing runtime reasoning and limiting correction advice to relevant
-reviews, with no raised limit. Independent Opus review subsequently tightened
-probe isolation and restricted correction advice to changes-requested decisions;
-all 7 guidance tests passed after those final refinements. Run the final combined
-suite after the next source milestone before final completion.
+The final combined CLI suite passed 823 tests on 2026-11-04. Existing size
+limits caught duplicate reviewer guidance and an oversized planner example;
+both were corrected without raising a limit. Final reviewer guidance isolates
+correction probes and applies correction advice only to changes-requested
+work. Unselected implementor/reviewer prompt bytes and revisions match an actual
+archived `bf3941c`. Eight task-method and eight recipe-path tests pass.
 
-The recipe-path fix has 7 passing integration tests: real assign, plan, prompt,
+The recipe-path fix has 8 passing integration tests: real assign, plan, prompt,
 submit, bundle and qualified-root behavior with spaces, hashes and quotes. The
 field alone uses a JSON string codec; ordinary references and global flat
 frontmatter behavior retain their existing bytes. Old truncated fields cannot
@@ -34,7 +33,7 @@ user pause, honest caps and retry-safe generation replacement. Both interrupted
 replacement and withdrawal-at-cap wake regressions were reproduced before their
 fixes. See [the design](group-discussion-design.md). G05 is the real three-party
 pilot, with manually initiated delivery until the installed copy is synced.
-Its conclusion is design advice, never coding approval or a passing test.
+Its unanimous conclusion is design advice, never coding approval or a passing test.
 
 M0's existing checks passed 789 CLI tests, 43 UI Python tests, 104 UI Node tests,
 and 8 explicit browser tests. Real preflight/submission used distinct proof
@@ -42,36 +41,41 @@ folders and froze an intact doctor/result/screenshot bundle. That integration
 fixture used documents-only evidence; Git freezing, multi-root, drift and tamper
 cases are covered by the CLI suite. No comparative cost/quality gain is claimed.
 
-## Active disjoint work
+## Completed methods and remaining comparison work
 
-M2: Sol is extending the companion helper with an explicit removal scenario and
-separate manifest. The real browser must remove a project, restart a distinct
-server with a fresh context, preserve other projects, and permit re-addition.
-Independent review requires a scenario-specific proof filename so the default
-Add journey cannot accidentally satisfy the removal contract, a named injected
-failure, actual startup-removal refusal, private cleanup, and an honest feature
-map. Source is not approved merely because an early positive run succeeded.
+M2 is complete and independently reviewed. The real browser removes a project,
+restarts a distinct server with a fresh context, preserves other projects, and
+permits re-addition. Each current scenario has its own required passing receipt:
+`add-proof.json` or `removal-proof.json`, in addition to doctor/result/screenshot.
+All 13 focused browser tests passed. Real core preflight/submission froze four
+outputs for each scenario, while both wrong-scenario directions refused with
+unchanged reports and no bundle. Startup removal is refused by the actual
+server; the controlled failure is atomic and preserves other state. See the
+maintained feature map. Terminal-binding invalidation remains unobserved.
 
 M3: Opus is preparing the narrow blinded procedure on `pstack-recipe-comparison`.
 Its WIP preservation checkpoint is `9f66fbe`; it is not the latest reviewed code.
 Preparation and sensitivity tests ran, but no model candidates have run.
 The first two seeds escaped the original Add-project helper because they concern
-adjacent behavior. Before launches, replace one with a covered server-main
-saved-list wiring defect. Independently prove reference/alternate repairs pass,
-the seed escapes existing tests, and the original helper fails for the intended
-persistence outcome. Keep one adjacent task and label its applicability honestly.
+adjacent behavior. One task now covers server shutdown deleting the saved list, while the other
+remains adjacent removal behavior. Sensitivity tests prove reference/alternate repairs pass,
+the seeds escape existing tests, and the original helper catches the covered
+persistence failure while passing on the adjacent seed. Independent review found
+additional provenance/launch, frozen-tree grading and scoring issues; the
+isolated lane is fixing those before any candidates. Use the final reviewed
+protocol, not a draft launch procedure. Keep applicability limits explicit.
 Pin `fe58b1a` and identical Opus implementor/Sol reviewer assignments in both arms;
 exclude M1 and M2 to isolate the first treatment. Freeze source/tasks/checks/rubric
 before candidates, keep private mapping/checks outside candidate directories,
 and require actual independent approvals and measured identity/usage. Unknown
 telemetry remains unknown. Two pairs permit directional opt-in findings only.
 
-M4: Opus recommends an explicit existing `--decision` / plan-task `decision`
-selection plus `docket help task-methods` for refactor-equivalence/performance.
-There is no `--constraint` flag. Preserve acceptance, historical compatibility,
-mandatory contract rendering and final review; do not add automatic inference,
-extra roles/turns or a new schema just to load guidance. Sol's implementation
-follows the group design discussion and coordinator review.
+M4 is implemented. Use an explicit existing `--decision` / plan-task `decision`
+selection and `docket help task-methods` for refactor-equivalence/performance.
+There is no `--constraint` flag or automatic work-type parser. Guidance preserves
+acceptance, historical compatibility, mandatory contract rendering and final
+review, with no new schema, roles or routine model turns. The selected command
+uses backticks so an absent PATH entry can fall back to the absolute launcher.
 
 M6/M7: Opus recommends deferring forge babysitting and extra early-oracle turns.
 There is no current CI/PR waiting problem in this repository. An early-review

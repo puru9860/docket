@@ -37,7 +37,7 @@ from .profiles import (
 from .freeze import current_bundle
 from .sessions import opencode_default_model
 from .gate import task_intent_problems
-from .playbooks import cmd_help, contract_path, load_contract, read_contract
+from .playbooks import SHARED_HELP_TOPICS, cmd_help, contract_path, load_contract, read_contract
 
 
 PROMPT_STAGES = ("initial", "correction", "resume", "verification", "review")
@@ -50,7 +50,7 @@ def cmd_role_help(a: argparse.Namespace) -> None:
         return
     if not a.run or not a.owner:
         die("active guidance needs both --run RUN and --owner TASK (or orch)")
-    if a.role in ("signalling", "discussion"):
+    if a.role in SHARED_HELP_TOPICS:
         die(f"{a.role} help is shared across presets; use `docket help {a.role}`")
     prompt, _ = compose_prompt(need_run(a.run), a.run, a.owner, a.role)
     print(prompt, end="" if prompt.endswith("\n") else "\n")

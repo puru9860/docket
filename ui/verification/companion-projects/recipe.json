@@ -3,5 +3,5 @@
   "name": "companion-projects",
   "instructions": "recipe.md",
   "helpers": ["verify.mjs"],
-  "evidence": ["doctor.json", "result.json", "journey.png"]
+  "evidence": ["doctor.json", "result.json", "journey.png", "add-proof.json"]
 }

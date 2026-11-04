@@ -405,15 +405,17 @@ async function run(values, evidenceDir) {
     result.cleanup.errors = errors;
     if (errors.length) { result.status = 'failed'; result.error = { code: 'CLEANUP_FAILED', message: errors.join('; ') }; }
     result.finished_at = new Date().toISOString();
-    if (values.scenario === 'remove-projects' && result.status === 'passed') {
-      // Required only by removal.json. A successful default add run cannot
-      // satisfy the removal manifest accidentally using its generic proof files.
-      result.removal_proof = 'removal-proof.json';
-      await writeFile(path.join(evidenceDir, result.removal_proof), `${JSON.stringify({
-        version: 1, invocation, scenario: values.scenario, status: result.status,
-        removal: result.removal_restart_observation, readd: result.readd_restart_observation,
-        startup_removal: result.checks.find(check => check.name === 'starting-project-protected').observation,
-        cleanup: { servers_stopped: result.cleanup.servers_stopped, sandbox_removed: result.cleanup.sandbox_removed }
+    if (result.status === 'passed') {
+      // Each manifest requires the receipt only its own passing scenario writes,
+      // so neither successful journey can satisfy the other manifest's proof.
+      const cleanup = { servers_stopped: result.cleanup.servers_stopped, sandbox_removed: result.cleanup.sandbox_removed };
+      const [field, receipt] = values.scenario === 'remove-projects'
+        ? ['removal_proof', { removal: result.removal_restart_observation, readd: result.readd_restart_observation,
+          startup_removal: result.checks.find(check => check.name === 'starting-project-protected').observation }]
+        : ['add_proof', { restart: result.restart_observation }];
+      result[field] = values.scenario === 'remove-projects' ? 'removal-proof.json' : 'add-proof.json';
+      await writeFile(path.join(evidenceDir, result[field]), `${JSON.stringify({
+        version: 1, invocation, scenario: values.scenario, status: result.status, ...receipt, cleanup
       }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     }
     // Do not retain the private launch URL, token, environment, or child logs.
