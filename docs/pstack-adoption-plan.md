@@ -2,14 +2,15 @@
 
 Updated 2026-11-04. Working branch: `audit-3-fixes`.
 
-**Resumed by the user on 2026-11-03.** The existing disjoint Opus and Sol
-lanes are active again. Read [the continuation handoff](pstack-resume-handoff.md)
+**Paused by the user on 2026-11-04.** All agent lanes are idle. Wait for an
+explicit continue before restarting implementation or comparison candidates. Read [the continuation handoff](pstack-resume-handoff.md)
 for saved WIP branches, validation state and home-PC instructions.
 
 The user authorized continuous implementation, Opus 5.5 for heavy design and
 implementation, Sol for lighter work, and committing and pushing the plan and
-tested milestones so work can continue from a home PC. Do not stop at a plan or
-ask again for routine implementation, review, commits, or pushes within this scope.
+tested milestones so work can continue from a home PC. That authorization remains available after the explicit pause is lifted.
+Do not ask again for routine implementation, review, commits, or pushes within
+this scope.
 
 ## Product direction and constraints
 
@@ -55,7 +56,7 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
 | M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; final combined suite 823 passed | Sol, Opus/coordinator review |
 | M2 | Broader recipe coverage and maintained feature map | Implemented and reviewed; 13 browser tests and real positive/wrong-scenario core integration passed | Sol implementation, Opus/coordinator boundary review |
-| M3 | Blinded recipe-only comparison with fixed model assignments | Covered/adjacent tasks sensitivity-tested; independent tooling review fixes in progress before candidates | Opus design/candidates, Sol bounded adjudication |
+| M3 | Blinded recipe-only comparison with fixed model assignments | Paused WIP acb9cd1; final review-fix verification interrupted, no candidates launched | Opus design/candidates, Sol bounded adjudication |
 | M4 | Focused refactor-equivalence and performance guidance | Implemented and reviewed; 8 focused tests and final combined suite passed | Opus design, Sol mechanical integration |
 | M5 | Native group discussions | Integrated and regression-tested; direct three-party pilot concluded unanimously with manual delivery | Opus, coordinator review |
 | M6 | Optional PR/CI babysitting | Assessed and deferred until concrete forge/CI waiting friction exists | Opus assessment, G05 advice |

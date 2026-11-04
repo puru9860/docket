@@ -1,9 +1,16 @@
 # Pstack continuation handoff
 
-The user resumed on 2026-11-03 around 21:55 Nepal time after the earlier graceful
-pause. Continuous implementation, heavy Opus/light Sol routing, disjoint
-worktrees, commits and pushes remain authorized. The working branch is
-`audit-3-fixes`; read [the adoption plan](pstack-adoption-plan.md) for scope.
+**Paused at the user's request on 2026-11-04.** All three visible agents are
+idle and the comparison test/proof processes have stopped. Wait for an explicit
+continue before resuming work. No comparison candidates have been launched.
+The working branch is `audit-3-fixes`; read
+[the adoption plan](pstack-adoption-plan.md) for scope.
+
+Verified implementation is pushed through `b1a6fbe`. The comparison lane is
+preserved separately at `acb9cd1` on `pstack-recipe-comparison`; its latest
+review fixes are WIP. Its final test/proof run was interrupted at this pause,
+so do not treat the latest draft as validated. The installed skill remains
+unchanged.
 
 ## Source and validation
 
@@ -54,7 +61,8 @@ server; the controlled failure is atomic and preserves other state. See the
 maintained feature map. Terminal-binding invalidation remains unobserved.
 
 M3: Opus is preparing the narrow blinded procedure on `pstack-recipe-comparison`.
-Its WIP preservation checkpoint is `9f66fbe`; it is not the latest reviewed code.
+Its current WIP preservation checkpoint is `acb9cd1`, including the latest
+review fixes. Review and rerun verification before integration or candidates.
 Preparation and sensitivity tests ran, but no model candidates have run.
 The first two seeds escaped the original Add-project helper because they concern
 adjacent behavior. One task now covers server shutdown deleting the saved list, while the other
@@ -62,7 +70,7 @@ remains adjacent removal behavior. Sensitivity tests prove reference/alternate r
 the seeds escape existing tests, and the original helper catches the covered
 persistence failure while passing on the adjacent seed. Independent review found
 additional provenance/launch, frozen-tree grading and scoring issues; the
-isolated lane is fixing those before any candidates. Use the final reviewed
+isolated lane has draft fixes awaiting final review and verification before any candidates. Use the final reviewed
 protocol, not a draft launch procedure. Keep applicability limits explicit.
 Pin `fe58b1a` and identical Opus implementor/Sol reviewer assignments in both arms;
 exclude M1 and M2 to isolate the first treatment. Freeze source/tasks/checks/rubric
@@ -86,6 +94,38 @@ rejection. Revisit on concrete forge friction or material residual oracle errors
 after the discovery/recipe guidance has been used.
 
 ## Continue from another machine
+
+Resume only after the user explicitly continues. On this machine, untracked
+`docs/recipe-comparison-protocol.md` and `tools/` in the main checkout contain an
+older comparison integration that passed 40 tests, not the latest paused draft.
+Do not stage those stale copies as the current comparison implementation.
+The authoritative draft is the `pstack-recipe-comparison` branch at `acb9cd1`.
+Preserve unrelated files when replacing the older integration on resume.
+
+Remaining comparison work includes independent review of the launch/provenance,
+frozen-tree grading and scoring fixes, final toolkit tests and sensitivity proof,
+and actual launch qualification before any candidates. A real conductor with
+fake Herdr is useful plumbing evidence but cannot establish that model commands
+use the pinned CLI. Candidate traces must prove that separately. Do not change
+global aliases, permissions or installed Docket to make the experiment launch.
+The fake-Herdr qualification proved the pinned conductor adopts already idle
+agents only by its exact path-derived name and harness kind, without reading
+launch flags. Each role needs its own pane with `DOCKET_RUN`, `DOCKET_ROLE` and
+`DOCKET_SESSION` equal to that expected agent name. Set the mandatory decision
+to: "Run every Docket command through `<launcher>`, including the startup and
+obligation commands above that name docket without a path; never invoke docket
+by bare name." Assert that this wording survives rendering verbatim; quoted
+bare command examples inside the decision are rewritten by the pinned renderer.
+Three startup/obligation commands outside the contract remain bare, so the first
+live case must prove compliance through actual tool calls. Codex can record these
+as `custom_tool_call` wrapping `functions.exec`, not only `function_call`.
+The clean conductor PATH needs the real Node/npm directory for milestone checks
+and a separate Herdr shim, without introducing installed Docket. Keep capture off
+and use absolute `conduct`, not `launch`.
+
+Keep the fixed `fe58b1a` treatment source and mandatory repository completion
+checks identical in both arms. Docket usage alone is a lower bound; full fresh
+role telemetry and actual model identity remain required for cost claims.
 
 Fetch origin, switch to `audit-3-fixes`, and fast-forward only. Read this file,
 `docs/pstack-adoption-plan.md`, `AGENTS.md` and `ARCHITECTURE.md` in a fresh
