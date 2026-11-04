@@ -2,16 +2,26 @@
   "version": 1,
   "id": "removal-persists",
   "title": "Removed companion projects come back after restart",
-  "brief": "In the Docket companion UI (`ui/`), removing a project with \"Remove from list\" in the project menu works until the companion is restarted; after a restart the removed project is listed again.\n\nExpected behavior: a removed project stays out of the list across companion restarts, while every other saved project, including projects added after the removal, is still listed. Adding a removed project again works and persists. The starting project still cannot be removed. Keep the saved-list format and its private file permissions.\n\nHow to run it: `cd ui && npm start -- --workspace /absolute/project` starts the companion and prints a private local URL.\nThe project list is saved to `$XDG_STATE_HOME/docket-ui/projects.json` (default `~/.local/state/docket-ui/projects.json`).\nUse a private `XDG_STATE_HOME` and disposable projects for any manual check rather than your real companion state.\nPrerequisites are Node.js 22+, Python 3.11+ as `python3`, and the companion's npm dependencies (`cd ui && npm ci`).\n`cd ui && npm test` runs the companion's unit tests.\n",
+  "objective": "A project removed from the companion's project list stays removed across companion restarts, and every other saved project is kept.",
+  "goal": "Removing a project with \"Remove from list\" in the companion's project menu works until the companion restarts; after a restart the removed project is listed again. Make a removal persist across restarts while every other saved project, including one added after the removal, stays listed.",
   "criteria": [
     "A project removed from the list is not listed after a companion restart.",
-    "Every other saved project, including one added again after removal, is still listed after a restart.",
-    "The starting project cannot be removed, and the saved list keeps its format and private permissions."
+    "Every other saved project, including one added again after its removal, is still listed after a restart.",
+    "The starting project still cannot be removed, and the saved list keeps its format and private file permissions."
+  ],
+  "out_of_scope": [
+    "Restoring the last selected project after a restart."
+  ],
+  "notes": [
+    "Start the companion with `cd ui && npm start -- --workspace /absolute/project --socket /absolute/private/dir/none.sock`; it prints a private local URL, and the private `--socket` path keeps a manual check away from any live Herdr server.",
+    "The project list is saved to `$XDG_STATE_HOME/docket-ui/projects.json` (default `~/.local/state/docket-ui/projects.json`); use a private `XDG_STATE_HOME` and disposable projects for any manual check, never real companion state.",
+    "Prerequisites: Node.js 22+ and Python 3.11+ as `python3`. The companion's npm dependencies are already installed in `ui/node_modules` and the machine may be offline, so do not reinstall, update or remove them."
   ],
   "files": [
     "ui/projects.mjs",
     "ui/tests/projects.test.mjs"
   ],
+  "recipe_covered": false,
   "seed": [
     {
       "path": "ui/projects.mjs",

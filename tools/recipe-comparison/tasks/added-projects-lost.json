@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "added-projects-lost",
+  "title": "Added companion projects are gone after the companion is stopped",
+  "objective": "Projects added to the companion's project list remain listed after the companion is stopped normally and started again.",
+  "goal": "Projects added with \"Add project\" stay listed while the companion runs, but after the companion is stopped normally (Ctrl-C or a stop signal) and started again, only the starting project is listed. Added projects must remain listed after a normal stop and restart.",
+  "criteria": [
+    "Projects added before a normal stop (SIGINT or SIGTERM) are listed after the companion starts again, and selecting one shows its own runs.",
+    "The saved list keeps its format and private permissions, and no temporary project-list file is left behind after a stop.",
+    "Projects without a .docket directory are still refused and never saved."
+  ],
+  "out_of_scope": [
+    "Restoring the last selected project after a restart."
+  ],
+  "notes": [
+    "Start the companion with `cd ui && npm start -- --workspace /absolute/project --socket /absolute/private/dir/none.sock`; it prints a private local URL, and the private `--socket` path keeps a manual check away from any live Herdr server.",
+    "The project list is saved to `$XDG_STATE_HOME/docket-ui/projects.json` (default `~/.local/state/docket-ui/projects.json`); use a private `XDG_STATE_HOME` and disposable projects for any manual check, never real companion state.",
+    "Prerequisites: Node.js 22+ and Python 3.11+ as `python3`. The companion's npm dependencies are already installed in `ui/node_modules` and the machine may be offline, so do not reinstall, update or remove them."
+  ],
+  "files": [
+    "ui/server.mjs",
+    "ui/projects.mjs",
+    "ui/tests/projects.test.mjs"
+  ],
+  "recipe_covered": true,
+  "seed": [
+    {
+      "path": "ui/server.mjs",
+      "old": "import { readFile, realpath } from 'node:fs/promises';\n",
+      "new": "import { readFile, readdir, realpath, rm } from 'node:fs/promises';\n"
+    },
+    {
+      "path": "ui/server.mjs",
+      "old": "    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {\n      await companion.close(); process.exit(0);\n    });\n",
+      "new": "    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {\n      await companion.close();\n      // Leave no temporary project-list files behind after an interrupted save.\n      const state = path.dirname(preferencesPath);\n      for (const name of await readdir(state).catch(() => [])) {\n        if (name.startsWith(path.basename(preferencesPath))) await rm(path.join(state, name), { force: true });\n      }\n      process.exit(0);\n    });\n"
+    }
+  ],
+  "alternate_fix": [
+    {
+      "path": "ui/server.mjs",
+      "old": "        if (name.startsWith(path.basename(preferencesPath))) await rm(",
+      "new": "        if (name.startsWith(`${path.basename(preferencesPath)}.`) && name.endsWith('.tmp')) await rm("
+    }
+  ]
+}

@@ -79,10 +79,10 @@ function harness(checkout, owned) {
     }
     throw new Error('companion printed no private URL within 15 seconds');
   }
-  async function stop(app) {
+  async function stop(app, signal = 'SIGTERM') {
     const { child } = app;
     if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGTERM');
+      child.kill(signal);
       for (let i = 0; i < 125 && child.exitCode === null && child.signalCode === null; i++) await delay(40);
       if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await delay(200); }
     }
@@ -105,8 +105,12 @@ function harness(checkout, owned) {
     const r = await call(app, '/api/projects/remove', { id: project.id });
     assert.equal(r.status, 200, `removing ${path.basename(dir)}: ${JSON.stringify(r.body)}`);
   }
-  // One restart: stop the running companion, start a distinct process on the same state.
-  async function restart(w, app, workspace) { await stop(app); return start(w, workspace); }
+  // One restart: stop the running companion normally, start a distinct process on the same state.
+  async function restart(w, app, workspace, signal = 'SIGTERM') {
+    await stop(app, signal);
+    assert.equal(app.child.exitCode, 0, `companion exits cleanly on ${signal}`);
+    return start(w, workspace);
+  }
   return { start, stop, call, listed, add, remove, restart };
 }
 
@@ -208,71 +212,80 @@ const TASKS = {
       return { refused_status: refused.status, listed };
     }]
   ],
-  // Every saved project survives a restart from any listed project.
-  'startup-switch': [
-    ['api-switch-startup', 'decisive', async ({ h, w }) => {
-      const [x, y, z] = [await w.project('xray'), await w.project('yankee'), await w.project('zulu')];
+  // Projects added before a normal stop are listed after the next start.
+  'added-projects-lost': [
+    ['browser-add-survives-restart', 'decisive', async ({ h, w, browser }) => {
+      const [s, a] = [await w.project('home'), await w.project('alpha')];
       const before = await treeDigest(w.projects);
-      let app = await h.start(w, x);
-      await h.add(app, y); await h.add(app, z);
-      app = await h.restart(w, app, y);
-      const fromY = membership(await h.listed(app), y, [x, z]);
-      app = await h.restart(w, app, z);
-      const fromZ = membership(await h.listed(app), z, [x, y]);
-      await h.stop(app);
-      await isolation(w, before);
-      return { from_yankee: fromY, from_zulu: fromZ };
-    }],
-    ['switch-then-save', 'decisive', async ({ h, w }) => {
-      const [x, y, z, v] = [await w.project('xray'), await w.project('yankee'), await w.project('zulu'), await w.project('victor')];
-      let app = await h.start(w, x);
-      await h.add(app, y); await h.add(app, z);
-      app = await h.restart(w, app, y);
-      await h.add(app, v);
-      app = await h.restart(w, app, x);
-      const listed = membership(await h.listed(app), x, [y, z, v]);
-      await h.stop(app);
-      return { listed };
-    }],
-    ['browser-switch-startup', 'decisive', async ({ h, w, browser }) => {
-      const [x, y] = [await w.project('xray'), await w.project('yankee')];
-      let app = await h.start(w, x);
+      let app = await h.start(w, s);
       let context = await browser.newContext();
       let page = await context.newPage(); page.setDefaultTimeout(10000);
       await page.goto(app.privateUrl);
-      await page.locator('#run-title').filter({ hasText: 'Project xray' }).waitFor();
-      await browserAdd(page, y);
+      await page.locator('#run-title').filter({ hasText: 'Project home' }).waitFor();
+      await browserAdd(page, a);
       await context.close();
-      app = await h.restart(w, app, y);
+      app = await h.restart(w, app, s);
       context = await browser.newContext();
       page = await context.newPage(); page.setDefaultTimeout(10000);
       await page.goto(app.privateUrl);
-      await page.locator('#run-title').filter({ hasText: 'Project yankee' }).waitFor();
+      await page.locator('#run-title').filter({ hasText: 'Project home' }).waitFor();
       const shown = await browserOptions(page);
-      assert.deepEqual(shown, ['yankee', 'xray'], `fresh browser after restarting from yankee lists ${shown.join(', ')}`);
-      await page.selectOption('#project-select', { label: 'xray' });
-      await page.locator('#run-title').filter({ hasText: 'Project xray' }).waitFor();
+      assert.deepEqual(shown, ['home', 'alpha'], `fresh browser after restart lists ${shown.join(', ')}`);
+      await page.selectOption('#project-select', { label: 'alpha' });
+      await page.locator('#run-title').filter({ hasText: 'Project alpha' }).waitFor();
       await context.close();
       await h.stop(app);
-      return { after_restart: shown, selected: 'xray' };
+      await isolation(w, before);
+      return { after_restart: shown, selected: 'alpha' };
     }],
-    ['same-startup-restart', 'regression', async ({ h, w }) => {
-      const [x, y] = [await w.project('xray'), await w.project('yankee')];
-      let app = await h.start(w, x);
-      await h.add(app, y);
-      app = await h.restart(w, app, x);
-      const listed = membership(await h.listed(app), x, [y]);
+    ['api-add-survives-interrupt-and-term', 'decisive', async ({ h, w }) => {
+      const [s, a, b, c] = [await w.project('home'), await w.project('alpha'), await w.project('bravo'), await w.project('charlie')];
+      let app = await h.start(w, s);
+      await h.add(app, a); await h.add(app, b);
+      app = await h.restart(w, app, s, 'SIGINT');
+      const afterInterrupt = membership(await h.listed(app), s, [a, b]);
+      await h.add(app, c);
+      app = await h.restart(w, app, s, 'SIGTERM');
+      const afterTerm = membership(await h.listed(app), s, [a, b, c]);
       await h.stop(app);
-      return { listed };
+      return { after_sigint: afterInterrupt, after_sigterm: afterTerm };
     }],
-    ['vanished-dropped', 'regression', async ({ h, w }) => {
-      const [x, y, z] = [await w.project('xray'), await w.project('yankee'), await w.project('zulu')];
-      let app = await h.start(w, x);
-      await h.add(app, y); await h.add(app, z);
+    ['saved-list-read-back-after-exit', 'decisive', async ({ h, w }) => {
+      const [s, a] = [await w.project('home'), await w.project('alpha')];
+      const app = await h.start(w, s);
+      await h.add(app, a);
+      // Separate the write (observed while running) from the read-back after the process exits.
+      const written = JSON.parse(await readFile(w.prefs, 'utf8')).projects;
+      assert.deepEqual([...written].sort(), [s, a].sort(), 'saved list written while the companion runs');
       await h.stop(app);
-      await rename(z, `${z}-moved`);
-      app = await h.start(w, x);
-      const listed = membership(await h.listed(app), x, [y]);
+      assert.equal(app.child.exitCode, 0, 'companion exits cleanly');
+      let saved;
+      try { saved = JSON.parse(await readFile(w.prefs, 'utf8')).projects; }
+      catch (error) { throw new Error(`saved list written while running (${names(written).join(', ')}) is missing after exit: ${error.code || error.message}`); }
+      assert.deepEqual([...saved].sort(), [s, a].sort(), 'saved list on disk after the process exited');
+      const leftovers = (await readdir(path.dirname(w.prefs))).filter(n => n.endsWith('.tmp'));
+      assert.deepEqual(leftovers, [], 'no temporary list file is left behind');
+      return { written_while_running: names(written), after_exit: names(saved) };
+    }],
+    ['invalid-project-never-saved', 'regression', async ({ h, w }) => {
+      const s = await w.project('home');
+      const bare = path.join(w.projects, 'plain');
+      await mkdir(bare, { recursive: true });
+      let app = await h.start(w, s);
+      const refused = await h.call(app, '/api/projects', { path: bare });
+      assert.equal(refused.status, 400, 'a directory without .docket is refused');
+      app = await h.restart(w, app, s);
+      const listed = membership(await h.listed(app), s, []);
+      await h.stop(app);
+      return { refused_status: refused.status, listed };
+    }],
+    ['remove-still-persists', 'regression', async ({ h, w }) => {
+      const [s, a, b] = [await w.project('home'), await w.project('alpha'), await w.project('bravo')];
+      let app = await h.start(w, s);
+      await h.add(app, a); await h.add(app, b);
+      await h.remove(app, a);
+      app = await h.restart(w, app, s);
+      const listed = membership(await h.listed(app), s, [b]);
       await h.stop(app);
       return { listed };
     }]
