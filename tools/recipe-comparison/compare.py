@@ -540,11 +540,13 @@ QUOTED = re.compile(r"""'[^']*'|"(?:[^"\\]|\\.)*"|\\.""", re.S)
 PUNCTUATION = ";&|()<>\n"
 
 
-def shell_tokens(script: str) -> list[tuple[str, bool]] | None:
-    """Words and operators of a script; None when its syntax is outside the supported subset.
+def shell_tokens(script: str) -> list[tuple[str, bool, str]] | None:
+    """Words, operators, and live text of a script; None when its syntax is outside the supported subset.
 
-    Tokenized twice: as written for word values, and with every quoted string and escape masked, so a
-    quoted "&&" stays a word. Only a token that is punctuation in the masked pass is an operator.
+    Tokenized three times: as written for word values; with every quoted string and escape masked, so a
+    quoted "&&" stays a word (only a token that is punctuation in that pass is an operator); and with only
+    single-quoted text and escapes masked, so a token's live text shows the substitutions the shell would
+    still perform inside double quotes but never inside single quotes.
     Comments are cut here because shlex would also swallow the newline that ends them, joining the
     next line's command to the commented one as its arguments.
     """
@@ -554,15 +556,17 @@ def shell_tokens(script: str) -> list[tuple[str, bool]] | None:
         return list(lexer)
 
     masked = QUOTED.sub(lambda m: m[0][0] + "Q" * (len(m[0]) - 2) + m[0][-1] if m[0][0] in "'\"" else "QQ", script)
+    live = QUOTED.sub(lambda m: m[0] if m[0][0] == '"' else "'" + "Q" * (len(m[0]) - 2) + "'" if m[0][0] == "'"
+                      else "QQ", script)
     for m in reversed(list(re.finditer(r"(?:^|(?<=[\s;&|()]))#[^\n]*", masked, re.M))):
-        script, masked = (text[:m.start()] + text[m.end():] for text in (script, masked))
+        script, masked, live = (text[:m.start()] + text[m.end():] for text in (script, masked, live))
     try:
-        words, shape = lex(script), lex(masked)
+        words, shape, lively = lex(script), lex(masked), lex(live)
     except ValueError:
         return None
-    if len(words) != len(shape):
+    if not len(words) == len(shape) == len(lively):
         return None
-    return [(word, bool(form) and set(form) <= set(PUNCTUATION)) for word, form in zip(words, shape)]
+    return [(word, bool(form) and set(form) <= set(PUNCTUATION), text) for word, form, text in zip(words, shape, lively)]
 
 
 def env_command(words: list[str]) -> list[str] | None:
@@ -703,16 +707,16 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
         out["ambiguous"] += mentioned
         return out
     script, docs = split
-    mentioned = mentioned or any(docket(t) for t, _ in tokens)
+    mentioned = mentioned or any(docket(t) for t, _, _ in tokens)
     segments, current, joins, odd, irregular = [], [], [], [], False
-    for token, operator in tokens:
+    for token, operator, live in tokens:
         if operator and token in SEPARATORS:
             segments.append(current)
             odd.append(irregular)
             joins.append(token)
             current, irregular = [], False
         else:
-            irregular = irregular or operator and token not in REDIRECTS or any(c in token for c in ("`", "$(", "<("))
+            irregular = irregular or operator and token not in REDIRECTS or any(c in live for c in ("`", "$(", "<("))
             current.append(token)
     segments.append(current)
     odd.append(irregular)
@@ -730,6 +734,9 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
         unplaced = odd[n]
         text = " ".join([*words, *(t for _, t in attached)])
         words = [w for w in words if not HEREDOC_WORD.fullmatch(w)]
+        # A brace group runs its commands in this shell, so its braces are transparent.
+        if words[:1] == ["{"] or words[:1] == ["}"] and not operands(words[1:]):
+            words = words[1:] if words[0] == "{" else []
         inert = [t for expands, t in attached if not (expands and ("$(" in t or "`" in t))]
         assignments = []
         while words and re.fullmatch(r"[A-Za-z_]\w*=.*", words[0], re.S):
@@ -760,14 +767,17 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                 indirect = indirect or "$" in word
             elif docket(word):
                 continues = True
+                runs = certain and not (FILE_REDIRECTS & set(words) or duplicated)
+                # The pinned path where it might not run either ran the pinned CLI or nothing: it cannot hide
+                # another CLI, so it is simply not credited. Any other path there might have run.
                 if word == "docket":
                     out["bare"] += 1
-                elif not certain or not word.startswith(("/", "~")) or FILE_REDIRECTS & set(words) or duplicated:
+                elif not word.startswith(("/", "~")):
                     out["ambiguous"] += 1
                 elif os.path.normpath(word) in pinned:
-                    out["pinned"] += 1
+                    out["pinned"] += runs
                 else:
-                    out["foreign"] += 1
+                    out["foreign" if runs else "ambiguous"] += 1
             elif base in INDIRECT and args and set(args) <= INFO_ONLY:
                 continues = True
             elif base in SHELL_BUILTINS and not (base == "command" and words[1:2] in (["-v"], ["-V"])):

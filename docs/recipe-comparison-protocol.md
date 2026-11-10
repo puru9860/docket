@@ -114,9 +114,11 @@ Execution evidence comes only from the explicitly supplied transcripts, and only
 - Stdin a model writes to a running process is not execution; starting an interactive shell or interpreter that could read commands from stdin is ambiguous.
 
 Each executed script is classified by a narrow recognizer, not a shell parser.
-It tokenizes twice, as written and with quoted strings and escapes masked, so a quoted `&&` is never an operator.
+It tokenizes three times: as written, with quoted strings and escapes masked so a quoted `&&` is never an operator, and with only single-quoted text masked so a substitution counts only where the shell would perform it.
 Comments are cut before tokenizing, so a comment never joins the next line's command to its own.
 A Docket execution counts as pinned or foreign only at a command position that certainly runs without a file redirection or an unusual descriptor duplication, after assignments and the supported `env` options (`-i`, `-u NAME`).
+The pinned path where it might not run is not credited and is not ambiguous, since it ran the pinned CLI or nothing; any other Docket path there is ambiguous.
+A brace group `{ ...; }` runs in the same shell, so its braces are transparent.
 That is the first command, one reached through `cd DIR &&`, or one after `;`, a newline or `&` when every earlier command cannot end the shell: a data command, a common file utility (`cp`, `mv`, `mkdir`, `rm`, `touch` and similar), a literal assignment to an ordinary variable, a `--version` or `--help` query, a child interpreter running a named file or a literal here-document, or Docket itself.
 Unsupported syntax (a substitution, subshell, control structure or unknown operator) is judged where it appears: its segment is ambiguous when it names Docket, and no later command is certain.
 A command built from a variable, `eval`, `source`, `exec`, or an interpreter inside unsupported syntax can run text from anywhere in the script, so the script is ambiguous whenever it names Docket.

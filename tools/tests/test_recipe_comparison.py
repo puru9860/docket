@@ -892,7 +892,7 @@ class ProvenanceTest(Temp):
     def test_shell_data_comments_and_unexecuted_branches_are_never_execution(self) -> None:
         for command, ambiguous in ((f'printf "%s\\n" "{self.LAUNCHER} status r"', 0), (f"true # {self.LAUNCHER} status r", 0),
                                    (f"cat {self.LAUNCHER}", 0), (f"if false; then {self.LAUNCHER} status r; fi", 1),
-                                   (f"false && {self.LAUNCHER} status r", 1), (f"cat <<EOF\n{self.LAUNCHER} status r\nEOF", 0),
+                                   (f"false && {self.LAUNCHER} status r", 0), (f"cat <<EOF\n{self.LAUNCHER} status r\nEOF", 0),
                                    (f'echo "{self.LAUNCHER} status r" | sh', 1), (f"x=$({self.LAUNCHER} status r)", 1),
                                    (f"mytool {self.LAUNCHER} status r", 1), ("../tools/docket/bin/docket status r", 1)):
             result = self.classify([codex_exec(command)])
@@ -938,6 +938,9 @@ class ProvenanceTest(Temp):
             f"node --test ui/x.test.mjs > out.txt 2>&1; echo $?; {L} status r": (1, 0, 0),
             f"{L} preflight r T01 2>&1 | tail -5; sed -n 150,185p ui/a.mjs; {F} status r": (1, 1, 0),
             f"(cd ui && npm test) > out 2>&1; true": (0, 0, 0),
+            f"F=r.mdx && {{ cat head.txt; cat <<'EOF'\nRan `{L} submit r T01`.\nEOF\n}} > $F; {L} submit r T01": (1, 0, 0),
+            f"sed -i 's/`a:150`/`a:152`/' r.mdx && grep -n x r.mdx; {L} status r": (1, 0, 0),
+            f"F=r.mdx && sed -i 's/a/b/' $F && grep -n x $F && {L} submit r T01 --check": (0, 0, 0),
             f"python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'status'])\nPY\n{L} status r": (1, 0, 0),
             f"cat <<A; {L} status r\nbody {F} status r\nA": (1, 0, 0),
             f"true # <<EOF\n{F} status r\nEOF": (0, 1, 0),
@@ -976,7 +979,7 @@ class ProvenanceTest(Temp):
             f"node - <<'EOF'\nrequire('child_process').execSync('{F} status r')\nEOF",
             f"python3 script.py <<'EOF'\n{L}\nEOF", f"python3 run.py - <<'EOF'\nprint('{F} status r')\nEOF",
             f"cat <<'EOF'\n{F} status r", f'echo "a <<EOF\n"; {F} status r\nEOF')
-        foreign_or_unknown += (
+        foreign_or_unknown += (f'echo "`{F} status r`"', f'x="$({F} status r)"', f'echo "$({F} status r)" > out',
             f"python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['{L}', 'status', 'r'])\nEOF",
             f"python3 - <<'EOF'\nimport pathlib\npathlib.os.system('{F} status r')\nEOF",
             f"python3 -m runpy {L}", f"python3 -I -c \"import os; os.execv('{F}', ['d'])\"",
@@ -985,7 +988,7 @@ class ProvenanceTest(Temp):
             "python3 - <<'A' <<'B'\nprint(1)\nA\nprint(2)\nB", f"printf '%s' \"import os; os.system('{F}')\" | python3 - 3<<'EOF'\nprint(1)\nEOF",
             f"cat >f.py <<'C'\nimport os; os.system('{F} status r')\nC\npython3 - <f.py 3<<'S'\nprint(1)\nS")
         pinned_not_run = (
-            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f'D={F}; eval "$D status r"',
+            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f"false && {{ {L} status r; }}", f'D={F}; eval "$D status r"',
             f"cat >x.sh <<'E'\n{F} status r\nE\nsource x.sh", f"cp {L} /tmp/x; mytool; {L} status r",
             f"cp {F} /tmp/d",  f"{L} status r >&9", f"{L} status r <&7",
             f"D={L}; '$D' status r", f"'D={L}'; \"$D\" status r", f"bash -n <<'EOF'\n{L} status r\nEOF",
@@ -993,10 +996,16 @@ class ProvenanceTest(Temp):
             f"bash <<'ONE' <<'TWO'\n{L} status r\nONE\necho harmless\nTWO", f"{L} status r </missing/input",
             f"false && {L} status r", f"set -e; false; {L} status r", f"mytool x; {L} status r", f"exit 0; {L} status r",
             f"python3; {L} status r", f"D={L}; false && D={F}; $D status r", f"false && bash <<'EOF'\n{L} status r\nEOF")
-        for script in foreign_or_unknown + pinned_not_run:
+        for script in foreign_or_unknown:
             got = compare.classify_script(script, paths, M)
             self.assertEqual(0, got["pinned"], script)
             self.assertTrue(got["foreign"] + got["bare"] + got["ambiguous"] > 0, (script, got))
+        # The pinned path where it might not run is never credited, and needs no ambiguity: it ran nothing else.
+        for script in pinned_not_run:
+            self.assertEqual(0, compare.classify_script(script, paths, M)["pinned"], script)
+        for script in (f"false && {F} status r", f"mytool; {F} status r", f"{F} status r </missing", f"{F} status r >&9"):
+            got = compare.classify_script(script, paths, M)
+            self.assertEqual((0, True), (got["foreign"], got["ambiguous"] > 0), script)
 
     def test_codex_freeform_javascript_is_never_read_for_commands(self) -> None:
         pinned = codex_native(f"{self.LAUNCHER} status r")
