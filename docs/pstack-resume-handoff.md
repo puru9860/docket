@@ -1,9 +1,8 @@
 # Pstack continuation handoff
 
-**Update 2026-11-10:** M3 candidates ran on the home PC and the report is
-inconclusive on CLI provenance; read [the results](recipe-comparison-results.md).
-Remaining: decide how to treat the provenance recognizer before any new study,
-then the M8 installed-copy sync after approval.
+**Update 2026-11-10:** M3 is complete: the fifth study reached a verdict,
+not supported, with directional savings; read [the results](recipe-comparison-results.md).
+The installed copy is synced (M8). Antigravity (`agy`) is a supported harness.
 
 **Resumed at the user's request on 2026-11-04.** The previous graceful pause
 is preserved in `161cf6a`. Continuous work, disjoint Opus/Sol lanes, commits and

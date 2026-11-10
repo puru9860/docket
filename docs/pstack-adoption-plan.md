@@ -56,7 +56,7 @@ runtime evidence; a revision label or screenshot alone does not establish truth.
 | M0 | Verification-recipe infrastructure and one real companion recipe | Implemented, verified and committed in this checkpoint | Opus core, Sol UI |
 | M1 | Safety fact/probe, runtime proof descriptions, repeated-premise correction guidance | Implemented and reviewed; final combined suite 823 passed | Sol, Opus/coordinator review |
 | M2 | Broader recipe coverage and maintained feature map | Implemented and reviewed; 13 browser tests and real positive/wrong-scenario core integration passed | Sol implementation, Opus/coordinator boundary review |
-| M3 | Blinded recipe-only comparison with fixed model assignments | First run complete 2026-11-10: inconclusive on CLI provenance; see [results](recipe-comparison-results.md) | Opus design/candidates, Sol bounded adjudication |
+| M3 | Blinded recipe-only comparison with fixed model assignments | Complete 2026-11-10: not supported (treatment regression on the adjacent task) with directional savings; see [results](recipe-comparison-results.md) | Opus design/candidates, Sol bounded adjudication |
 | M4 | Focused refactor-equivalence and performance guidance | Implemented and reviewed; 8 focused tests and final combined suite passed | Opus design, Sol mechanical integration |
 | M5 | Native group discussions | Integrated and regression-tested; direct three-party pilot concluded unanimously with manual delivery | Opus, coordinator review |
 | M6 | Optional PR/CI babysitting | Assessed and deferred until concrete forge/CI waiting friction exists | Opus assessment, G05 advice |
@@ -291,3 +291,8 @@ an active run. Keep local model launch configuration outside Git.
   despite zero foreign or bare executions. See
   [the results](recipe-comparison-results.md). No promotion; installed copy
   not yet synced.
+- 2026-11-10: Merged Antigravity support and the Codex archive fix, synced the
+  installed copy, and narrowed the provenance recognizer across four studies.
+  Study 5 proved `pinned` provenance for every candidate; its report is not
+  supported because of an adjudicated treatment regression on the adjacent
+  task, while the treatment showed fewer rounds and tokens. Recipes stay opt-in.
