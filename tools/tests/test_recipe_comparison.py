@@ -934,6 +934,10 @@ class ProvenanceTest(Temp):
             f"f=a.mdx && python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1], 'w').write('{L} status r')\nEOF": (0, 0, 0),
             f"E=ev && cp a $E/a && python3 - <<'EOF'\nfrom pathlib import Path\nPath('r.md').write_text('`{L} submit r T01`')\nEOF\n{L} submit r T01 --check": (1, 0, 0),
             f"mkdir -p ev; cp a ev/; {F} status r": (0, 1, 0),
+            f"python3 - <<'EOF'\nopen('r.md', 'w').write('import os from \"node:os\"; ran {L} status r')\nEOF": (0, 0, 0),
+            f"node --test ui/x.test.mjs > out.txt 2>&1; echo $?; {L} status r": (1, 0, 0),
+            f"{L} preflight r T01 2>&1 | tail -5; sed -n 150,185p ui/a.mjs; {F} status r": (1, 1, 0),
+            f"(cd ui && npm test) > out 2>&1; true": (0, 0, 0),
             f"python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'status'])\nPY\n{L} status r": (1, 0, 0),
             f"cat <<A; {L} status r\nbody {F} status r\nA": (1, 0, 0),
             f"true # <<EOF\n{F} status r\nEOF": (0, 1, 0),
@@ -978,9 +982,11 @@ class ProvenanceTest(Temp):
             f"python3 -m runpy {L}", f"python3 -I -c \"import os; os.execv('{F}', ['d'])\"",
             "bash <<'SAFE' </tmp/spawn.sh\necho harmless\nSAFE", "python3 - <<'SAFE' <&3\nprint('x')\nSAFE",
             f"python3 - 3<<'EOF'\nopen('/dev/fd/3')\n{F}\nEOF", f"GIT_EXTERNAL_DIFF={F} git diff",
-            "python3 - <<'A' <<'B'\nprint(1)\nA\nprint(2)\nB", "python3 - </tmp/spawn.py 3<<'EOF'\nprint(1)\nEOF")
+            "python3 - <<'A' <<'B'\nprint(1)\nA\nprint(2)\nB", f"printf '%s' \"import os; os.system('{F}')\" | python3 - 3<<'EOF'\nprint(1)\nEOF",
+            f"cat >f.py <<'C'\nimport os; os.system('{F} status r')\nC\npython3 - <f.py 3<<'S'\nprint(1)\nS")
         pinned_not_run = (
-            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f"cp {L} /tmp/x; mytool; {L} status r",
+            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f'D={F}; eval "$D status r"',
+            f"cat >x.sh <<'E'\n{F} status r\nE\nsource x.sh", f"cp {L} /tmp/x; mytool; {L} status r",
             f"cp {F} /tmp/d",  f"{L} status r >&9", f"{L} status r <&7",
             f"D={L}; '$D' status r", f"'D={L}'; \"$D\" status r", f"bash -n <<'EOF'\n{L} status r\nEOF",
             f"bash -lc <<'EOF'\n{L} status r\nEOF", f"bash -e <<'EOF'\nfalse\n{L} status r\nEOF",

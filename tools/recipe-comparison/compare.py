@@ -2,6 +2,7 @@
 """Prepare, prove, grade and report the two-pair recipe-only comparison (stdlib only)."""
 
 import argparse
+import ast
 import difflib
 import hashlib
 import hmac
@@ -589,9 +590,35 @@ EXECUTING_DATA = {"git", "rg", "less", "more", "sort"}
 INFO_ONLY = {"--version", "--help"}
 # Python or Node source that visibly starts a process or runs generated code. A cooperative agent's script
 # that only reads and writes files has none of these, so Docket text in it is data.
-SPAWNS = {"python": re.compile(r"\b(?:subprocess|os|pty|multiprocessing|asyncio|ctypes|runpy|importlib|pexpect|"
-                               r"exec|eval|compile|system|popen|spawn\w*|fork\w*|execv\w*)\b|__"),
-          "node": re.compile(r"\b(?:child_process|require|import|process|eval|Function|vm|spawn\w*|exec\w*|fork)\b|__")}
+SPAWN_MODULES = {"os", "subprocess", "pty", "multiprocessing", "asyncio", "ctypes", "runpy", "importlib", "pexpect",
+                 "posix", "concurrent"}
+SPAWN_NAMES = re.compile(r"(?:exec\w*|eval|compile|system|popen\w*|spawn\w*|fork\w*|getattr|breakpoint|os)$|__")
+
+
+def python_spawns(code: str) -> bool:
+    """Whether Python source visibly starts a process or runs generated code, judged on its syntax tree.
+
+    String contents never count. Source that does not parse never runs.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(a.name.split(".")[0] in SPAWN_MODULES for a in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in SPAWN_MODULES:
+            return True
+        name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ""
+        if name and SPAWN_NAMES.match(name):
+            return True
+    return False
+
+
+NODE_SPAWNS = re.compile(r"\b(?:child_process|require|import|process|eval|Function|vm|spawn\w*|exec\w*|fork)\b|__")
+SPAWNS = {"python": python_spawns, "node": lambda code: bool(NODE_SPAWNS.search(code))}
+# Commands that run code inside this shell rather than in a child.
+SHELL_BUILTINS = {"eval", "exec", "source", ".", "command", "builtin"}
 PYTHON_FLAGS = {"-I", "-u", "-B", "-E", "-S", "-s", "-q"}
 # File utilities that cannot end the calling shell; Docket among their arguments is still ambiguous.
 FILE_UTILITIES = {"cp", "mv", "mkdir", "rm", "rmdir", "touch", "chmod", "ln", "tee", "cmp", "date", "sleep", "mktemp"}
@@ -677,23 +704,33 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
         return out
     script, docs = split
     mentioned = mentioned or any(docket(t) for t, _ in tokens)
-    unplaced = "$(" in script or "`" in script or "<(" in script or "\\\n" in script
-    segments, current, joins = [], [], []
+    segments, current, joins, odd, irregular = [], [], [], [], False
     for token, operator in tokens:
         if operator and token in SEPARATORS:
             segments.append(current)
+            odd.append(irregular)
             joins.append(token)
-            current = []
+            current, irregular = [], False
         else:
-            if operator and (token not in REDIRECTS):
-                unplaced = True
+            irregular = irregular or operator and token not in REDIRECTS or any(c in token for c in ("`", "$(", "<("))
             current.append(token)
     segments.append(current)
+    odd.append(irregular)
+    # A line continuation can join any two lines, so nothing in this script is placed.
+    if "\\\n" in script:
+        out["ambiguous"] += mentioned
+        return out
     certain = alive = True
+    # A command built from a variable, or one this shell evaluates, can run text from anywhere in the script.
+    indirect = False
     for n, words in enumerate(segments):
         attached = [docs[int(m[1])] for w in words if (m := HEREDOC_WORD.fullmatch(w))]
+        # A substitution, subshell, control structure or other unsupported syntax stays unplaced: it ends every
+        # later certainty, and its own segment is ambiguous when it names Docket.
+        unplaced = odd[n]
+        text = " ".join([*words, *(t for _, t in attached)])
         words = [w for w in words if not HEREDOC_WORD.fullmatch(w)]
-        inert = [text for expands, text in attached if not (expands and ("$(" in text or "`" in text))]
+        inert = [t for expands, t in attached if not (expands and ("$(" in t or "`" in t))]
         assignments = []
         while words and re.fullmatch(r"[A-Za-z_]\w*=.*", words[0], re.S):
             assignments.append(words.pop(0))
@@ -705,7 +742,9 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                 unplaced = True
                 words = []
         base, continues = "", False
-        if not words:
+        if unplaced:
+            pass
+        elif not words:
             continues = all("$" not in a and "`" not in a and a.split("=", 1)[0] not in READONLY
                             for a in assignments) and not attached
         else:
@@ -718,6 +757,7 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
             duplicated = [b for a, b in zip(words, words[1:]) if a in (">&", "<&") and b not in ("0", "1", "2", "-")]
             if word in KEYWORDS or "$" in word or any(c in word for c in "*?[") and word != "[":
                 unplaced = True
+                indirect = indirect or "$" in word
             elif docket(word):
                 continues = True
                 if word == "docket":
@@ -730,7 +770,9 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                     out["foreign"] += 1
             elif base in INDIRECT and args and set(args) <= INFO_ONLY:
                 continues = True
-            elif base in INDIRECT and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
+            elif base in SHELL_BUILTINS and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
+                unplaced = indirect = True
+            elif base in INDIRECT:
                 # Python or Node running `-c`/`-e` source, or a literal here-document as `-`, is ambiguous only
                 # when its text names Docket and its code visibly starts a process or runs generated code.
                 code_args = list(args)
@@ -744,17 +786,16 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                     code, rest = attached[0][1], code_args[1:]
                 if code is not None:
                     continues = True
-                    texts = [code, *rest, *(text for _, text in attached)]
-                    out["ambiguous"] += bool(SPAWNS[base].search(code)) and any(mentions(t) for t in texts)
-                # A literal here-document makes stdin known: like any other program, the interpreter is then
-                # ambiguous only when its input or arguments name Docket, and it cannot end this shell.
-                elif stdin_known:
+                    texts = [code, *rest, *(t for _, t in attached)]
+                    out["ambiguous"] += SPAWNS[base](code) and any(mentions(t) for t in texts)
+                # Known stdin, or a named script or program: like any other child program, ambiguous only
+                # when its input or arguments name Docket. Unknown stdin with nothing named could run anything.
+                elif stdin_known or [w for w in args if not w.startswith("-")] and not attached:
                     continues = True
-                    out["ambiguous"] += any(mentions(t) for t in [attached[0][1], *words[1:]])
+                    out["ambiguous"] += any(mentions(t) for t in [*(t for _, t in attached), *words[1:]])
                 else:
                     unplaced = True
-                    if not [w for w in args if not w.startswith("-")]:
-                        out["ambiguous"] += 1
+                    out["ambiguous"] += 1
             elif base in DATA:
                 continues = len(inert) == len(attached)
                 if base in EXECUTING_DATA and any(mentions(t) or docket(t) for t in words[1:]):
@@ -765,17 +806,23 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                     out["ambiguous"] += 1
             if not docket(word) and any(mentions(a) for a in assignments):
                 out["ambiguous"] += 1
-            if not continues:
-                out["ambiguous"] += sum(mentions(text) for _, text in attached)
+            if not continues and not unplaced:
+                out["ambiguous"] += sum(mentions(t) for _, t in attached)
+        if unplaced:
+            continues = False
+            out["ambiguous"] += mentions(text) or any(docket(w) for w in words)
+            # An interpreter inside unsupported syntax may read code written anywhere in the script.
+            if words and re.sub(r"^(python)[\d.]*$", r"\1", os.path.basename(words[0])) in INDIRECT:
+                indirect = True
         alive = alive and continues
         join = joins[n] if n < len(joins) else ""
         if join in (";", "\n", "&"):
             certain = alive
         elif join == "&&":
-            certain = certain and base == "cd"
+            certain = certain and base == "cd" and not unplaced
         elif join not in ("|", "|&"):
             certain = False
-    out["ambiguous"] += unplaced and mentioned
+    out["ambiguous"] += indirect and mentioned
     return out
 
 
