@@ -273,7 +273,7 @@ class TokenCost(unittest.TestCase):
         calls = [{'at': '2026-01-02T00:00:00Z', 'model': 'observed-small'},
                  {'at': '2026-01-03T00:00:00Z', 'model': 'observed-new'}]
         with patch.dict(g, harness_session=lambda _: ref, session_transcripts=lambda _: [],
-                        claude_calls=lambda _: (calls, [], '')):
+                        TRANSCRIPT_CALLS={'claude': lambda _: (calls, [], '')}):
             self.assertEqual('observed-new', self.mod.submission_model(run, 'T01'))
             registration['native_harness'] = {**ref, 'session_id': 'other'}
             self.mod.publish_json(self.mod.session_path('worker'), registration)

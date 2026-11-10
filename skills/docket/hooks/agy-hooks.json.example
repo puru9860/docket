@@ -1,0 +1,11 @@
+{
+  "docket-wake": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "\"$HOME\"/.agents/skills/docket/hooks/agy-wake.sh",
+        "timeout": 28800
+      }
+    ]
+  }
+}

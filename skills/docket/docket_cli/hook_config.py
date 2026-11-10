@@ -20,7 +20,7 @@ def read_hook_config(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def docket_hook_command(command: object) -> bool:
+def docket_hook_command(command: object, adapter: str = "wake.sh") -> bool:
     """Accept a direct adapter invocation, optionally through bash or sh.
 
     Mentioning wake.sh in another command is not an installed Docket adapter.
@@ -34,7 +34,7 @@ def docket_hook_command(command: object) -> bool:
         return False
     if len(words) == 2 and Path(words[0]).name in ("bash", "sh"):
         words = words[1:]
-    return (len(words) == 1 and Path(words[0]).parts[-3:] == ("docket", "hooks", "wake.sh")
+    return (len(words) == 1 and Path(words[0]).parts[-3:] == ("docket", "hooks", adapter)
             and not any(char in words[0] for char in (";", "|", "`", "\n", "$(")))
 
 
@@ -71,6 +71,26 @@ def codex_hook_configuration(home: Path) -> dict:
     locations = [path for path in (home / "hooks.json", home / "config.toml")
                  if wake_hook_configured(path, claude=False)]
     return {"locations": locations, "enabled": enabled is True}
+
+
+def agy_hook_locations(project: Path) -> list[Path]:
+    """Antigravity hooks.json files that wire a Stop handler to the agy adapter.
+
+    Its format names each hook and lists Stop handlers directly, and a named hook
+    with `"enabled": false` contributes nothing.
+    """
+    found = []
+    for path in (project / ".agents" / "hooks.json", Path.home() / ".gemini" / "config" / "hooks.json"):
+        for spec in read_hook_config(path).values():
+            if not isinstance(spec, dict) or spec.get("enabled", True) is not True:
+                continue
+            stops = spec.get("Stop")
+            if any(isinstance(hook, dict) and hook.get("type", "command") == "command"
+                   and docket_hook_command(hook.get("command"), "agy-wake.sh")
+                   for hook in (stops if isinstance(stops, list) else [])):
+                found.append(path)
+                break
+    return found
 
 
 def skill_copy_differences(source: Path, installed: Path) -> list[str]:

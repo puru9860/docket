@@ -3,7 +3,7 @@
 Run a **planner / implementor / reviewer** workflow across coding agents, coordinated through numbered `.mdx` files, with a mechanical report-validation gate and zero-token wake signalling.
 The planner defines tasks and milestones, the implementor works them and their corrections, and the independent reviewer checks evidence and approves each milestone.
 Claude Code is the default worker harness.
-Claude Code and Codex are first-class; OpenCode remains supported as an explicit opt-in.
+Claude Code and Codex are first-class; OpenCode and Antigravity (`agy`) remain supported as explicit opt-ins.
 
 Docket also supports visible peer discussions for brainstorming, feedback, or
 another provider's view on the current topic. Your current agent participates
@@ -122,6 +122,13 @@ a `[[skills.config]]` entry in `~/.codex/config.toml` is only needed to *disable
 
 **OpenCode** - nothing to configure. It scans `~/.agents/skills/*/SKILL.md` globally and
 `.agents/skills/<name>/SKILL.md` per project. Placement alone is enough.
+
+**Antigravity** - reads global skills from `~/.gemini/config/skills`, so symlink it in:
+
+```bash
+mkdir -p ~/.gemini/config/skills
+ln -sfn ~/.agents/skills/docket ~/.gemini/config/skills/docket
+```
 
 **Claude Code** - does not read `~/.agents/skills`, so symlink it in:
 
@@ -461,7 +468,7 @@ docket improvements                    # review project findings
 docket retrospective R01               # mechanical run summary
 ```
 
-Docket also notes each role's harness session (Claude Code, Codex, or OpenCode) whenever the role runs its own docket commands, so token usage per role and the full conversation behind any report can be reviewed later:
+Docket also notes each role's harness session (Claude Code, Codex, OpenCode, or Antigravity) whenever the role runs its own docket commands, so token usage per role and the full conversation behind any report can be reviewed later:
 
 ```bash
 docket usage R01              # tokens per role and per model inside the run's window, read from harness transcripts

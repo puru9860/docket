@@ -3,7 +3,7 @@
 Use this flow for brainstorming, feedback, or another view on the current topic.
 The agent the user is already talking to is the **invoker**. Keep that session:
 it holds the context. Start one **peer** in a visible session of Claude Code,
-Codex, or OpenCode, on the harness and model the user requested. A discussion
+Codex, OpenCode, or Antigravity, on the harness and model the user requested. A discussion
 does not need a coding run, a plan, a task, or Git.
 
 ## Start and invite

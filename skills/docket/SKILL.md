@@ -1,6 +1,6 @@
 ---
 name: docket
-description: Coordinate planned coding work or visible peer discussions across Claude Code, Codex, and OpenCode. Use for multi-agent implementation pipelines, brainstorming, feedback or another agent's view on the current topic, or when the user invokes /docket.
+description: Coordinate planned coding work or visible peer discussions across Claude Code, Codex, OpenCode, and Antigravity. Use for multi-agent implementation pipelines, brainstorming, feedback or another agent's view on the current topic, or when the user invokes /docket.
 metadata:
   argument-hint: <run-id>, coding task, or discussion topic
 ---
@@ -20,7 +20,7 @@ The planner applies the plan, runs `docket launch`, and ends its turn.
 Start a fresh planner session for each run, carrying its approved objective and plan.
 The conductor is a plain foreground process in its own Herdr pane, with no model tokens or hidden subagents.
 It opens workers in a dedicated run tab, delivers work only to idle agents, and retains native session identities before closing panes.
-Claude Code and Codex are first-class; OpenCode is an explicit opt-in for simple or personal work.
+Claude Code and Codex are first-class; OpenCode is an explicit opt-in for simple or personal work, and Antigravity (`agy`) is an explicit opt-in.
 Use approved model identifiers from config, with a capable planner and reviewer and a lower-cost implementor appropriate to the risk.
 Never silently weaken the reviewer or switch models to get past a usage limit.
 

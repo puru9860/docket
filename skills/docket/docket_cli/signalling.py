@@ -276,6 +276,8 @@ def short_watch_refusal(harness: str, role: str, timeout: int) -> str:
         "opencode": f"Use --timeout {MIN_HARNESS_WATCH_SECONDS} only in a terminal or "
                     "adapter that allows at least 600 seconds; a shell cap below 590 seconds "
                     "cannot run this watch.",
+        "agy": "Use the Antigravity Stop hook (hooks/agy-wake.sh) and end your turn; "
+               "the hook waits at no model cost.",
     }[harness]
     return (f"watch --timeout {timeout} inside {harness} is a polling loop: every "
             "return re-enters the model with its whole context to start the same wait again. "

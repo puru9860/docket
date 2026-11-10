@@ -32,14 +32,14 @@ A user config can contain:
 ```
 
 Each role accepts `<role>_harness`, `<role>_model`, `<role>_allowed_models`, and `<role>_pinned` in the user file.
-Harnesses are `claude`, `codex`, or explicit opt-in `opencode`.
+Harnesses are `claude`, `codex`, or explicit opt-in `opencode` or `agy` (Antigravity).
 Models must be nonempty strings on one line; allowed models must be a list of such strings and pins must be JSON booleans.
 An omitted allowed list adds no restriction; an empty allowed list permits no model launch.
 An omitted or false pin permits planner overrides within the allowed list.
 A true pin protects the user's resolved assignment and refuses any project or milestone override, even one requesting the same value.
 A model omitted from a pinned role still means the session or harness default; it is not a named model pin.
 A project file may override harness and model fields only; it cannot widen allowed lists or remove user pins.
-Only the user file accepts `claude_launch_args`, `codex_launch_args`, and `opencode_launch_args`, each a JSON array of nonempty single-line argument strings.
+Only the user file accepts `claude_launch_args`, `codex_launch_args`, `opencode_launch_args`, and `agy_launch_args`, each a JSON array of nonempty single-line argument strings.
 The conductor reads these launch arguments at launch time and appends the milestone's recorded model flag.
 Project configuration cannot supply launch arguments, including permission bypass flags.
 With no user launch arguments, only the recorded model flag is passed and permission dialogs remain visible for the user.

@@ -28,7 +28,7 @@ from .verification import (
 from .feedback import machine_feedback
 from .models import cmd_feedback, record_outcome
 from .sessions import (harness_session, run_harness_sessions, session_transcripts,
-                       claude_calls, codex_calls, opencode_calls, opencode_session_rows,
+                       TRANSCRIPT_CALLS, opencode_calls, opencode_session_rows,
                        _in_window, harness_process_ref, session_until)
 from .liveness import read_registration
 from .gate import gate_problems
@@ -137,7 +137,7 @@ def submission_model(d: Path, owner: str) -> str:
             calls, _, _ = opencode_calls(opencode_session_rows(ref["session_id"]))
         else:
             files = session_transcripts(ref)
-            calls, _, _ = claude_calls(files[:1]) if ref["harness"] == "claude" else codex_calls(files)
+            calls, _, _ = TRANSCRIPT_CALLS[ref["harness"]](files[:1] if ref["harness"] == "claude" else files)
         observed = [c for c in calls if c.get("model") and
                     _in_window(str(c.get("at", "")), str(noted.get("first_seen", "")), session_until(d, noted))]
         return str(max(observed, key=lambda c: str(c.get("at", "")))["model"]) if observed else ""

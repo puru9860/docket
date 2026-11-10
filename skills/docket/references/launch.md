@@ -18,7 +18,7 @@ herdr agent prompt impl-1 "$(cat <prompt file>)"                        # no --w
 docket set-model R01 T01 --actual <provider/model id the pane shows> [--effort LEVEL]
 ```
 
-Harness flags after `--`: opencode `--auto --model provider/model`, codex `--yolo -m MODEL`, claude `--dangerously-skip-permissions --model MODEL`.
+Harness flags after `--`: opencode `--auto --model provider/model`, codex `--yolo -m MODEL`, claude `--dangerously-skip-permissions --model MODEL`, agy `--model MODEL --effort LEVEL`.
 herdr agent names are global across tabs, so prefix them with the run (`r01-impl-1`).
 
 A new Codex worker can stop at a directory-trust screen and a "Hooks need review" screen: trust the project directory.

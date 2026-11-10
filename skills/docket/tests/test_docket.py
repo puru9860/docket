@@ -35,7 +35,8 @@ HOOK = Path(__file__).parents[1] / "hooks" / "wake.sh"
 # Variables a harness gives the commands it runs. A suite run inside a harness
 # strips them so docket never notes that harness's own session as a test role.
 HARNESS_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
-               "OPENCODE_PID", "OPENCODE")
+               "OPENCODE_PID", "OPENCODE", "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_AGENT",
+               "ANTIGRAVITY_APP_DATA_DIR", "ANTIGRAVITY_LS_VERSION")
 
 
 def cli_source_text() -> str:

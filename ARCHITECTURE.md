@@ -6,7 +6,7 @@ read the README and `docket help <role>`.
 ## The model in one paragraph
 
 Five logical roles (planner, orchestrator, implementor, verifier, reviewer) may run as separate agents, or the planner and orchestrator may be combined.
-Supported harnesses are Claude Code, Codex, and OpenCode.
+Supported harnesses are Claude Code, Codex, OpenCode, and Antigravity (`agy`).
 They coordinate entirely through Markdown files in `.docket/runs/<run>/`.
 A supervisor learns that a subordinate finished because the *harness* re-enters it, not because it polled.
 Mechanical gates validate task intent, atomically claim implementor-discovered scopes, detect active-scope collisions, and refuse to mark a report reviewable unless its schema, diff boundary, acceptance fidelity, and verification all hold.
@@ -644,7 +644,7 @@ Only live user config can supply per-harness launch arguments, and the conductor
 Project config accepts no launch arguments or permission bypass options.
 Without user launch arguments only the model flag is passed, leaving permission dialogs visible for human attention.
 `docket status` reads the conductor lock, worker tab, and launch records without changing delivery state.
-`docket reopen RUN --milestone M --role ROLE` resumes the saved native session in a new pane, with Claude `--resume`, Codex `resume`, or explicit OpenCode `--session`.
+`docket reopen RUN --milestone M --role ROLE` resumes the saved native session in a new pane, with Claude `--resume`, Codex `resume`, Antigravity `--conversation`, or explicit OpenCode `--session`.
 Native identities come from worker registrations and the existing session ledger, never from requested agent names or guessed recent sessions.
 Reopen records launch intent, uses a new transport session, and leaves the worker to register and move any draft binding through the ordinary resume gate.
 Conductor and reopen mutations serialize through `.locks/conductor-workers.lock`; the long-lived conductor singleton lock remains independent.
@@ -757,14 +757,14 @@ Raw cases never enter prompts; only reviewed rules do, which is the same rule th
 
 Each role's harness session is noted too, so its token usage and full conversation can be reviewed later without asking the agent for anything.
 When a role runs one of its own commands (`watch`, `arm`, `submit`, `verify`, `decide`, dispatch commands, `feedback --add`) inside a harness, docket appends that session to the run's `.harness-sessions.jsonl`.
-Claude Code and Codex name their session in every command's environment (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
+Claude Code, Codex, and Antigravity name their session in every command's environment (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `ANTIGRAVITY_CONVERSATION_ID`).
 OpenCode names only its process (`OPENCODE_PID`), so its session is the one whose running shell call, in OpenCode's own database, is this very command; newest-session guesses are wrong whenever several sessions are open.
-Variables inherited from an unrelated session are never trusted: the harness process must be an ancestor of the docket process (`CLAUDE_PID`, `OPENCODE_PID`, or a `codex` process).
+Variables inherited from an unrelated session are never trusted: the harness process must be an ancestor of the docket process (`CLAUDE_PID`, `OPENCODE_PID`, or a `codex` or `agy` process), and the nearest one wins when one harness runs inside another's shell.
 A session is noted for one role per run, the first it speaks for.
 A supervisor routinely runs commands on another role's behalf, arming the verifier or handing off a stuck implementor's task, and noting those would attribute its tokens to roles it never played; a command whose role differs from the session's `DOCKET_ROLE` is not noted either.
 A command names its role by its own `--as`/`--role`, so a planner's `assign --as planner` is noted as the planner rather than falling into the new quick default of implementor.
 An explicit transport registration (`arm --session`, `session --register`, `dispatch --register`) made from the session noted for that same role also records the session's native and process identity (`native_harness`, `native_process`) in the registration, which is what lets the companion prove its terminal; a registration for another role, or one that already holds an identity, is never given the caller's.
-`docket usage <run>` reads each session's own transcript (Claude Code and Codex JSONL, OpenCode's database) as one record per model call and counts the calls inside its attributed window.
+`docket usage <run>` reads each session's own transcript (Claude Code, Codex, and Antigravity JSONL, OpenCode's database) as one record per model call and counts the calls inside its attributed window.
 The window opens when the role first joined this run, except for the planner, whose planning counts from session start or the end of the previous run that noted the same session.
 Planner records label the extra span as `planning` and the ordinary joined window as `run_work`, with separate counts in JSON, archives, and human output.
 An unfinished previous run owns the session until this run joins, so its work is never attributed again as planning.
@@ -772,6 +772,8 @@ The upper bound remains the earlier of the run's end (its last decision plus a w
 Codex's cumulative counter becomes per-call deltas over every shard of the thread, the resumed `rollout-<time>-<sid>_<shard>.jsonl` continuation included once its own session_meta names the thread; a repeated reading is not another call.
 Each session splits its totals by model call by call, so a mixed session never counts its whole total under each model.
 A transcript with no call inside the attributed window reports `telemetry: empty`, a gap rather than zero tokens.
+Antigravity's `brain/<conversation>/.system_generated/logs/transcript_full.jsonl` records each model response's `input_tokens`, which already include its `cache_read_tokens`, so fresh input is their difference.
+That transcript names neither the model nor the working directory, so an Antigravity session's model stays unobserved rather than taken from the launch request.
 A command an OpenCode subagent runs is credited to its root session, whose usage already sums its subagents.
 `--archive` also copies each full transcript (subagents included, OpenCode via `opencode export`) into a private `sessions/` directory beside the feedback log and logs the attributed usage there.
 The final aggregate verdict archives automatically.
@@ -1410,6 +1412,17 @@ a supervisor's stop entered the hook, a pending wake returned one second later a
 `hook_prompt`, and the next stop waited again. `DOCKET_WATCH_HOOK=1` tells `docket watch`
 it runs inside a hook, which suppresses the Codex poll hint meant for a manual watcher.
 
+Antigravity also runs a synchronous `Stop` hook, from `~/.gemini/config/hooks.json` or a
+project's `.agents/hooks.json`, but in the folder holding that file and with a JSON
+contract: it reads one object from stdout, and `{"decision": "continue", "reason": ...}`
+re-enters the loop with the reason as a system message. `hooks/agy-wake.sh` adapts
+`wake.sh` to it: the project is the payload's first `workspacePaths` entry, never the
+hook's cwd or an inherited `CLAUDE_PROJECT_DIR`, and only `wake.sh`'s exit 2 becomes a
+`continue`. Measured on agy 1.5.3, a Stop hook that blocked 40 seconds and then returned
+`continue` produced a new model turn answering the reason. The hook's environment names
+the conversation in `ANTIGRAVITY_CONVERSATION_ID` under an `agy` ancestor, so the hook
+binds to a natively armed role the same way a command does.
+
 Inside the hook a wake is exit 3, never 2, and `wake.sh` maps only 3 to the harness's 2.
 Exit 2 is also what uv and argparse return for their own errors, so a hook that execed the watcher turned a missing interpreter or a bad `DOCKET_WATCH_TIMEOUT` into a wake on every Stop, each one a full-context turn carrying the error as its prompt.
 Any other failure exits 1, which wakes nobody, and is recorded in `.docket/hook-failure-<role>` so `docket doctor` can say the hook is broken; a working run removes it.
@@ -1784,7 +1797,7 @@ Tests that read the CLI's constants or source read every package module through 
 | `verification` | `task_env`, `parse_framework_counts`, `run_verification`, `execute_verify`, verify slots, `latest_reusable_verification`, `matching_verifications`, `current_round_digest` |
 | `templates` | `TEMPLATES` dict and `template()`, which honours per-project overrides |
 | `feedback` | `feedback_log_path`, `log_feedback`, `machine_feedback` |
-| `hook_config` | shared defensive Stop-hook recognition, local Codex JSON/TOML configuration, runtime skill-copy comparison |
+| `hook_config` | shared defensive Stop-hook recognition, local Codex JSON/TOML and Antigravity hooks.json configuration, runtime skill-copy comparison |
 | `sessions` | `harness_session`, `calling_harness`, `opencode_running_session`, `note_command_session`, `run_harness_sessions`, `session_usage`, `archive_session`, `collect_run_usage`, `cmd_usage` |
 | `discussion_groups` | group roster and name validation, floor and proposal replay, generation-bound pending acceptance, outcome settlement, wake ownership, group prompt text |
 | `discussions` | independent peer transcript, participant binding, message and conclusion transitions, receipt and wake delivery, `cmd_discuss` |

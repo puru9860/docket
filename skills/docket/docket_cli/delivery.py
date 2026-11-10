@@ -601,7 +601,8 @@ def hook_input_ref() -> dict[str, str]:
     """The session named by a Stop hook's JSON on stdin, or {} without one.
 
     Codex runs its Stop hook without CODEX_THREAD_ID, so the payload's
-    `session_id` is the only identity the hook has.
+    `session_id` is the only identity the hook has. Antigravity names it
+    `conversationId`.
     """
     try:
         if sys.stdin is None or sys.stdin.isatty() \
@@ -610,12 +611,15 @@ def hook_input_ref() -> dict[str, str]:
         payload = json.loads(sys.stdin.read(1 << 20) or "{}")
     except (OSError, ValueError):
         return {}
-    sid = str(payload.get("session_id", "")) if isinstance(payload, dict) else ""
+    if not isinstance(payload, dict):
+        return {}
+    sid = str(payload.get("session_id", payload.get("conversationId", "")))
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sid):
         return {}
-    transcript = str(payload.get("transcript_path", ""))
+    transcript = str(payload.get("transcript_path", payload.get("transcriptPath", "")))
     harness = ("codex" if "/.codex/" in transcript else
-               "claude" if "/.claude/" in transcript else "")
+               "claude" if "/.claude/" in transcript else
+               "agy" if "/antigravity-cli/" in transcript else "")
     return {"session_id": sid, **({"harness": harness} if harness else {})}
 
 

@@ -27,8 +27,8 @@ from .hook_config import codex_hook_configuration
 
 #
 # Which harness session played which role, so each role's token usage and full
-# conversation can be reviewed after a run. Claude Code and Codex name their
-# session in the environment of every command they run. OpenCode names only its
+# conversation can be reviewed after a run. Claude Code, Codex, and Antigravity name
+# their session in the environment of every command they run. OpenCode names only its
 # process, so its session is the one whose running shell call is this very
 # command. Environment inherited from an unrelated session is never trusted:
 # the harness process has to be an ancestor of this one.
@@ -44,6 +44,11 @@ def claude_config_dir() -> Path:
 
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", "").strip() or Path.home() / ".codex")
+
+
+def agy_home() -> Path:
+    return Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+                or Path.home() / ".gemini" / "antigravity-cli")
 
 
 def opencode_db() -> Path:
@@ -103,10 +108,10 @@ def process_ancestors(limit: int = 48) -> list[tuple[int, str]] | None:
 
 
 def calling_harness() -> str:
-    """claude, codex, or opencode when that harness runs this command, else ''."""
+    """claude, codex, opencode, or agy when that harness runs this command, else ''."""
     env = os.environ
     markers = (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"),
-               ("opencode", "OPENCODE_PID"))
+               ("opencode", "OPENCODE_PID"), ("agy", "ANTIGRAVITY_CONVERSATION_ID"))
     candidates = [name for name, var in markers if env.get(var, "").strip()]
     if not candidates:
         return ""
@@ -125,6 +130,8 @@ def calling_harness() -> str:
             return "opencode"
         if "codex" in candidates and name.startswith("codex"):
             return "codex"
+        if "agy" in candidates and name == "agy":
+            return "agy"
     return ""
 
 
@@ -157,6 +164,8 @@ def harness_process_ref() -> dict[str, object]:
         if harness == "opencode" and str(pid) != os.environ.get("OPENCODE_PID", "").strip():
             continue
         if harness == "codex" and not comm.lower().startswith("codex"):
+            continue
+        if harness == "agy" and comm.lower() != "agy":
             continue
         # Codex runs tools under one app-server shared by every Codex window; its
         # pid names no session, and its parent is whichever window started it.
@@ -284,6 +293,9 @@ def harness_session(needles: list[str], *, require_unique: bool = False,
     elif harness == "codex":
         ref["session_id"] = os.environ["CODEX_THREAD_ID"].strip()
         version = os.environ.get("CODEX_VERSION", "").strip()
+    elif harness == "agy":
+        ref["session_id"] = os.environ["ANTIGRAVITY_CONVERSATION_ID"].strip()
+        version = os.environ.get("ANTIGRAVITY_LS_VERSION", "").strip()
     else:
         ref["session_id"], version = (
             opencode_running_session(needles, require_unique=require_unique, command_argv=command_argv)
@@ -465,6 +477,9 @@ def session_transcripts(ref: dict[str, object]) -> list[Path]:
         return [mains[0], *sorted(p for p in extra.rglob("*") if p.is_file())]
     if ref.get("harness") == "codex":
         return codex_thread_shards(sid)
+    if ref.get("harness") == "agy":
+        full = agy_home() / "brain" / sid / ".system_generated" / "logs" / "transcript_full.jsonl"
+        return [full] if full.is_file() else []
     return []
 
 
@@ -668,6 +683,33 @@ def codex_calls(files: list[Path]) -> tuple[list[dict], list[str], str]:
             "cache_write": written, "output": delta["output_tokens"],
             "reasoning": delta["reasoning_output_tokens"], "total": delta["total_tokens"]}))
     return calls, times, cwd
+
+
+def agy_calls(files: list[Path]) -> tuple[list[dict], list[str], str]:
+    """(calls, activity times, cwd) from an Antigravity transcript.
+
+    Its `input_tokens` already include `cache_read_tokens`. The transcript names
+    neither the model nor the working directory, so both stay unobserved.
+    """
+    calls: list[dict] = []
+    times: list[str] = []
+    for record in (r for path in files for r in _jsonl(path)):
+        when = str(record.get("created_at", "") or "")
+        if when:
+            times.append(when)
+        if record.get("source") != "MODEL" or "input_tokens" not in record:
+            continue
+        counts = {key: int(record.get(f"{key}_tokens") or 0)
+                  for key in ("input", "cache_read", "output", "thinking")}
+        calls.append(_call(when, "", {
+            "input": max(0, counts["input"] - counts["cache_read"]),
+            "cache_read": counts["cache_read"], "output": counts["output"],
+            "reasoning": counts["thinking"],
+            "total": counts["input"] + counts["output"] + counts["thinking"]}))
+    return calls, times, ""
+
+
+TRANSCRIPT_CALLS = {"claude": claude_calls, "codex": codex_calls, "agy": agy_calls}
 
 
 def opencode_calls(rows: dict[str, object] | None) -> tuple[list[dict], list[str], str]:
@@ -913,7 +955,7 @@ def session_usage(ref: dict[str, object]) -> tuple[dict[str, object], list[Path]
         transcript = f"{opencode_db()}#{ref.get('session_id')}" if rows else ""
     else:
         files = session_transcripts(ref)
-        calls, times, cwd = (claude_calls if ref.get("harness") == "claude" else codex_calls)(files)
+        calls, times, cwd = TRANSCRIPT_CALLS[str(ref.get("harness"))](files) if files else ([], [], "")
         found = bool(files)
         transcript = str(files[0]) if files else ""
     usage = summarize_calls(calls, times, since, until)
@@ -937,7 +979,7 @@ def observed_session_models(ref: dict[str, object]) -> list[str]:
             calls, times, _ = opencode_calls(opencode_session_rows(str(ref.get("session_id", ""))))
         else:
             files = session_transcripts(ref)
-            calls, times, _ = (claude_calls(files[:1]) if harness == "claude" else codex_calls(files))
+            calls, times, _ = TRANSCRIPT_CALLS[str(harness)](files[:1] if harness == "claude" else files)
         return summarize_calls(calls, times, since, until)["models"]
     except (OSError, ValueError, TypeError, KeyError):
         # Optional telemetry must never prevent a lifecycle command.

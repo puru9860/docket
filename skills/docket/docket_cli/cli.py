@@ -247,7 +247,7 @@ def main() -> None:
     q.add_argument("owner", type=owner_argument)
     q.add_argument("--actual", required=True, help="exact active model label or provider/model id")
     q.add_argument("--effort", default="", help="verified active effort when exposed by the harness")
-    q.add_argument("--harness", default="", choices=("", "claude", "codex", "opencode"),
+    q.add_argument("--harness", default="", choices=("", *SUPPORTED_HARNESSES),
                    help="the worker's harness, when it changed since dispatch; the worker's own "
                         "session records it without this flag")
     q.set_defaults(fn=cmd_set_model)

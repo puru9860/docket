@@ -40,6 +40,7 @@ One `docket watch <run> --role "$DOCKET_ROLE"` returns exactly when something is
 | Claude Code | Prefer the Stop hook with `asyncRewake`; otherwise use one Bash `run_in_background` call running `docket watch` without a short `--timeout`, so the model is re-entered only when it exits. |
 | Codex | Use the synchronous Stop hook in `hooks/codex-hooks.json.example`, or one foreground `docket watch` and keep waiting on that same command. |
 | OpenCode | Run `docket watch <run> --role R --timeout 590` only in a terminal or adapter whose shell call can last at least 600 seconds. |
+| Antigravity | Use the synchronous Stop hook in `hooks/agy-hooks.json.example`, placed in `~/.gemini/config/hooks.json` or a project's `.agents/hooks.json`, then end your turn. |
 
 Never detach `docket watch` with shell `&` or `nohup` in any harness, and never use Codex background terminals.
 Never background a watcher inside a Stop hook; it must remain in that hook's foreground process tree.
@@ -47,6 +48,7 @@ Claude Code's Bash `run_in_background` is a supported no-hook fallback: Claude s
 With a working native hook, end your turn instead of starting a watcher.
 Claude Code foreground tool calls can be capped at 10 minutes; its managed background fallback avoids a model turn every time that cap expires.
 OpenCode `run` calls can be capped at 120 seconds; use a longer-lived terminal or delivery adapter when the call cannot host the watch.
+Antigravity runs a Stop hook in the folder holding `hooks.json` and reads a JSON decision from stdout, so it uses `hooks/agy-wake.sh`, which finds the project from the payload's `workspacePaths`, runs `wake.sh`, and turns a wake into `{"decision": "continue", "reason": <banner>}`.
 For a manual Codex watch, pass the `yield_time_ms` printed at startup to every `write_stdin` and `wait` poll of that same foreground command.
 Set `background_terminal_max_timeout = 3600000` at the top level of `~/.codex/config.toml` to allow one-hour polls; this setting controls the wait window and does not authorize backgrounding the watcher.
 Codex's first yields may return after about 30 seconds, but subsequent long waits return as soon as the event lands.

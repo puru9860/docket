@@ -14,7 +14,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 LAUNCHER = SKILL_DIR / "bin" / "docket"
 
 STATE_DIR = ".docket"
-SUPPORTED_HARNESSES = ("claude", "codex", "opencode")
+SUPPORTED_HARNESSES = ("claude", "codex", "opencode", "agy")
 DEFAULT_REVIEWER = "orch"
 TOPOLOGIES = ("split", "combined")
 WORKFLOW_LEGACY_DECODE = "legacy"

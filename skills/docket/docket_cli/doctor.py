@@ -16,7 +16,8 @@ from .state import ROLES, armed
 from .events import derive_events
 from .delivery import paused_flag
 from .qualification import probe_boundary
-from .hook_config import codex_hook_configuration, skill_copy_differences, wake_hook_configured
+from .hook_config import (agy_hook_locations, codex_hook_configuration, skill_copy_differences,
+                          wake_hook_configured)
 from .sessions import codex_home
 
 
@@ -103,6 +104,13 @@ def cmd_doctor(a: argparse.Namespace) -> None:
         print("         synchronous adapter configured; local hooks "
               + ("enabled" if codex_config["enabled"] else "disabled")
               + "; trust and effective overrides unknown; confirm in /hooks and test a wake.")
+    agy_locations = agy_hook_locations(root())
+    if agy_locations or _has("agy"):
+        agy_label = ", ".join(str(path).replace(str(Path.home()), "~", 1) for path in agy_locations)
+        print(f"  [{ok if agy_locations else warn}] Stop hook (Antigravity) "
+              + (f"in {agy_label}" if agy_locations else
+                 "absent in .agents/hooks.json, ~/.gemini/config/hooks.json"
+                 "  - see `docket help signalling`"))
     role = os.environ.get("DOCKET_ROLE", "")
     print(f"  [{ok if role in ROLES else warn}] DOCKET_ROLE"
           + (f"={role}" if role in ROLES else " is unset - this session cannot consume wake events"))

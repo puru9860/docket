@@ -260,6 +260,8 @@ def start_worker(d: Path, record: dict) -> None:
             args += ['--resume', native]
         elif record['requested_harness'] == 'codex':
             args = ['resume', native, *args]
+        elif record['requested_harness'] == 'agy':
+            args += ['--conversation', native]
         else:
             args += ['--session', native]
     try:

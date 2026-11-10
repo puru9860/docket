@@ -9,7 +9,7 @@ from pathlib import Path
 from .common import (
     ACTING_ROLES, MODE_QUICK, MODE_STANDARD, QUICK_ROLES, RECORDED_MODES,
     REVIEW_COMBINED_CHECKER, REVIEW_INDEPENDENT, REVIEW_QUICK_MILESTONE,
-    REVIEW_TIERED, TOPOLOGIES, WORKFLOWS,
+    REVIEW_TIERED, SUPPORTED_HARNESSES, TOPOLOGIES, WORKFLOWS,
     WORKFLOW_FIVE_ROLE, WORKFLOW_LEGACY_DECODE, die,
 )
 from .frontmatter import parse
@@ -223,7 +223,7 @@ def correction_limit_of(d: Path) -> int:
 
 
 # The harness tool that runs one task in a context of its own. Codex has none a
-# role can rely on yet, so a Codex role keeps working in its session.
+# role can rely on yet, so a Codex or Antigravity role keeps working in its session.
 FRESH_CONTEXT_TOOLS = {"claude": "the Agent tool (general-purpose)",
                        "opencode": "the task tool (general agent)"}
 
@@ -523,7 +523,7 @@ def assignment_role(record: dict, role: str) -> dict:
         if allowed is not None and (not isinstance(allowed, list) or
                                    any(not isinstance(item, str) or not item for item in allowed)):
             raise ValueError("allowed_models must be a list or null")
-        if result.get("harness") not in ("claude", "codex", "opencode") or "model" not in result:
+        if result.get("harness") not in SUPPORTED_HARNESSES or "model" not in result:
             raise ValueError("missing model or invalid harness")
         if result.get("pinned") not in (True, False, "yes", "no"):
             raise ValueError("invalid pin")
