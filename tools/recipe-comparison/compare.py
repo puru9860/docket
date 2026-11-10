@@ -207,7 +207,8 @@ def copy_tree(source: Path, dest: Path) -> None:
 def cli_decision(launcher: str) -> str:
     # Survives the renderer's bare-command rewrite verbatim: "docket" never follows a backtick or ": " or starts a line.
     return (f"Run every Docket command through `{launcher}`, including the startup and obligation commands above "
-            "that name docket without a path; never invoke docket by bare name.")
+            "that name docket without a path; never invoke docket by bare name. "
+            "Run each one as its own shell command with that path written out, never through a variable, subshell, script or `||` fallback.")
 
 
 def conductor_path(shim: Path, operator_path: str) -> list[str]:
@@ -543,13 +544,17 @@ def shell_tokens(script: str) -> list[tuple[str, bool]] | None:
 
     Tokenized twice: as written for word values, and with every quoted string and escape masked, so a
     quoted "&&" stays a word. Only a token that is punctuation in the masked pass is an operator.
+    Comments are cut here because shlex would also swallow the newline that ends them, joining the
+    next line's command to the commented one as its arguments.
     """
     def lex(text: str) -> list[str]:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=PUNCTUATION)
-        lexer.whitespace, lexer.whitespace_split = " \t\r", True
+        lexer.whitespace, lexer.whitespace_split, lexer.commenters = " \t\r", True, ""
         return list(lexer)
 
     masked = QUOTED.sub(lambda m: m[0][0] + "Q" * (len(m[0]) - 2) + m[0][-1] if m[0][0] in "'\"" else "QQ", script)
+    for m in reversed(list(re.finditer(r"(?:^|(?<=[\s;&|()]))#[^\n]*", masked, re.M))):
+        script, masked = (text[:m.start()] + text[m.end():] for text in (script, masked))
     try:
         words, shape = lex(script), lex(masked)
     except ValueError:
@@ -576,25 +581,95 @@ def env_command(words: list[str]) -> list[str] | None:
     return words
 
 
+HEREDOC = re.compile(r"(?<![<\w])<<(?!<)(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|(\\?)([A-Za-z_][\w.-]*))")
+HEREDOC_WORD = re.compile(r"__heredoc_(\d+)__")
+# Data commands with options that run another program, so Docket among their arguments cannot be placed.
+EXECUTING_DATA = {"git", "rg", "less", "more", "sort"}
+# Arguments with which an interpreter prints and exits instead of reading commands from stdin.
+INFO_ONLY = {"--version", "--help"}
+FILE_REDIRECTS = REDIRECTS - {">&", "<&"}
+# Assigning one of these fails, which ends a non-interactive shell.
+READONLY = {"UID", "EUID", "PPID", "SHELLOPTS", "BASHOPTS", "BASH_VERSINFO", "BASHPID", "GROUPS"}
+
+
+def split_heredocs(script: str) -> tuple[str, list[tuple[bool, str]]] | None:
+    """The script with each here-document replaced by a placeholder word, and the documents.
+
+    Each document is (expands, text): an unquoted delimiter expands `$(...)` and backquotes in the text.
+    None when the text before a here-document is not lexically complete, the line holding it is not, or a
+    document never ends, since a misplaced boundary could hide a command.
+    """
+    lines, kept, docs, i = script.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        masked = QUOTED.sub(lambda m: m[0][0] + "Q" * (len(m[0]) - 2) + m[0][-1] if m[0][0] in "'\"" else "QQ", line)
+        masked = re.sub(r"(^|[\s;&|()])#.*", r"\1", masked)
+        found = [HEREDOC.match(line, m.start()) for m in HEREDOC.finditer(masked)]
+        if not found:
+            kept.append(line)
+            continue
+        if None in found or shell_tokens("\n".join(kept)) is None:
+            return None
+        for n, m in reversed(list(enumerate(found, len(docs)))):
+            line = f"{line[:m.start()]} __heredoc_{n}__ {line[m.end():]}"
+        if shell_tokens(line) is None:
+            return None
+        kept.append(line)
+        for m in found:
+            tag = next(g for g in (m[2], m[3], m[5]) if g is not None)
+            body = []
+            while i < len(lines) and (lines[i].lstrip("\t") if m[1] else lines[i]) != tag:
+                body.append(lines[i])
+                i += 1
+            if i == len(lines):
+                return None
+            i += 1
+            docs.append((m[2] is None and m[3] is None and not m[4], "\n".join(body)))
+    return "\n".join(kept), docs
+
+
+def operands(words: list[str]) -> list[str]:
+    """Arguments without redirections, their targets, or the descriptor numbers in front of them."""
+    ops = REDIRECTS | {"<<", "<<-", "<<<"}
+    out, skip = [], False
+    for n, w in enumerate(words):
+        if skip:
+            skip = False
+        elif w in ops:
+            skip = True
+        elif not (w.isdigit() and words[n + 1:n + 2] and words[n + 1] in ops):
+            out.append(w)
+    return out
+
+
 def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[str, int]:
     """Docket executions at recognized command positions of one executed shell script.
 
     Only a restricted shell subset is recognized: simple commands joined by separators, with assignments,
-    supported `env` options and redirects. An execution counts as pinned or foreign only where it certainly
-    runs: the first command, or one reached only through `cd DIR &&`. A Docket path or name anywhere else
-    (a later or conditional command, an interpreter, a substitution, a control structure, a here-document,
-    an unknown command's arguments, unsupported syntax) is ambiguous, and so is a bare interactive shell
-    or interpreter whose stdin could run anything.
+    supported `env` options, redirects and here-documents. An execution counts as pinned or foreign only
+    where it certainly runs without a file redirection: no conditional branch leads to it, and every earlier
+    command is one that cannot end the shell (a data command, a literal assignment, a version query, or
+    Docket itself), or it is reached through `cd DIR &&`. A here-document is data for a data command, and the
+    known stdin of any other program, which like an argument is ambiguous only when it names Docket. A Docket
+    path or name anywhere else (a variable, a conditional command, a substitution, a control structure, an
+    unknown command or its arguments or environment, the arguments of a data command that can run programs,
+    a line continuation, unsupported syntax) is ambiguous, and so is a shell or interpreter whose stdin is
+    not known. The model is a cooperative agent, not deliberately disguised execution.
     """
     out = {"pinned": 0, "foreign": 0, "bare": 0, "ambiguous": 0}
     docket = lambda t: t == "docket" or t.endswith("/bin/docket") or any(m in t for m in [*pinned, *markers])
-    mentioned = any(m in script for m in [*pinned, *markers]) or bool(BARE_DOCKET.search(script))
-    tokens = shell_tokens(script)
+    mentions = lambda text: (any(m in text for m in [*pinned, *markers, "/bin/docket"]) or bool(BARE_DOCKET.search(text))
+                             or bool(re.search(r"(?<![\w./-])docket(?![\w./-])", text)))
+    mentioned = mentions(script) or mentions(script.replace("\\\n", ""))
+    split = split_heredocs(script)
+    tokens = None if split is None else shell_tokens(split[0])
     if tokens is None:
         out["ambiguous"] += mentioned
         return out
+    script, docs = split
     mentioned = mentioned or any(docket(t) for t, _ in tokens)
-    unplaced = "$(" in script or "`" in script or "<(" in script
+    unplaced = "$(" in script or "`" in script or "<(" in script or "\\\n" in script
     segments, current, joins = [], [], []
     for token, operator in tokens:
         if operator and token in SEPARATORS:
@@ -606,41 +681,75 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                 unplaced = True
             current.append(token)
     segments.append(current)
-    unconditional = True
+    certain = alive = True
     for n, words in enumerate(segments):
+        attached = [docs[int(m[1])] for w in words if (m := HEREDOC_WORD.fullmatch(w))]
+        words = [w for w in words if not HEREDOC_WORD.fullmatch(w)]
+        inert = [text for expands, text in attached if not (expands and ("$(" in text or "`" in text))]
+        assignments = []
         while words and re.fullmatch(r"[A-Za-z_]\w*=.*", words[0], re.S):
-            words = words[1:]
+            assignments.append(words.pop(0))
+        stdin_known = (len(attached) == 1 and not {"<", "<>", "<&"} & set(words)
+                       and not (attached[0][0] and ("$" in attached[0][1] or "`" in attached[0][1])))
         if words and os.path.basename(words[0]) == "env":
             words = env_command(words)
             if words is None:
                 unplaced = True
                 words = []
+        base, continues = "", False
         if not words:
-            unconditional = False
-            continue
-        word = words[0]
-        # `/bin/bash` or `python3.14` is still bash or python.
-        base = re.sub(r"^(python)[\d.]*$", r"\1", os.path.basename(word))
-        if base == "python" and len(words) > 1 and docket(words[1]):
-            word = base = words[1]
-        if word in KEYWORDS or "$" in word or any(c in word for c in "*?[") and word != "[":
-            unplaced = True
-        elif docket(word):
-            if word == "docket":
-                out["bare"] += 1
-            elif not unconditional or not word.startswith(("/", "~")):
+            continues = all("$" not in a and "`" not in a and a.split("=", 1)[0] not in READONLY
+                            for a in assignments) and not attached
+        else:
+            word = words[0]
+            # `/bin/bash` or `python3.14` is still bash or python.
+            base = re.sub(r"^(python)[\d.]*$", r"\1", os.path.basename(word))
+            if base == "python" and len(words) > 1 and docket(words[1]):
+                word = base = words[1]
+            args = operands(words[1:])
+            duplicated = [b for a, b in zip(words, words[1:]) if a in (">&", "<&") and b not in ("0", "1", "2", "-")]
+            if word in KEYWORDS or "$" in word or any(c in word for c in "*?[") and word != "[":
+                unplaced = True
+            elif docket(word):
+                continues = True
+                if word == "docket":
+                    out["bare"] += 1
+                elif not certain or not word.startswith(("/", "~")) or FILE_REDIRECTS & set(words) or duplicated:
+                    out["ambiguous"] += 1
+                elif os.path.normpath(word) in pinned:
+                    out["pinned"] += 1
+                else:
+                    out["foreign"] += 1
+            elif base in INDIRECT and args and set(args) <= INFO_ONLY:
+                continues = True
+            elif base in INDIRECT and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
+                # A literal here-document makes stdin known: like any other program, the interpreter is then
+                # ambiguous only when its input or arguments name Docket, and it cannot end this shell.
+                if stdin_known:
+                    continues = True
+                    out["ambiguous"] += any(mentions(t) for t in [attached[0][1], *words[1:]])
+                else:
+                    unplaced = True
+                    if not [w for w in args if not w.startswith("-")]:
+                        out["ambiguous"] += 1
+            elif base in DATA:
+                continues = len(inert) == len(attached)
+                if base in EXECUTING_DATA and any(mentions(t) or docket(t) for t in words[1:]):
+                    out["ambiguous"] += 1
+            elif any(docket(t) or mentions(t) for t in words[1:]):
                 out["ambiguous"] += 1
-            elif os.path.normpath(word) in pinned:
-                out["pinned"] += 1
-            else:
-                out["foreign"] += 1
-        elif base in INDIRECT and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
-            unplaced = True
-            if not [w for w in words[1:] if not w.startswith("-") and w not in REDIRECTS]:
+            if not docket(word) and any(mentions(a) for a in assignments):
                 out["ambiguous"] += 1
-        elif base not in DATA and any(docket(t) or BARE_DOCKET.search(t) for t in words[1:]):
-            out["ambiguous"] += 1
-        unconditional = unconditional and base == "cd" and n < len(joins) and joins[n] == "&&"
+            if not continues:
+                out["ambiguous"] += sum(mentions(text) for _, text in attached)
+        alive = alive and continues
+        join = joins[n] if n < len(joins) else ""
+        if join in (";", "\n", "&"):
+            certain = alive
+        elif join == "&&":
+            certain = certain and base == "cd"
+        elif join not in ("|", "|&"):
+            certain = False
     out["ambiguous"] += unplaced and mentioned
     return out
 

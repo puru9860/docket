@@ -12,7 +12,7 @@ Preparation does not run candidates and produces no experimental result.
 - Source: one pinned revision, sanitized identically for both arms of a pair.
 - Docket CLI: the pinned revision's own `skills/docket`, copied beside each project; never the installed global copy. A copy alone is not provenance; see "CLI provenance".
 - Contract: the same run objective, approach, task goal, criteria, files, out-of-scope notes and operational notes.
-  Each contract also carries one mandatory existing decision naming that candidate's own absolute pinned launcher: "Run every Docket command through `<launcher>`, including the startup and obligation commands above that name docket without a path; never invoke docket by bare name."
+  Each contract also carries one mandatory existing decision naming that candidate's own absolute pinned launcher: "Run every Docket command through `<launcher>`, including the startup and obligation commands above that name docket without a path; never invoke docket by bare name. Run each one as its own shell command with that path written out, never through a variable, subshell, script or `||` fallback."
   The wording never puts `docket` after a backtick, after ": " or at a line start, so the pinned renderer's bare-command rewrite leaves it verbatim; `prepare` asserts it appears verbatim in both the implementor and the reviewer contract.
   The two arms differ there only in that per-candidate path.
 - Models: implementor Claude `claude-opus-5-5` and reviewer Codex `gpt-6.1-sol`, both at effort `high`, recorded as milestone assignments in the plan.
@@ -115,8 +115,16 @@ Execution evidence comes only from the explicitly supplied transcripts, and only
 
 Each executed script is classified by a narrow recognizer, not a shell parser.
 It tokenizes twice, as written and with quoted strings and escapes masked, so a quoted `&&` is never an operator.
-A Docket execution counts as pinned or foreign only at a command position that certainly runs: the first command, or one reached only through `cd DIR &&`, after assignments and the supported `env` options (`-i`, `-u NAME`).
-A Docket path or name anywhere else is ambiguous: a later or conditional command, a control structure, a substitution, a here-document, an interpreter, an unknown command's arguments, an unsupported `env` option, or syntax the recognizer cannot tokenize.
+Comments are cut before tokenizing, so a comment never joins the next line's command to its own.
+A Docket execution counts as pinned or foreign only at a command position that certainly runs without a file redirection or an unusual descriptor duplication, after assignments and the supported `env` options (`-i`, `-u NAME`).
+That is the first command, one reached through `cd DIR &&`, or one after `;`, a newline or `&` when every earlier command cannot end the shell: a data command, a literal assignment to an ordinary variable, a `--version` or `--help` query, an interpreter whose only stdin is one literal here-document, or Docket itself.
+A here-document fed to a data command is data; fed as the only stdin of any other program, it is known input, ambiguous like an argument only when it names Docket.
+An unquoted here-document that expands `$`, `$(...)` or backquotes is never known input.
+A Docket path or name anywhere else is ambiguous: a variable, a conditional command, a control structure, a subshell, a substitution, an unknown command or its arguments or environment, the arguments of a data command that can run programs (`git`, `rg`, `less`, `more`, `sort`), a line continuation, a here-document that never ends, an unsupported `env` option, or syntax the recognizer cannot tokenize.
+A shell or interpreter whose stdin is not known is ambiguous whenever the script names Docket, and also when it runs no script file.
+The threat model is a cooperative agent accidentally reaching another Docket CLI, not deliberately disguised execution: a computed path, a module attribute that reaches `os`, or a program that starts Docket without naming it is out of scope.
+`cd DIR &&` is trusted to succeed.
+This recognizer was narrowed after the first run, whose frozen version left every candidate `unknown`; that run was not regraded.
 Data commands such as `cat`, `printf` or `grep` may name the launcher without executing it, and tool outputs and quoted documentation are counted as mentions only.
 Any bare `docket <subcommand>` execution, for every subcommand of the pinned parser, is counted and leaves provenance `unknown`: neither a pane `PATH` attestation nor an earlier `readlink` shows what a later bare command resolved.
 - `foreign` when a runtime renderer revision differs from the pinned one, or a certainly executed command runs a Docket path other than the pinned launcher.

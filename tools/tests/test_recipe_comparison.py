@@ -241,7 +241,8 @@ class PrepareTest(Temp):
     def test_decision_wording_is_untouched_by_the_renderer_rewrite(self) -> None:
         decision = compare.cli_decision("/w/w1/tools/docket/bin/docket")
         self.assertEqual("Run every Docket command through `/w/w1/tools/docket/bin/docket`, including the startup and "
-                         "obligation commands above that name docket without a path; never invoke docket by bare name.", decision)
+                         "obligation commands above that name docket without a path; never invoke docket by bare name. "
+                         "Run each one as its own shell command with that path written out, never through a variable, subshell, script or `||` fallback.", decision)
         pinned_rewrite = r"(?<=`)docket(?= )|^([ \t]*)docket(?= )|(?<=: )docket(?= )"
         self.assertIsNone(re.search(pinned_rewrite, decision, flags=re.M))
 
@@ -891,7 +892,7 @@ class ProvenanceTest(Temp):
     def test_shell_data_comments_and_unexecuted_branches_are_never_execution(self) -> None:
         for command, ambiguous in ((f'printf "%s\\n" "{self.LAUNCHER} status r"', 0), (f"true # {self.LAUNCHER} status r", 0),
                                    (f"cat {self.LAUNCHER}", 0), (f"if false; then {self.LAUNCHER} status r; fi", 1),
-                                   (f"false && {self.LAUNCHER} status r", 1), (f"cat <<EOF\n{self.LAUNCHER} status r\nEOF", 1),
+                                   (f"false && {self.LAUNCHER} status r", 1), (f"cat <<EOF\n{self.LAUNCHER} status r\nEOF", 0),
                                    (f'echo "{self.LAUNCHER} status r" | sh', 1), (f"x=$({self.LAUNCHER} status r)", 1),
                                    (f"mytool {self.LAUNCHER} status r", 1), ("../tools/docket/bin/docket status r", 1)):
             result = self.classify([codex_exec(command)])
@@ -906,7 +907,7 @@ class ProvenanceTest(Temp):
         cases = {f'cd /tmp "&&" {L} status r': (0, 0), f'printf "%s\\n" "||" {F} status r': (0, 0),
                  f"printf '%s' ';' {F} status r": (0, 0), f"echo \\; {F} status r": (0, 0),
                  f"false && {F} status r": (0, 0), f"true || {F} status r": (0, 0),
-                 f"if false\nthen\n{F} status r\nfi": (0, 0), f"ls; {F} status r": (0, 0),
+                 f"if false\nthen\n{F} status r\nfi": (0, 0), f"ls; {F} status r": (0, 1),
                  f"env -u {L}": (0, 0), f"env -C {L} status r": (0, 0), f"env --split-string='{L} status r'": (0, 0),
                  f"env -i -u X DOCKET_X=1 {L} status r": (1, 0), f"cd /w && {F} status r": (0, 1),
                  f"/usr/bin/env -i {F} status r": (0, 1), f"/usr/bin/env -C /w {L} status r": (0, 0),
@@ -914,6 +915,75 @@ class ProvenanceTest(Temp):
         for script, (pinned, foreign) in cases.items():
             got = compare.classify_script(script, paths, M)
             self.assertEqual((pinned, foreign), (got["pinned"], got["foreign"]), script)
+
+    def test_ordinary_role_scripts_place_their_docket_commands(self) -> None:
+        """Sequenced commands, version queries, here-document data and Docket-free interpreter input are placed."""
+        L, F, M = self.LAUNCHER, self.FOREIGN, compare.design()["foreign_cli_markers"]
+        paths = {L, "/work/w1/tools/bin/docket"}
+        cases = {
+            f'{L} dispatch r T01 --register; echo "---"; {L} pickup r --role implementor': (2, 0, 0),
+            f'cd /w && {L} preflight r T01 2>&1 | tail -20': (1, 0, 0),
+            f'grep -n x README.md | head; {L} diff r T01 | head -150': (1, 0, 0),
+            f"ls; {F} status r": (0, 1, 0),
+            "node --version; python3 --version; git status --short": (0, 0, 0),
+            f"python3 --version; {F} status r": (0, 1, 0),
+            f"cat > .docket/runs/r/T01-scope.mdx <<'EOF'\nfiles: a\nRan `{L} status r`.\nEOF": (0, 0, 0),
+            "python3 - <<'EOF'\np='.docket/runs/r/T01-report-01.mdx'\nopen(p, 'w').write('done')\nEOF": (0, 0, 0),
+            f"python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'status'])\nPY\n{L} status r": (1, 0, 0),
+            f"cat <<A; {L} status r\nbody {F} status r\nA": (1, 0, 0),
+            f"true # <<EOF\n{F} status r\nEOF": (0, 1, 0),
+            f"true # a note\n{F} status r": (0, 1, 0),
+            f"{L} status r 2>&1 | tail -3; {L} diff r T01": (2, 0, 0),
+        }
+        for script, want in cases.items():
+            got = compare.classify_script(script, paths, M)
+            self.assertEqual(want, (got["pinned"], got["foreign"], got["ambiguous"]), script)
+
+    def test_unprovable_role_scripts_stay_ambiguous(self) -> None:
+        """Nothing that could hide another Docket execution is placed, including every reproduced review hole."""
+        L, F, M = self.LAUNCHER, self.FOREIGN, compare.design()["foreign_cli_markers"]
+        G = "/opt/other/bin/docket"
+        paths = {L, "/work/w1/tools/bin/docket"}
+        foreign_or_unknown = (
+            f"D=$(echo {F}); $D status r", f'D="{F}"; "$D" status r', f"D={L}; printf -v D %s {F}; \"$D\" status r",
+            f'printf "%s" "\ncat <<EOF\n"\n{F} status r\nprintf "%s" "\nEOF\n"',
+            f"D={F}; bash <<EOF\n$D status r\nEOF", f"bash <<'EOF'\n{F} status r\nEOF",
+            f"python3 -c \"from os import system; system('{F} status r')\"",
+            f"python3 -c \"import os as o; o.system('{F} status r')\"",
+            f"python3 -c \"import os; os . system('{F} status r')\"",
+            f"python3 - {F} status r <<'EOF'\nimport subprocess, sys\nsubprocess.run(sys.argv[1:])\nEOF",
+            f"node - {F} status r <<'EOF'\nrequire('child_process').execFileSync(process.argv[2], process.argv.slice(3))\nEOF",
+            f"python3 -c 'import sys; exec(sys.stdin.read())' <<'EOF'\nimport os; os.system('{F} status r')\nEOF",
+            f"python3 -c \"import subprocess; subprocess.run(['{G}', 'status', 'r'])\"",
+            f"node -e \"require('child_process').execFileSync('{G}', ['status', 'r'])\"",
+            "python3 -c \"import subprocess; subprocess.run(['docket', 'status', 'r'])\"",
+            f"cat <<EOF\n$({G} status r)\nEOF", f"bash -c '{G} status r' <<'EOF'\ndata\nEOF", f"{G} status r\n'",
+            f"git -c alias.probe=\"!{F} status r\" probe", f"rg --pre {F} FOREIGN input.txt",
+            f"{F[:-3]}\\\n{F[-3:]} status r", f"python3 -c \"().__class__.__base__.__subclasses__()\" {F}",
+            f"python3 - <<'EOF'\nimport sys\nsys.modules['os'].system('{F} status r')\nEOF",
+            f"python3 -m runpy {F}", f"cat <<EOF\n$({F} status r)\nEOF",
+            f"python3 -c \"try: import subprocess\nexcept ImportError: pass\nsubprocess.run(['{F}'])\"",
+            f"python3 - <<'EOF'\nimport sys; import subprocess\nsubprocess.run(['{F}'])\nEOF",
+            f"node - <<'EOF'\nrequire('child_process').execSync('{F} status r')\nEOF",
+            f"python3 script.py <<'EOF'\n{L}\nEOF", f"python3 run.py - <<'EOF'\nprint('{F} status r')\nEOF",
+            f"cat <<'EOF'\n{F} status r", f'echo "a <<EOF\n"; {F} status r\nEOF')
+        foreign_or_unknown += (
+            f"python3 - <<'EOF'\nopen('r.md', 'w').write('ran {L} submit r T01')\nEOF", f"python3 -c \"print('{L} status r')\"",
+            f"f=a.mdx && python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1], 'w').write('{L} status r')\nEOF",
+            "bash <<'SAFE' </tmp/spawn.sh\necho harmless\nSAFE", "python3 - <<'SAFE' <&3\nprint('x')\nSAFE",
+            f"python3 - 3<<'EOF'\nopen('/dev/fd/3')\n{F}\nEOF", f"GIT_EXTERNAL_DIFF={F} git diff",
+            "python3 - <<'A' <<'B'\nprint(1)\nA\nprint(2)\nB", "python3 - </tmp/spawn.py 3<<'EOF'\nprint(1)\nEOF")
+        pinned_not_run = (
+            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f"{L} status r >&9", f"{L} status r <&7",
+            f"D={L}; '$D' status r", f"'D={L}'; \"$D\" status r", f"bash -n <<'EOF'\n{L} status r\nEOF",
+            f"bash -lc <<'EOF'\n{L} status r\nEOF", f"bash -e <<'EOF'\nfalse\n{L} status r\nEOF",
+            f"bash <<'ONE' <<'TWO'\n{L} status r\nONE\necho harmless\nTWO", f"{L} status r </missing/input",
+            f"false && {L} status r", f"set -e; false; {L} status r", f"mytool x; {L} status r", f"exit 0; {L} status r",
+            f"python3; {L} status r", f"D={L}; false && D={F}; $D status r", f"false && bash <<'EOF'\n{L} status r\nEOF")
+        for script in foreign_or_unknown + pinned_not_run:
+            got = compare.classify_script(script, paths, M)
+            self.assertEqual(0, got["pinned"], script)
+            self.assertTrue(got["foreign"] + got["bare"] + got["ambiguous"] > 0, (script, got))
 
     def test_codex_freeform_javascript_is_never_read_for_commands(self) -> None:
         pinned = codex_native(f"{self.LAUNCHER} status r")
