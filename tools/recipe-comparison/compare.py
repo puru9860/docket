@@ -587,6 +587,14 @@ HEREDOC_WORD = re.compile(r"__heredoc_(\d+)__")
 EXECUTING_DATA = {"git", "rg", "less", "more", "sort"}
 # Arguments with which an interpreter prints and exits instead of reading commands from stdin.
 INFO_ONLY = {"--version", "--help"}
+# Python or Node source that visibly starts a process or runs generated code. A cooperative agent's script
+# that only reads and writes files has none of these, so Docket text in it is data.
+SPAWNS = {"python": re.compile(r"\b(?:subprocess|os|pty|multiprocessing|asyncio|ctypes|runpy|importlib|pexpect|"
+                               r"exec|eval|compile|system|popen|spawn\w*|fork\w*|execv\w*)\b|__"),
+          "node": re.compile(r"\b(?:child_process|require|import|process|eval|Function|vm|spawn\w*|exec\w*|fork)\b|__")}
+PYTHON_FLAGS = {"-I", "-u", "-B", "-E", "-S", "-s", "-q"}
+# File utilities that cannot end the calling shell; Docket among their arguments is still ambiguous.
+FILE_UTILITIES = {"cp", "mv", "mkdir", "rm", "rmdir", "touch", "chmod", "ln", "tee", "cmp", "date", "sleep", "mktemp"}
 FILE_REDIRECTS = REDIRECTS - {">&", "<&"}
 # Assigning one of these fails, which ends a non-interactive shell.
 READONLY = {"UID", "EUID", "PPID", "SHELLOPTS", "BASHOPTS", "BASH_VERSINFO", "BASHPID", "GROUPS"}
@@ -723,9 +731,24 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
             elif base in INDIRECT and args and set(args) <= INFO_ONLY:
                 continues = True
             elif base in INDIRECT and not (base == "command" and words[1:2] in (["-v"], ["-V"])):
+                # Python or Node running `-c`/`-e` source, or a literal here-document as `-`, is ambiguous only
+                # when its text names Docket and its code visibly starts a process or runs generated code.
+                code_args = list(args)
+                while code_args[:1] and code_args[0] in PYTHON_FLAGS and base == "python":
+                    code_args.pop(0)
+                code = None
+                if base in SPAWNS and len(code_args) >= 2 and code_args[0] in ("-c", "-e", "-p") \
+                        and (stdin_known or not attached and not {"<", "<>", "<&"} & set(words)):
+                    code, rest = code_args[1], code_args[2:]
+                elif base in SPAWNS and stdin_known and code_args[:1] in ([], ["-"]):
+                    code, rest = attached[0][1], code_args[1:]
+                if code is not None:
+                    continues = True
+                    texts = [code, *rest, *(text for _, text in attached)]
+                    out["ambiguous"] += bool(SPAWNS[base].search(code)) and any(mentions(t) for t in texts)
                 # A literal here-document makes stdin known: like any other program, the interpreter is then
                 # ambiguous only when its input or arguments name Docket, and it cannot end this shell.
-                if stdin_known:
+                elif stdin_known:
                     continues = True
                     out["ambiguous"] += any(mentions(t) for t in [attached[0][1], *words[1:]])
                 else:
@@ -736,8 +759,10 @@ def classify_script(script: str, pinned: set[str], markers: list[str]) -> dict[s
                 continues = len(inert) == len(attached)
                 if base in EXECUTING_DATA and any(mentions(t) or docket(t) for t in words[1:]):
                     out["ambiguous"] += 1
-            elif any(docket(t) or mentions(t) for t in words[1:]):
-                out["ambiguous"] += 1
+            else:
+                continues = base in FILE_UTILITIES and len(inert) == len(attached)
+                if any(docket(t) or mentions(t) for t in words[1:]):
+                    out["ambiguous"] += 1
             if not docket(word) and any(mentions(a) for a in assignments):
                 out["ambiguous"] += 1
             if not continues:

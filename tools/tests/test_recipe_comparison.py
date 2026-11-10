@@ -929,6 +929,11 @@ class ProvenanceTest(Temp):
             f"python3 --version; {F} status r": (0, 1, 0),
             f"cat > .docket/runs/r/T01-scope.mdx <<'EOF'\nfiles: a\nRan `{L} status r`.\nEOF": (0, 0, 0),
             "python3 - <<'EOF'\np='.docket/runs/r/T01-report-01.mdx'\nopen(p, 'w').write('done')\nEOF": (0, 0, 0),
+            f"python3 - <<'EOF'\nopen('r.md', 'w').write('ran {L} submit r T01')\nEOF": (0, 0, 0),
+            f"python3 -c \"print('{L} status r')\"": (0, 0, 0),
+            f"f=a.mdx && python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1], 'w').write('{L} status r')\nEOF": (0, 0, 0),
+            f"E=ev && cp a $E/a && python3 - <<'EOF'\nfrom pathlib import Path\nPath('r.md').write_text('`{L} submit r T01`')\nEOF\n{L} submit r T01 --check": (1, 0, 0),
+            f"mkdir -p ev; cp a ev/; {F} status r": (0, 1, 0),
             f"python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'status'])\nPY\n{L} status r": (1, 0, 0),
             f"cat <<A; {L} status r\nbody {F} status r\nA": (1, 0, 0),
             f"true # <<EOF\n{F} status r\nEOF": (0, 1, 0),
@@ -968,13 +973,15 @@ class ProvenanceTest(Temp):
             f"python3 script.py <<'EOF'\n{L}\nEOF", f"python3 run.py - <<'EOF'\nprint('{F} status r')\nEOF",
             f"cat <<'EOF'\n{F} status r", f'echo "a <<EOF\n"; {F} status r\nEOF')
         foreign_or_unknown += (
-            f"python3 - <<'EOF'\nopen('r.md', 'w').write('ran {L} submit r T01')\nEOF", f"python3 -c \"print('{L} status r')\"",
-            f"f=a.mdx && python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1], 'w').write('{L} status r')\nEOF",
+            f"python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['{L}', 'status', 'r'])\nEOF",
+            f"python3 - <<'EOF'\nimport pathlib\npathlib.os.system('{F} status r')\nEOF",
+            f"python3 -m runpy {L}", f"python3 -I -c \"import os; os.execv('{F}', ['d'])\"",
             "bash <<'SAFE' </tmp/spawn.sh\necho harmless\nSAFE", "python3 - <<'SAFE' <&3\nprint('x')\nSAFE",
             f"python3 - 3<<'EOF'\nopen('/dev/fd/3')\n{F}\nEOF", f"GIT_EXTERNAL_DIFF={F} git diff",
             "python3 - <<'A' <<'B'\nprint(1)\nA\nprint(2)\nB", "python3 - </tmp/spawn.py 3<<'EOF'\nprint(1)\nEOF")
         pinned_not_run = (
-            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f"{L} status r >&9", f"{L} status r <&7",
+            f"UID=1; {L} status r", f"SHELLOPTS=x; {L} status r", f"cp {L} /tmp/x; mytool; {L} status r",
+            f"cp {F} /tmp/d",  f"{L} status r >&9", f"{L} status r <&7",
             f"D={L}; '$D' status r", f"'D={L}'; \"$D\" status r", f"bash -n <<'EOF'\n{L} status r\nEOF",
             f"bash -lc <<'EOF'\n{L} status r\nEOF", f"bash -e <<'EOF'\nfalse\n{L} status r\nEOF",
             f"bash <<'ONE' <<'TWO'\n{L} status r\nONE\necho harmless\nTWO", f"{L} status r </missing/input",
