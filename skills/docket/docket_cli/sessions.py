@@ -1115,8 +1115,12 @@ def archive_session(d: Path, ref: dict[str, object], usage: dict[str, object],
                     _gzip_to(target / "subagents" / f"{child.get('id')}.json.gz", child_export)
     elif files:
         _gzip_to(target / "transcript.jsonl.gz", files[0].read_bytes())
+        # Claude keeps subagent files under the session's own folder; a resumed
+        # Codex thread's later shards sit beside other days' rollouts.
+        claude_extras = files[0].parent / str(ref.get("session_id"))
         for extra in files[1:]:
-            relative = extra.relative_to(files[0].parent / str(ref.get("session_id")))
+            relative = (extra.relative_to(claude_extras) if extra.is_relative_to(claude_extras)
+                        else Path(extra.name))
             _gzip_to(target / "subagents-and-tools" / f"{relative}.gz", extra.read_bytes())
     publish_json(target / "usage.json", {**ref, **usage, "run": d.name,
                                           "archived_at": stamp()})

@@ -1,6 +1,7 @@
 """Token accounting and handoff-stall regressions from the October UI-run audit."""
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import sys
@@ -84,6 +85,24 @@ class UsageAccounting(unittest.TestCase):
             "calls", "total", "input", "cache_read", "output")))
         self.assertEqual({"gpt-x": 110, "gpt-y": 220},
                          {m: c["total"] for m, c in usage["by_model"].items()})
+
+    def test_archive_keeps_every_shard_of_a_resumed_codex_thread(self):
+        """Regression: the archive assumed Claude's subagent layout for every extra file."""
+        home = Path(self.f._feedback_tmp.name) / "codex-home"
+        tid = "01a1153c-7a58-7470-96f9-d74f52e3d6aa"
+        first = home / f"sessions/2026/10/07/rollout-2026-10-07T13-05-47-{tid}.jsonl"
+        resumed = home / f"sessions/2026/10/08/rollout-2026-10-08T22-59-25-{tid}_01a11c82-54bd.jsonl"
+        self.rollout(first, tid, [("2026-10-07T13:06:00Z", (100, 80, 10, 2, 110))])
+        self.rollout(resumed, tid, [("2026-10-08T17:18:00Z", (300, 250, 30, 5, 330))])
+        self.f.init5()
+        run = self.f.root / ".docket/runs/demo"
+        self.note(run, tid, "2026-10-07T13:00:00Z", harness="codex")
+        result = self.f.cli_env({"CODEX_HOME": str(home)}, "usage", "demo", "--archive", "--json")
+        [row] = json.loads(result.stdout)
+        archived = Path(row["archive"])
+        self.assertEqual(first.read_bytes(), gzip.decompress((archived / "transcript.jsonl.gz").read_bytes()))
+        self.assertEqual(resumed.read_bytes(), gzip.decompress(
+            (archived / "subagents-and-tools" / f"{resumed.name}.gz").read_bytes()))
 
     def test_usage_window_ends_when_the_session_joins_a_later_run(self):
         """A session reused by a later run stops counting for the earlier one."""
