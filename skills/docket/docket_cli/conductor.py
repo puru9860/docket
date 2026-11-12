@@ -364,9 +364,23 @@ def worker_prompt(d: Path, batch: dict, record: dict, event: dict,
     return header
 
 
+PROMPT_START_TIMEOUT_MS = 15000
+
+
+def stalled_send_open(d: Path, record: dict, key: str) -> bool:
+    stalled = record.get('stalled_delivery') or {}
+    if stalled.get('key') != key:
+        return False
+    cause = stall_cause(record, stalled['reason'])
+    return any(i.get('cause') == cause and i.get('recipient') == 'planner' and i.get('state') == 'open'
+               for i in list_incidents(d))
+
+
 def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
     role, key = record['role'], str(event['key'])
-    if paused_flag(d, role).is_file() or not idle_worker(record):
+    # A swallowed prompt is resent only after the planner resolves its incident;
+    # retyping into a harness screen could answer that screen.
+    if paused_flag(d, role).is_file() or stalled_send_open(d, record, key) or not idle_worker(record):
         return
     section_hashes = {}
     prompt = worker_prompt(d, batch, record, event, section_hashes)
@@ -393,10 +407,24 @@ def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
                 announce_path(d, role, key).unlink(missing_ok=True)
                 return
             bind_worker_registration(d, record)
-            herdr('agent', 'prompt', record['agent_name'], prompt)
+            # Submission alone does not prove a turn started: a harness update or
+            # trust screen can hold the typed text, so require observed activity.
+            herdr('agent', 'prompt', record['agent_name'], prompt, '--wait', '--until', 'working',
+                  '--until', 'blocked', '--timeout', str(PROMPT_START_TIMEOUT_MS))
         except HerdrError as exc:
             delivery_log(d, role, {'kind': 'send-failed', 'key': key, 'reason': str(exc)})
             if exc.code in ('agent_busy', 'agent_blocked'):
+                return
+            if exc.code in ('agent_prompt_stalled', 'timeout'):
+                # The text may still sit in the harness, so the announcement stays
+                # for a late pickup while the missing delivered_at keeps it undelivered.
+                reason = (f"prompt for {key} was submitted but the worker never started a turn; "
+                          f"inspect pane {record.get('pane_id')} for a harness screen such as an "
+                          "update or trust prompt, clear it, then resolve this incident to redeliver")
+                record['stalled_delivery'] = {'key': key, 'reason': reason, 'at': stamp()}
+                publish_json(worker_path(d, str(batch['batch']), role), record)
+                delivery_log(d, role, {'kind': 'send-stalled', 'key': key, 'transport': 'herdr'})
+                conductor_stall(d, record, reason)
                 return
             raise
         fault('conduct:sent')
@@ -413,6 +441,7 @@ def deliver(d: Path, batch: dict, record: dict, event: dict) -> None:
                 log.flush()
         if section_hashes:
             record['prompt_sections'] = section_hashes
+        record.pop('stalled_delivery', None)
         record.update(last_delivery_at=stamp(), last_delivery_key=key)
         publish_json(worker_path(d, str(batch['batch']), role), record)
         delivery_log(d, role, {'kind': 'delivered', 'key': key, 'transport': 'herdr',
@@ -460,6 +489,12 @@ def milestone_sort_key(value: str) -> tuple:
                  for part in re.split(r'(\d+)', value))
 
 
+def stall_cause(record: dict, reason: str) -> str:
+    prefix = (f"conductor {record['milestone']} {record['role']} ({record['agent_name']})"
+              if record.get('milestone') else 'conductor')
+    return f'{prefix}: {reason}'
+
+
 def conductor_stall(d: Path, record: dict, reason: str) -> None:
     batch = read_batch(d, str(record['milestone'])) if record.get('milestone') else {}
     members = [str(m) for m in batch.get('members', [])]
@@ -469,9 +504,7 @@ def conductor_stall(d: Path, record: dict, reason: str) -> None:
                   ('approved', 'waived', 'completed')), next(iter(members), ''))
     if not owner:
         return
-    prefix = (f"conductor {record['milestone']} {record['role']} ({record['agent_name']})"
-              if record.get('milestone') else 'conductor')
-    cause = f'{prefix}: {reason}'
+    cause = stall_cause(record, reason)
     epoch = reopen_epoch(d, owner, state_of(d, owner)[0])
     if any(i.get('owner') == owner and i.get('cause') == cause and i.get('epoch') == epoch
            and i.get('recipient') == 'planner' and i.get('state') == 'open' for i in list_incidents(d)):
@@ -550,7 +583,9 @@ def monitor_workers(d: Path, batches: list[dict], stall_seconds: float) -> None:
         else:
             if not record.get('idle_since'):
                 record['idle_since'] = now
-            if now - max(float(record['idle_since']), float(record.get('obligation_since', now))) >= stall_seconds:
+            swallowed = any(stalled_send_open(d, record, str(ev['key'])) for ev in obligations)
+            if (not swallowed and now - max(float(record['idle_since']),
+                                            float(record.get('obligation_since', now))) >= stall_seconds):
                 delivered = any(announce_delivered(d, role, str(ev['key'])) for ev in obligations)
                 label = ('missing worker pane' if status == 'missing' else
                          'unanswered obligation' if delivered or not obligations else 'undelivered obligation')

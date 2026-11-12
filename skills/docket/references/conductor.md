@@ -41,6 +41,9 @@ Only user `${XDG_CONFIG_HOME:-~/.config}/docket/config.json` may provide harness
 These examples are explicit user opt-ins, never defaults or project options.
 Without them, launch passes only `--model MODEL` for Claude/OpenCode or `-m MODEL` for Codex, omitting the flag for an empty model request.
 Permission and unrecognized question dialogs remain visible and immediately open a planner-directed stall incident; repository trust and the known Codex hook-review screen are passed automatically.
+A prompt counts as delivered only after Herdr observes the worker start a turn.
+If the worker stays idle after submission, a harness screen such as a Codex update prompt probably holds the text: the conductor opens one planner incident naming the pane and does not retype it.
+Clear the screen, then resolve the incident; the conductor redelivers unless the worker already picked the obligation up.
 Run `docket status R01` to see whether the conductor lock is held and each milestone's panes, agent names, and last delivery.
 Restart `docket conduct R01` after interruption; it reconciles recorded launch intent against `herdr agent list` before launching or delivering again.
 A vanished registered worker is preserved for recovery instead of silently replacing its context.

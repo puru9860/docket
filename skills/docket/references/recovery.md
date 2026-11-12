@@ -18,7 +18,7 @@ docket reopen RUN --milestone M1 --role reviewer
 This requires a recorded native session, leaves lifecycle and frozen evidence unchanged, and asks the resumed worker to register its new transport session before acting.
 The worker uses the ordinary task resume gate when a draft is still bound to its old transport session.
 No requested model is recorded as observed, and neither reopen nor stall recovery switches models automatically.
-Unknown permission dialogs, provider usage-limit messages, and idle unanswered obligations wake the planner through `.incidents/`.
+Unknown permission dialogs, provider usage-limit messages, prompts a harness screen swallowed, and idle unanswered obligations wake the planner through `.incidents/`.
 Inspect and resolve the actual cause, then run `docket health RUN --resolve-stall ID`.
 A healthy busy verification or a worker waiting without an obligation is not an idle stall.
 See [launch.md](launch.md) for thresholds, startup screens, native resume flags, and the manual launch fallback.

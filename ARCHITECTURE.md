@@ -630,7 +630,8 @@ A continued reviewer also closes once it is no longer the next milestone's reuse
 A fresh milestone is a continuation boundary, so a busy older reviewer is never reused across it while its cleanup waits.
 
 The conductor uses the existing role delivery lock, pending records, announcement lease, received identity, and append-only role ledger.
-It checks idle state immediately before `herdr agent prompt`; successful writes record delivery, while failed or interrupted sends remain retryable after the announcement lease unless picked up.
+It checks idle state immediately before `herdr agent prompt --wait --until working --until blocked`, and only observed activity records delivery; failed or interrupted sends remain retryable after the announcement lease unless picked up.
+A submission with no observed activity (`agent_prompt_stalled`) means a harness screen, such as a Codex update or trust prompt, may hold the text: the announcement stays undelivered for a late pickup, the worker record notes `stalled_delivery`, one planner incident names the pane, and the conductor resends only after that incident resolves, because retyping into the screen could answer it.
 The crash contract remains at-least-once; unchanged successfully delivered identities stay quiet across restart and native worker hooks do not provide a competing transport.
 Workers follow a numbered startup sequence: register through dispatch or arm, then pickup, then act on the rendered contract without another role playbook read.
 Successful deliveries record hashes of their rendered guidance, with numbered steps compared individually; continued sessions receive only changed sections or steps and explicit retired-section notices.

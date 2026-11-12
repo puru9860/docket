@@ -204,6 +204,9 @@ diff -r --exclude='__pycache__' --exclude='*.pyc' ~/.agents/skills/docket ~/Docu
 - A correction review packet initially shows the correction delta rather than the whole historical patch.
   The reviewer retrieves full historical patches if the delta crosses interfaces, dependencies, shared invariants, or unrelated code, or is unavailable.
   Missing or damaged prior evidence refuses the packet rather than silently changing its basis.
+- A conductor prompt Herdr submitted but the worker never started a turn on is not
+  delivered, and it is not resent while its planner incident is open. The text may sit
+  behind a harness screen, and typing again could answer that screen.
 - `docket usage` stops counting a session when its run ends or another run notes the
   same session. A transcript with no call inside that window is `telemetry: empty`,
   reported as a gap, never as zero.

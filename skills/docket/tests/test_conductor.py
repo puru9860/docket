@@ -86,7 +86,9 @@ if a[:2] == ['agent', 'prompt']:
     if agent['agent_status'] not in ('idle', 'done'): fail('agent_busy')
     if s.pop('fail_prompt', False): fail('transport_failed')
     s['prompts'].append({'name': a[2], 'text': a[3]})
-    reply({})
+    # A harness screen takes the typed text: plain submission still succeeds.
+    if s.get('swallow_prompts') and '--wait' in a: fail('agent_prompt_stalled')
+    reply({'agent': {**agent, 'agent_status': 'working'}} if '--wait' in a else {})
 fail('unsupported_fake_command')
 '''
 
@@ -692,6 +694,57 @@ class Conductor(unittest.TestCase):
         self.cli('conduct', 'demo', '--once', '--stall-seconds', '1')
         self.assertEqual(1, len(self.incidents()))
         self.assertEqual('resolved', self.incidents()[0]['state'])
+
+    def expire_announcements(self, role='implementor'):
+        for p in (self.run / f'.delivery/{role}/announce').glob('*.json'):
+            data = json.loads(p.read_text()); data['lease_until'] = 0
+            p.write_text(json.dumps(data))
+
+    def test_b_swallowed_prompt_is_not_delivered_and_waits_for_planner_recovery(self):
+        self.update(swallow_prompts=True)
+        self.tick()
+        sends = [c for c in self.state()['calls'] if c[:2] == ['agent', 'prompt']]
+        self.assertEqual(1, len(sends))
+        self.assertEqual(['--wait', '--until', 'working', '--until', 'blocked'], sends[0][4:9])
+        announce = json.loads(next((self.run / '.delivery/implementor/announce').glob('*.json')).read_text())
+        self.assertNotIn('delivered_at', announce)
+        log = (self.run / '.delivery/implementor/log.jsonl').read_text()
+        self.assertIn('send-stalled', log)
+        self.assertNotIn('"delivered"', log)
+        self.assertEqual('', self.record()['last_delivery_at'])
+        self.assertEqual(1, len(self.incidents()))
+        incident = self.incidents()[0]
+        self.assertEqual('planner', incident['recipient'])
+        self.assertIn('never started a turn', incident['cause'])
+        self.assertIn(self.record()['pane_id'], incident['cause'])
+        self.assertIn('stalled', self.cli('events', 'demo', '--role', 'planner', '--peek').stdout)
+
+        self.expire_announcements(); self.age_worker()
+        self.cli('conduct', 'demo', '--once', '--stall-seconds', '1')
+        self.assertEqual(1, len(self.state()['prompts']))
+        self.assertEqual(1, len(self.incidents()))
+
+        self.update(swallow_prompts=False)
+        self.cli('health', 'demo', '--resolve-stall', incident['id'])
+        self.expire_announcements()
+        self.tick()
+        self.assertEqual(2, len(self.state()['prompts']))
+        self.assertNotIn('stalled_delivery', self.record())
+        self.assertTrue(self.record()['last_delivery_at'])
+        self.assertIn('"delivered"', (self.run / '.delivery/implementor/log.jsonl').read_text())
+
+    def test_b_swallowed_prompt_picked_up_late_is_not_resent(self):
+        self.update(swallow_prompts=True)
+        self.tick()
+        record = self.record()
+        self.cli('arm', 'demo', '--role', 'implementor', '--session', record['session'])
+        out = self.cli('pickup', 'demo', '--role', 'implementor', '--session', record['session']).stdout
+        self.assertIn('picked up 1 event', out)
+        self.update(swallow_prompts=False)
+        self.cli('health', 'demo', '--resolve-stall', self.incidents()[0]['id'])
+        self.expire_announcements()
+        self.tick()
+        self.assertEqual(1, len(self.state()['prompts']))
 
     def test_c_provider_usage_limit_waits_for_idle_without_model_switch(self):
         self.tick()
